@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "dev",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "dev"],
+      "port": 3000,
+      "env": {
+        "APP_BASE_URL": "http://localhost:3000",
+        "SESSION_SECRET": "dev-preview-secret",
+        "MOCK": "true",
+        "ADMIN_PASSWORD": "admin123"
+      }
+    }
+  ]
+}

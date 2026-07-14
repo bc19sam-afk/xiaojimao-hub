@@ -1,0 +1,44 @@
+'use client'
+
+import { StackIcon, CheckCircleIcon, HourglassIcon, CoinsIcon } from '@phosphor-icons/react'
+
+interface Contribution {
+  verifyStatus: string
+}
+
+export default function StatCards({ list, balance }: { list: Contribution[]; balance: number }) {
+  const total = list.length
+  const active = list.filter((c) => c.verifyStatus === 'active').length
+  const pending = list.filter(
+    (c) =>
+      c.verifyStatus === 'pending' ||
+      c.verifyStatus === 'verifying' ||
+      c.verifyStatus === 'quarantined',
+  ).length
+
+  const stats = [
+    { label: '已贡献', value: total, Icon: StackIcon, color: 'text-neutral-300' },
+    { label: '已入池', value: active, Icon: CheckCircleIcon, color: 'text-[var(--brand-bright)]' },
+    { label: '待验证', value: pending, Icon: HourglassIcon, color: 'text-amber-300' },
+    { label: '我的积分', value: balance, Icon: CoinsIcon, color: 'text-[var(--brand-bright)]' },
+  ]
+
+  return (
+    <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+      {stats.map((s) => (
+        <div
+          key={s.label}
+          className="flex items-center gap-3 rounded-2xl border border-white/10 bg-white/[0.03] px-4 py-3.5"
+        >
+          <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-white/5">
+            <s.Icon size={18} weight="bold" className={s.color} />
+          </div>
+          <div className="min-w-0">
+            <div className={`mono text-xl font-black leading-none ${s.color}`}>{s.value}</div>
+            <div className="mt-1 truncate text-xs text-neutral-500">{s.label}</div>
+          </div>
+        </div>
+      ))}
+    </div>
+  )
+}

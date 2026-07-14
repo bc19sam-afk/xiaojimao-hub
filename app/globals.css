@@ -1,0 +1,56 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+  --ink: #0d0d0d;
+  --ink-soft: #171717;
+  --brand: #10a37f;
+  --brand-bright: #19c99a;
+}
+
+/* OpenAI 墨黑背景 + 品牌绿辉光 */
+.bg-ink {
+  background-color: var(--ink);
+  background-image:
+    radial-gradient(48rem 40rem at 50% -8%, rgba(16, 163, 127, 0.18), transparent 62%),
+    radial-gradient(40rem 40rem at 88% 108%, rgba(25, 201, 154, 0.10), transparent 60%);
+}
+
+/* 细网格 */
+.bg-grid {
+  background-image:
+    linear-gradient(to right, rgba(255, 255, 255, 0.035) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(255, 255, 255, 0.035) 1px, transparent 1px);
+  background-size: 44px 44px;
+  mask-image: radial-gradient(ellipse 78% 62% at 50% 30%, #000 45%, transparent 100%);
+}
+
+/* logo 呼吸辉光 */
+@keyframes breathe {
+  0%, 100% { opacity: 0.55; transform: scale(1); }
+  50% { opacity: 1; transform: scale(1.06); }
+}
+.animate-breathe {
+  animation: breathe 4.5s ease-in-out infinite;
+}
+
+/* 光环行星：极缓慢公转的高光 */
+@keyframes orbit-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+.animate-orbit {
+  animation: orbit-spin 60s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-breathe { animation: none; }
+  .animate-orbit { animation: none; }
+}
+
+/* 等宽 eyebrow 标签 */
+.mono {
+  font-family: ui-monospace, "SF Mono", SFMono-Regular, "JetBrains Mono", Menlo, Consolas, monospace;
+}
