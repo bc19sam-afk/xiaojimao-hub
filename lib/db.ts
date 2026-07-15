@@ -157,7 +157,7 @@ export const db = {
     return rows.map(toContribution)
   },
 
-  // 插入；account_id 冲突则不插入并返回 duplicate=true（依赖 UNIQUE 约束，原子防重）
+  // 插入；(provider, account_id) 冲突则不插入并返回 duplicate=true（依赖复合 UNIQUE 约束，原子防重）
   insertUnique(c: Contribution): { duplicate: boolean } {
     const r = conn
       .prepare(
@@ -165,7 +165,7 @@ export const db = {
          (id, linuxdo_id, username, account_id, email, provider, plan, method, auth_file_name,
           verify_status, points, reward_status, reward_text, reward_note, reward_code, created_at, updated_at)
          VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-         ON CONFLICT(account_id) DO NOTHING`,
+         ON CONFLICT(provider, account_id) DO NOTHING`,
       )
       .run(
         c.id, c.linuxdoId, c.username, c.accountId, c.email, c.provider, c.plan, c.method, c.authFileName,
