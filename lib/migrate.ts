@@ -6,6 +6,8 @@ import { DatabaseSync } from 'node:sqlite'
 // - schema_version：单行记录已应用的迁移版本。
 // - migrate(db)：读当前版本，按序跑未应用的迁移；每个迁移单事务
 //   （BEGIN IMMEDIATE 兼作迁移锁防并发），成功后更新版本；重复调用幂等。
+//   拿锁后会重读版本——锁外读到的版本可能已过期（另一进程刚应用完同一迁移），
+//   重读发现已应用则跳过，防止双重执行（对未来的破坏性迁移是硬保护）。
 // - baseline 001：把框架之前 openDb() 里的建表原样固化。全新库与旧库走同一迁移链。
 // - 无版本旧库认定：没有 schema_version 但已存在 contributions（框架之前建的旧库）
 //   → 认定 baseline 001 已应用，只登记 version=1、不重跑建表；全新空库则从 0 正常跑 001。
@@ -133,6 +135,17 @@ export function migrate(db: DatabaseSync): number {
     if (m.version <= version) continue
     db.exec('BEGIN IMMEDIATE')
     try {
+      // 拿锁后重读版本：锁外读到的可能已过期（并发进程刚应用完此迁移）
+      const cur = (
+        db.prepare('SELECT version FROM schema_version LIMIT 1').get() as unknown as
+          | { version: number }
+          | undefined
+      )?.version ?? 0
+      if (m.version <= cur) {
+        db.exec('ROLLBACK')
+        version = cur
+        continue
+      }
       m.up(db)
       db.prepare('UPDATE schema_version SET version = ?').run(m.version)
       db.exec('COMMIT')
