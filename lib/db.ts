@@ -1,6 +1,7 @@
 import { DatabaseSync } from 'node:sqlite'
 import fs from 'node:fs'
 import path from 'node:path'
+import { migrate } from './migrate'
 
 // ============================================================================
 // SQLite 数据层（Node 26 内置 node:sqlite，免原生依赖）
@@ -47,82 +48,7 @@ function openDb(): DatabaseSync {
   const d = new DatabaseSync(DB_PATH)
   d.exec('PRAGMA journal_mode = WAL')
   d.exec('PRAGMA busy_timeout = 5000')
-  d.exec(`
-    CREATE TABLE IF NOT EXISTS contributions (
-      id            TEXT PRIMARY KEY,
-      linuxdo_id    INTEGER NOT NULL,
-      username      TEXT NOT NULL,
-      account_id    TEXT NOT NULL UNIQUE,
-      email         TEXT NOT NULL,
-      provider      TEXT NOT NULL DEFAULT 'codex',
-      plan          TEXT NOT NULL,
-      method        TEXT NOT NULL,
-      auth_file_name TEXT NOT NULL,
-      verify_status TEXT NOT NULL,
-      points        INTEGER NOT NULL DEFAULT 0,
-      reward_status TEXT NOT NULL,
-      reward_text   TEXT NOT NULL DEFAULT '',
-      reward_note   TEXT NOT NULL DEFAULT '',
-      reward_code   TEXT,
-      created_at    INTEGER NOT NULL,
-      updated_at    INTEGER NOT NULL
-    );
-    CREATE INDEX IF NOT EXISTS idx_contrib_user   ON contributions(linuxdo_id);
-    CREATE INDEX IF NOT EXISTS idx_contrib_verify ON contributions(verify_status);
-
-    -- 全局键值配置（管理页可改）
-    CREATE TABLE IF NOT EXISTS app_config (
-      key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL
-    );
-
-    -- 发分规则：(provider, plan) → 积分。plan='*' 为该 provider 的兜底
-    CREATE TABLE IF NOT EXISTS point_rules (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      provider TEXT NOT NULL,
-      plan     TEXT NOT NULL,
-      points   INTEGER NOT NULL,
-      enabled  INTEGER NOT NULL DEFAULT 1,
-      label    TEXT NOT NULL DEFAULT '',
-      UNIQUE(provider, plan)
-    );
-
-    -- 兑换项（商店）
-    CREATE TABLE IF NOT EXISTS redeem_items (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name        TEXT NOT NULL,
-      description TEXT NOT NULL DEFAULT '',
-      cost        INTEGER NOT NULL,
-      kind        TEXT NOT NULL,           -- permanent_quota/timed_quota/vip/invite_code
-      enabled     INTEGER NOT NULL DEFAULT 1,
-      sort        INTEGER NOT NULL DEFAULT 0,
-      config      TEXT NOT NULL DEFAULT '{}'
-    );
-
-    -- 积分流水（余额 = SUM(delta)）。UNIQUE(reason,ref) 保证同一贡献只发一次分
-    CREATE TABLE IF NOT EXISTS point_ledger (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      linuxdo_id INTEGER NOT NULL,
-      delta      INTEGER NOT NULL,
-      reason     TEXT NOT NULL,
-      ref        TEXT NOT NULL DEFAULT '',
-      created_at INTEGER NOT NULL,
-      UNIQUE(reason, ref)
-    );
-    CREATE INDEX IF NOT EXISTS idx_ledger_user ON point_ledger(linuxdo_id);
-
-    -- 兑换记录
-    CREATE TABLE IF NOT EXISTS redemptions (
-      id TEXT PRIMARY KEY,
-      linuxdo_id INTEGER NOT NULL,
-      item_id    INTEGER NOT NULL,
-      item_name  TEXT NOT NULL,
-      cost       INTEGER NOT NULL,
-      status     TEXT NOT NULL,            -- pending/fulfilled/failed
-      result     TEXT NOT NULL DEFAULT '',
-      created_at INTEGER NOT NULL
-    );
-    CREATE INDEX IF NOT EXISTS idx_redemptions_user ON redemptions(linuxdo_id);
-  `)
+  migrate(d)
   seedDefaults(d)
   return d
 }
