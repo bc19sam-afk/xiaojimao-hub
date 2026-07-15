@@ -103,6 +103,87 @@ export const migrations: Migration[] = [
       `)
     },
   },
+  {
+    version: 2,
+    // migration 002（P1a）：contributions 唯一键 account_id → 复合 UNIQUE(provider, account_id)。
+    // 三 provider（codex/claude/grok）的 account_id 命名空间独立，不同 provider 撞同一 id 不算重复。
+    // SQLite 不能用 ALTER 删/换 UNIQUE，用「重建表模式」：建新表 → 校验并复制 → 删旧表 → 改名 → 重建索引。
+    // 全程在 migrate() 提供的外层事务内（SQLite 的 DDL 可随事务回滚），up() 内不自开事务。
+    up(db) {
+      // 1) 复制前校验：若已存在重复 (provider, account_id) 对则拒绝迁移，绝不静默丢行
+      const dups = db
+        .prepare(
+          `SELECT provider, account_id, COUNT(*) AS c
+           FROM contributions GROUP BY provider, account_id HAVING c > 1`,
+        )
+        .all() as unknown as { provider: string; account_id: string; c: number }[]
+      if (dups.length > 0) {
+        const list = dups.map((d) => `(${d.provider}, ${d.account_id})×${d.c}`).join('; ')
+        throw new Error(
+          `[migrate 002] contributions 存在重复的 (provider, account_id)：${list}。` +
+            `迁移到复合唯一键前请人工清理这些重复行，再重跑 npm run migrate。`,
+        )
+      }
+      // 迁移前行数，迁移后须一致（防静默丢行）
+      const before = (
+        db.prepare('SELECT COUNT(*) AS n FROM contributions').get() as unknown as { n: number }
+      ).n
+
+      // 2) 建新表：列结构与 baseline 001 一字不差，唯一改动 = 去掉 account_id 列级 UNIQUE，
+      //    改为表级 UNIQUE(provider, account_id)
+      db.exec(`
+        CREATE TABLE contributions_new (
+          id            TEXT PRIMARY KEY,
+          linuxdo_id    INTEGER NOT NULL,
+          username      TEXT NOT NULL,
+          account_id    TEXT NOT NULL,
+          email         TEXT NOT NULL,
+          provider      TEXT NOT NULL DEFAULT 'codex',
+          plan          TEXT NOT NULL,
+          method        TEXT NOT NULL,
+          auth_file_name TEXT NOT NULL,
+          verify_status TEXT NOT NULL,
+          points        INTEGER NOT NULL DEFAULT 0,
+          reward_status TEXT NOT NULL,
+          reward_text   TEXT NOT NULL DEFAULT '',
+          reward_note   TEXT NOT NULL DEFAULT '',
+          reward_code   TEXT,
+          created_at    INTEGER NOT NULL,
+          updated_at    INTEGER NOT NULL,
+          UNIQUE(provider, account_id)
+        );
+      `)
+
+      // 3) 复制数据（显式列清单，不用 SELECT *）
+      db.exec(`
+        INSERT INTO contributions_new
+          (id, linuxdo_id, username, account_id, email, provider, plan, method, auth_file_name,
+           verify_status, points, reward_status, reward_text, reward_note, reward_code, created_at, updated_at)
+        SELECT
+          id, linuxdo_id, username, account_id, email, provider, plan, method, auth_file_name,
+          verify_status, points, reward_status, reward_text, reward_note, reward_code, created_at, updated_at
+        FROM contributions;
+      `)
+
+      // 4) 删旧表 → 改名（旧表两索引随 DROP 一并消失）
+      db.exec('DROP TABLE contributions')
+      db.exec('ALTER TABLE contributions_new RENAME TO contributions')
+
+      // 5) 重建索引（与 baseline 001 同名同义）
+      db.exec('CREATE INDEX IF NOT EXISTS idx_contrib_user   ON contributions(linuxdo_id)')
+      db.exec('CREATE INDEX IF NOT EXISTS idx_contrib_verify ON contributions(verify_status)')
+
+      // 6) 迁移后行数校验：与迁移前不等即抛，外层事务回滚
+      const after = (
+        db.prepare('SELECT COUNT(*) AS n FROM contributions').get() as unknown as { n: number }
+      ).n
+      if (after !== before) {
+        throw new Error(
+          `[migrate 002] 迁移后行数不一致（迁移前 ${before}，迁移后 ${after}），已回滚。`,
+        )
+      }
+    },
+  },
 ]
 
 // 代码所知的最新 schema 版本（从 migrations 数组派生，勿手写）
