@@ -218,13 +218,6 @@ export const db = {
     return rows.map(toContribution)
   },
 
-  findByAccountId(accountId: string): Contribution | undefined {
-    const r = conn
-      .prepare('SELECT * FROM contributions WHERE account_id = ?')
-      .get(accountId) as unknown as Row | undefined
-    return r ? toContribution(r) : undefined
-  },
-
   byVerifyStatus(statuses: string[]): Contribution[] {
     if (statuses.length === 0) return []
     const ph = statuses.map(() => '?').join(',')
@@ -438,13 +431,6 @@ export const db = {
       .run(linuxdoId, -Math.abs(cost), reason, ref, Date.now(), linuxdoId, cost)
     return r.changes > 0
   },
-  ledger(linuxdoId: number, limit = 50): LedgerEntry[] {
-    return conn
-      .prepare(
-        'SELECT delta, reason, ref, created_at AS createdAt FROM point_ledger WHERE linuxdo_id=? ORDER BY created_at DESC LIMIT ?',
-      )
-      .all(linuxdoId, limit) as unknown as LedgerEntry[]
-  },
 
   // ===== 兑换记录 =====
   createRedemption(rec: {
@@ -497,12 +483,6 @@ export interface RedeemItem {
   enabled: number
   sort: number
   config: string
-}
-export interface LedgerEntry {
-  delta: number
-  reason: string
-  ref: string
-  createdAt: number
 }
 export interface RedemptionRow {
   id: string

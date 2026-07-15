@@ -1,4 +1,4 @@
-import { NextRequest, NextResponse } from 'next/server'
+import { NextRequest } from 'next/server'
 import { env, trustForwardedHeaders } from './env'
 
 // 推断当前请求的 origin，用于重定向 / cookie secure 判断。
@@ -14,11 +14,6 @@ export function originOf(req: NextRequest): string {
     return `${proto}://${host}`
   }
   return env.appBaseUrl.replace(/\/+$/, '')
-}
-
-// 重定向到当前 origin 下的某路径
-export function redirectTo(req: NextRequest, path: string): NextResponse {
-  return NextResponse.redirect(new URL(path, originOf(req)))
 }
 
 // cookie 是否走 secure：跟随推断出的 origin 协议
