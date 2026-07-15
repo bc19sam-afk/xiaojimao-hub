@@ -41,7 +41,7 @@ export interface Contribution {
   updatedAt: number
 }
 
-const DB_PATH = path.join(process.cwd(), 'data', 'app.db')
+const DB_PATH = process.env.DB_PATH || path.join(process.cwd(), 'data', 'app.db')
 
 function openDb(): DatabaseSync {
   fs.mkdirSync(path.dirname(DB_PATH), { recursive: true })
