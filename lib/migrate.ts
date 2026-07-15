@@ -105,10 +105,39 @@ export const migrations: Migration[] = [
   },
 ]
 
+// 代码所知的最新 schema 版本（从 migrations 数组派生，勿手写）
+export const LATEST_VERSION = Math.max(...migrations.map((m) => m.version))
+
 function hasTable(db: DatabaseSync, name: string): boolean {
   return !!db
     .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?")
     .get(name)
+}
+
+// 迁移执行纪律守卫（P1-0）：生产启动只校验 schema 版本，不执行迁移
+// （迁移是部署时的独立步骤 `npm run migrate`）。纯只读，不建 schema_version 表：
+//   无 schema_version 表（含全新空库）视为版本 0；
+//   落后于 LATEST_VERSION → throw，指引先跑 npm run migrate；
+//   相等 → 通过；
+//   超前（DB 版本 > 代码版本，如代码回滚）→ warn 放行（迁移纪律「先加后删」向后兼容）。
+export function assertSchemaCurrent(db: DatabaseSync): void {
+  let version = 0
+  if (hasTable(db, 'schema_version')) {
+    const row = db.prepare('SELECT version FROM schema_version LIMIT 1').get() as unknown as
+      | { version: number }
+      | undefined
+    version = row?.version ?? 0
+  }
+  if (version < LATEST_VERSION) {
+    throw new Error(
+      `[db] schema 版本落后（当前 ${version}，代码需要 ${LATEST_VERSION}）：请先运行 npm run migrate 完成迁移，再启动应用。`,
+    )
+  }
+  if (version > LATEST_VERSION) {
+    console.warn(
+      `[db] schema 版本超前（当前 ${version}，代码 ${LATEST_VERSION}）：疑似代码回滚，按向后兼容放行。`,
+    )
+  }
 }
 
 // 读起始版本；schema_version 不存在时初始化：

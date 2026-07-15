@@ -1,7 +1,8 @@
 import { DatabaseSync } from 'node:sqlite'
 import fs from 'node:fs'
 import path from 'node:path'
-import { migrate } from './migrate'
+import { assertSchemaCurrent, migrate } from './migrate'
+import { env } from './env'
 
 // ============================================================================
 // SQLite 数据层（Node 26 内置 node:sqlite，免原生依赖）
@@ -48,7 +49,10 @@ function openDb(): DatabaseSync {
   const d = new DatabaseSync(DB_PATH)
   d.exec('PRAGMA journal_mode = WAL')
   d.exec('PRAGMA busy_timeout = 5000')
-  migrate(d)
+  // 迁移纪律：生产（非 mock）只校验 schema 版本，迁移由部署步骤 `npm run migrate` 执行；
+  // mock（开发/演示）保持启动自动迁移。
+  if (env.mock) migrate(d)
+  else assertSchemaCurrent(d)
   seedDefaults(d)
   return d
 }
@@ -240,6 +244,22 @@ export const db = {
       )
       .get(count) as unknown as { n: number }
     return { rank: (ahead?.n ?? 0) + 1, count }
+  },
+
+  // ===== 配置：全局键值（app_config）=====
+  getConfig(key: string): string | null {
+    const r = conn.prepare('SELECT value FROM app_config WHERE key=?').get(key) as unknown as
+      | { value: string }
+      | undefined
+    return r?.value ?? null
+  },
+  setConfig(key: string, value: string): void {
+    conn
+      .prepare(
+        `INSERT INTO app_config (key, value, updated_at) VALUES (?,?,?)
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at`,
+      )
+      .run(key, value, Date.now())
   },
 
   // ===== 配置：发分规则 =====
