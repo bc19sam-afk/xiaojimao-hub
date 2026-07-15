@@ -7,6 +7,7 @@
     "build": "next build",
     "start": "next start",
     "migrate": "node scripts/migrate.ts",
+    "backup": "node scripts/backup.ts",
     "test": "node --import ./test/setup.mjs --test test/*.test.ts"
   },
   "dependencies": {
