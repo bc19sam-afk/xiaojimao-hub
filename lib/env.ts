@@ -59,11 +59,6 @@ export const env = {
       .map((s) => Number(s.trim()))
       .filter((n) => Number.isFinite(n) && n > 0),
   },
-  reward: {
-    // 单个健康账号发放的奖励文案（可调）
-    text: process.env.REWARD_TEXT || '无限额度兑换码 × 1（兑换 1 天订阅）',
-    note: process.env.REWARD_NOTE || '领取后 1 天内使用',
-  },
   worker: {
     // 后台自动巡检开关。需常驻 Node 服务（next start 自托管），serverless 无效。
     enabled: (process.env.WORKER_ENABLED ?? 'true') !== 'false',

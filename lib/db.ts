@@ -284,23 +284,6 @@ export const db = {
     return r.changes > 0
   },
 
-  // 幂等发奖：仅当尚未 granted 才写码；返回本次是否真的发放（防重复发码）
-  grantRewardOnce(
-    id: string,
-    code: string,
-    text: string,
-    note: string,
-  ): boolean {
-    const r = conn
-      .prepare(
-        `UPDATE contributions
-         SET reward_status = 'granted', reward_code = ?, reward_text = ?, reward_note = ?, updated_at = ?
-         WHERE id = ? AND reward_status != 'granted'`,
-      )
-      .run(code, text, note, Date.now(), id)
-    return r.changes > 0
-  },
-
   leaderboard(limit = 20): { linuxdoId: number; username: string; count: number }[] {
     return conn
       .prepare(
