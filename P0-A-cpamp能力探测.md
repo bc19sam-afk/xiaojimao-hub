@@ -10,7 +10,7 @@
 
 | 需求假设 | 结论 | 证据 |
 |---|---|---|
-| **入池优先级**（默认 10、越大越先） | 🟢 **可行，不降级** | CLIProxyAPI selector：`auth.Attributes["priority"]`（string→int，默认 0，`priority > bestPriority` 越大越先选）；`routing.strategy=fill-first` 按 priority 分桶。完全匹配需求。**待落地**：priority 写入方式 |
+| **入池优先级**（默认 10、越大越先） | 🟢 **可行，不降级** | CLIProxyAPI selector：`auth.Attributes["priority"]`（string→int，默认 0，`priority > bestPriority` 越大越先选）；`routing.strategy=fill-first` 按 priority 分桶。完全匹配需求。**cpamp 确认可给单号设优先级**（用户 2026-07-15 确认）；具体 API/字段 P2c 对接 |
 | **来源标记** | 🟢 **可行** | auth-file 有自由文本 `label` 字段（当前存了个邮箱），可写 hub 来源标记（PATCH 写操作待验，字段确在） |
 | **claude 稳定 account_id** | 🟢 **有** | claude 记录含 `account`(len 14) + `id`(len 26) |
 | **grok 稳定 account_id** | ⚪ 无样本 | 当前池无 grok 号，待样本 |
@@ -26,9 +26,9 @@
 cpamp 自带：`request-retry=3`、`quota-exceeded` 处理选项、`transient-error-cooldown`、`session-affinity`(1h)。P2b 的软/硬/未知失败处理应**与之对齐**，避免和 cpamp 内建重试/冷却打架。
 
 ## 待落地 / 待样本（不阻塞 P0-B）
-1. **priority 写入方式**：selector 只 `读` `Attributes["priority"]`，未见写入路径。P2c 落地时确认——auth 文件 JSON 字段 / cpamp 管理 API / Web UI（用户作为 cpamp 管理员或可直接确认 Web UI 能否设优先级）。
+1. **priority 写入方式**：**cpamp 确认支持给单号设优先级**（用户 2026-07-15 确认）；走哪个 API/字段留 P2c 对接时定。
 2. **禁用原因区分**：需一个失效/被禁号样本，验证 `disabled`/`status`/`status_message` 组合能否区分「手动禁用」vs 失效/限流。
-3. **grok 稳定 ID**：需 grok 号样本。
+3. **grok 稳定 ID**：需 grok 号样本（用户 2026-07-15：暂无 grok 号，待有号再验）。
 
 ## 探测边界（诚实）
 优先级「写入方式」、禁用原因区分、grok 样本三项，只读探测 + 公开文档探不到底，留到 P2c 实现时（读加载源码 / 实测）或有样本时定。**均不阻塞 P0-B 基建启动。**
