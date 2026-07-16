@@ -65,8 +65,9 @@ after(() => {
   fs.rmSync(tmpDir, { recursive: true, force: true })
 })
 
-// ① 升级路径：v1 有数据 → migrate 到 v2，行数与内容逐行不变，版本=2
-test('升级路径：v1 数据 migrate 到 v2 后行数与内容不变，LATEST_VERSION=2', () => {
+// ① 升级路径：v1 有数据 → migrate 到最新，contributions 行数与内容逐行不变（002 重建不丢数据）
+// （P1b-4 加了 migration 003 后 migrate 直达 v3；003 只加 oauth_snapshots 表、不碰 contributions）
+test('升级路径：v1 数据 migrate 到最新后 contributions 行数与内容不变', () => {
   const d = makeV1Db()
   // v1 的 account_id 是全局 UNIQUE，故各行 account_id 互不相同；覆盖三 provider
   const seed: [string, number, string, string][] = [
@@ -80,8 +81,8 @@ test('升级路径：v1 数据 migrate 到 v2 后行数与内容不变，LATEST_
   const beforeRows = d.prepare('SELECT * FROM contributions ORDER BY id').all()
 
   const version = migrate(d)
-  assert.equal(version, 2)
-  assert.equal(LATEST_VERSION, 2)
+  assert.equal(version, LATEST_VERSION) // 跑满迁移链到最新（P1b-4 后 LATEST=3，含 003 加表）
+  assert.ok(LATEST_VERSION >= 2) // 002（复合唯一键）仍在链上
 
   const afterRows = d.prepare('SELECT * FROM contributions ORDER BY id').all()
   assert.equal(afterRows.length, beforeRows.length) // 行数不变
@@ -141,11 +142,11 @@ test('重复数据守卫：存在重复 (provider, account_id) 时 migrate 抛�
   d.close()
 })
 
-// ④ 全新空库：migrate 一次到 v2，表上唯一约束为复合键
-test('全新空库：migrate 到 v2 且唯一约束是复合键 (provider, account_id)', () => {
+// ④ 全新空库：migrate 到最新，contributions 表上唯一约束为复合键（002 生效，003 不影响）
+test('全新空库：migrate 到最新且唯一约束是复合键 (provider, account_id)', () => {
   const d = new DatabaseSync(':memory:')
   const version = migrate(d)
-  assert.equal(version, 2)
+  assert.equal(version, LATEST_VERSION)
 
   const ddl = (
     d

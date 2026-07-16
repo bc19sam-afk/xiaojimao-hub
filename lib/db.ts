@@ -402,6 +402,37 @@ export const db = {
       )
       .all(linuxdoId) as unknown as RedemptionRow[]
   },
+
+  // ===== OAuth 授权快照（P1b-4：按 state 持久化跨请求）=====
+  // startOAuth 授权前拍 auth-files 文件名快照并按 state 存；finishOAuth/checkOAuth 读同一份作
+  // findNew 的 before（挡号池既有号）；成功入库后删；过期清理。file_names 以 JSON 数组存。
+  setOAuthSnapshot(state: string, fileNames: string[]): void {
+    conn
+      .prepare(
+        `INSERT INTO oauth_snapshots (state, file_names, created_at) VALUES (?,?,?)
+         ON CONFLICT(state) DO UPDATE SET file_names=excluded.file_names, created_at=excluded.created_at`,
+      )
+      .run(state, JSON.stringify(fileNames), Date.now())
+  },
+  // 无记录返回 null；JSON 解析失败也返回 null（调用方 ?? [] 降级为空 before＝仍安全）
+  getOAuthSnapshot(state: string): string[] | null {
+    const r = conn.prepare('SELECT file_names FROM oauth_snapshots WHERE state=?').get(state) as unknown as
+      | { file_names: string }
+      | undefined
+    if (!r) return null
+    try {
+      return JSON.parse(r.file_names) as string[]
+    } catch {
+      return null
+    }
+  },
+  deleteOAuthSnapshot(state: string): void {
+    conn.prepare('DELETE FROM oauth_snapshots WHERE state=?').run(state)
+  },
+  // 删掉 created_at 早于 now-olderThanMs 的过期快照（startOAuth 顺带调用，防表无限增长）
+  cleanupOAuthSnapshots(olderThanMs: number): void {
+    conn.prepare('DELETE FROM oauth_snapshots WHERE created_at < ?').run(Date.now() - olderThanMs)
+  },
 }
 
 export interface PointRule {
