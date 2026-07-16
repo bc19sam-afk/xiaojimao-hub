@@ -238,3 +238,30 @@ test('快照 0 值保真：points=0 / priority=0 读回仍是 0（?? 不吞 0）
   assert.equal(c.snapshotPoints, 0)
   assert.equal(c.snapshotPriority, 0)
 })
+
+// ⑧ 快照冻结契约（§3.4）：startObservation 是 compare-and-set——首次成功、二次拒绝且快照岿然不动
+//    （worker 重试/重入不得重启计时窗口、不得用后台改后的配置污染在考察的号）
+test('快照冻结：startObservation 首次成功、二次返回 false 且不重写（§3.4 冻结契约）', async () => {
+  db.insertUnique(makeContribution({ id: 'freeze-1', accountId: 'freeze-acc-1', linuxdoId: 8006 }))
+
+  const first = db.startObservation('freeze-1', { windowMs: 86_400_000, points: 30, ruleVersion: 'rules-v1', priority: 7 })
+  assert.equal(first, true) // 首次初始化成功
+  const snap1 = db.getObservationSnapshot('freeze-1')
+
+  await new Promise((r) => setTimeout(r, 5)) // 拉开时间，若二次重写 observe_start_at 会变
+  // 二次进考察（模拟 worker 重入 + 后台此间改了配置）：必须被拒、快照一字不改
+  const second = db.startObservation('freeze-1', { windowMs: 999, points: 999, ruleVersion: 'rules-v2', priority: 1 })
+  assert.equal(second, false) // CAS 拒绝
+  assert.deepEqual(db.getObservationSnapshot('freeze-1'), snap1) // 计时起点/窗口/分值/规则/优先级全冻结不变
+})
+
+// ⑨ addObservation kind fail-closed：非法 kind 抛错，绝不落库（防 'hard-fail' 之类被 hasHardFailure 漏判）
+test('观测类型校验：非法 kind 抛错且不落库', () => {
+  db.insertUnique(makeContribution({ id: 'kind-1', accountId: 'kind-acc-1', linuxdoId: 8007 }))
+  // @ts-expect-error 故意传非法 kind（编译期已挡，运行时须再 fail-closed）
+  assert.throws(() => db.addObservation('kind-1', 'hard-fail', 'typo'), /非法观测类型/)
+  assert.equal(db.observationsFor('kind-1').length, 0) // 没落库
+  // 合法 kind 正常落库
+  db.addObservation('kind-1', 'hard_fail', 'real')
+  assert.equal(db.hasHardFailure('kind-1'), true)
+})

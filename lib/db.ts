@@ -153,12 +153,22 @@ function toContribution(r: Row): Contribution {
   }
 }
 
-// 考察期观测事件（P2a-1）：一行=一次观测。kind 见 observations.kind 列注释（healthy/hard_fail/soft_fail/unknown）
+// 考察期观测事件的合法类型（封死取值，防拼错——如 'hard-fail' 会被 hasHardFailure 漏判、
+// 导致本该判死的号发分）。healthy 正向健康 / hard_fail 硬失败判死 / soft_fail 软失败不阻断 / unknown 不可观测
+export type ObservationKind = 'healthy' | 'hard_fail' | 'soft_fail' | 'unknown'
+const OBSERVATION_KINDS: ReadonlySet<string> = new Set<ObservationKind>([
+  'healthy',
+  'hard_fail',
+  'soft_fail',
+  'unknown',
+])
+
+// 考察期观测事件（P2a-1）：一行=一次观测。
 export interface Observation {
   id: number
   contributionId: string
   observedAt: number
-  kind: string
+  kind: ObservationKind
   detail: string
   createdAt: number
 }
@@ -177,7 +187,7 @@ function toObservation(r: ObsRow): Observation {
     id: r.id,
     contributionId: r.contribution_id,
     observedAt: r.observed_at,
-    kind: r.kind,
+    kind: r.kind as ObservationKind, // 写入侧 addObservation 已校验，落库值必属合法集
     detail: r.detail,
     createdAt: r.created_at,
   }
@@ -489,7 +499,12 @@ export const db = {
   // ===== 考察期观测事件（P2a-1）=====
   // 纯 CRUD，不含任何状态转移/发分/计时判断（那是 P2a-2/P2b）。
   // 本单只建数据层：暂无写入方——P2b/P2c 巡检时才调 addObservation；此处测试直接驱动。
-  addObservation(contributionId: string, kind: string, detail = ''): void {
+  // kind 收敛为 ObservationKind：编译期挡拼错，运行时再 fail-closed 校验（防非 TS 调用方/动态值
+  // 写入 'hard-fail' 之类被 hasHardFailure 漏判 → 硬失败漏发判死）。
+  addObservation(contributionId: string, kind: ObservationKind, detail = ''): void {
+    if (!OBSERVATION_KINDS.has(kind)) {
+      throw new Error(`[db] 非法观测类型 kind='${kind}'，须为 healthy/hard_fail/soft_fail/unknown 之一`)
+    }
     const now = Date.now()
     conn
       .prepare(
@@ -515,20 +530,24 @@ export const db = {
   },
 
   // ===== 考察快照（P2a-1）=====
-  // 进入考察：记 observe_start_at=now（计时起点）+ 冻结窗口/分值/规则版本/优先级四列。纯写，不做任何决策。
+  // 进入考察：记 observe_start_at=now（计时起点）+ 冻结窗口/分值/规则版本/优先级四列。
+  // compare-and-set（守 observe_start_at IS NULL）——需求 §3.4 冻结契约：进考察那刻冻结、后台改配
+  // 只影响之后。worker 重试/重入若无条件重写会重启计时窗口 + 用改后的配置污染在考察的号。返回是否
+  // 真正初始化了（changes>0）；已在考察则返回 false、快照岿然不动。幂等，与 awardPoints/transition 同调。
   startObservation(
     contributionId: string,
     snap: { windowMs: number; points: number; ruleVersion: string; priority: number },
-  ): void {
+  ): boolean {
     const now = Date.now()
-    conn
+    const r = conn
       .prepare(
         `UPDATE contributions
          SET observe_start_at=?, observe_window_ms=?, snapshot_points=?,
              snapshot_rule_version=?, snapshot_priority=?, updated_at=?
-         WHERE id=?`,
+         WHERE id=? AND observe_start_at IS NULL`,
       )
       .run(now, snap.windowMs, snap.points, snap.ruleVersion, snap.priority, now, contributionId)
+    return r.changes > 0
   },
   // 读回五个快照字段；未进考察（或无此号）时 observeStartAt 等均为 null
   getObservationSnapshot(contributionId: string): {
