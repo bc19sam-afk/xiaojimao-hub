@@ -1,6 +1,6 @@
 import { randomBytes } from 'crypto'
-import { cpa, type IngestResult, type ProviderId, type StartResult } from './cpa'
-import { db, type Contribution } from './db'
+import { cpa, type IngestResult, type ProbeResult, type ProviderId, type StartResult } from './cpa'
+import { db, type Contribution, type ObservationKind } from './db'
 import { env } from './env'
 import type { SessionUser } from './session'
 
@@ -149,6 +149,34 @@ function observeWindowMs(): number {
   return Number.isFinite(n) && n > 0 ? n : env.mock ? 8000 : 86_400_000
 }
 
+// —— §3.3 判定表：inspect 探测结果 → 考察观测事件类型（与 cpamp 建议动作对齐）——
+// cpamp 动作映射（P0-A）：保留→ok、禁用/限流→retry、重登→reauth、删除→reject。reauth 不入此函数
+// （调用点直接转 needs_review）。decision 是 cpamp 权威动作、作主分类；reason 仅在失败类里细分 soft/hard：
+//   软失败（不阻断发分，与 cpamp 内建 request-retry/cooldown 对齐）：额度耗尽 / 限流（临时可恢复）。
+//   硬失败（判死）：401 / 撤权 / 失效（明确失效）。
+// reason 命中细分词表→按词表；reason 不明→保守回落 decision 现有映射（reject→硬 / 其余→软）。
+// ⚠️ MOCK 下 reason 由 mock inspect 给；真实 cpamp reason 结构对接时须复核此词表（见 PR 诚实标注）。
+const SOFT_REASON = /usage.?limit|quota|rate.?limit|too_many|cooldown|throttl/i
+const HARD_REASON = /unauthorized|invalid|revoked?|deactivat/i
+export function observationKind(r: ProbeResult): ObservationKind {
+  // decision=ok（cpamp 保留/启用）＝权威健康：绝不因 reason 字样把 cpamp 认可的活号误判死。
+  if (r.decision === 'ok') return 'healthy'
+  const reason = r.reason || ''
+  if (SOFT_REASON.test(reason)) return 'soft_fail'
+  if (HARD_REASON.test(reason)) return 'hard_fail'
+  return r.decision === 'reject' ? 'hard_fail' : 'soft_fail'
+}
+
+// —— §3.2 故障顺延：本轮成功观测时，相对上次成功观测的「暂停增量」——
+// 近似：以 worker intervalMs 为预期观测间隔。若本次距上次成功观测的 gap 远超预期（> 2× 容忍抖动），
+// 判定中间存在观测空洞（停机 / 不可观测），把「超出一个预期间隔的部分」记为暂停时长（不计入考察窗口 T）。
+// 2× 是工程取值（见 PR 诚实标注）。intervalMs 非正（配置异常）→ 返回 0，退化为纯 wall-clock，不误判全暂停。
+export function pauseIncrement(now: number, base: number, intervalMs: number): number {
+  if (intervalMs <= 0) return 0
+  const gap = now - base
+  return gap > intervalMs * 2 ? gap - intervalMs : 0
+}
+
 // —— 巡检 → 状态机（需求 §3.2 考察期闭环）——
 // worker 周期调用；手动也可触发。running 锁防单进程叠跑，跨实例幂等靠 DB。
 // 拉「进行中」三态：submitted 待首检 / first_check 首检重试中 / observing 考察中。
@@ -215,49 +243,87 @@ export async function processPending(): Promise<{
       }
       const snap = db.getObservationSnapshot(c.id)
       if (snap.observeStartAt == null || snap.observeWindowMs == null) return // 防御：未冻结不结算
-      // 故障顺延（§3.2 不可观测暂停计时）本单不做：计时用 wall-clock 不暂停——最小可用，留 P2b。
-      if (Date.now() - snap.observeStartAt < snap.observeWindowMs) return // 未到期：保持 observing，下轮再看
+      // 故障顺延（§3.2）：考察窗口 T 只计「可观测时段」——用「有效观测时长 = wall-clock − 累积暂停」判到期，
+      // 不可观测（停机/inspect 失败/未覆盖）时段不算进 T。暂停累积见 recordObserveTick；claude/grok 简化路径
+      // 从不记暂停（pausedMs 恒 0）→ 退化为原 wall-clock 判定，行为不变。
+      const pausedMs = db.getObserveTick(c.id).pausedMs
+      if (Date.now() - snap.observeStartAt - pausedMs < snap.observeWindowMs) return // 未到期：保持 observing
       const pts = snap.snapshotPoints ?? 0 // 冻结值，不重查规则
       db.awardPoints(c.linuxdoId, pts, 'contribution', c.id) // 幂等（UNIQUE(reason,ref)）
       db.update(c.id, { points: pts, rewardStatus: 'granted' })
       if (db.transition(c.id, ['observing'], 'granted')) granted++
     }
 
+    // ②' 故障顺延记账（§3.2）：本轮**成功观测**（healthy/soft/hard）时调用——算相对上次成功观测的暂停增量
+    //    （观测空洞＝停机/不可观测），累加进 observe_paused_ms 并把 last_observed_at 推到本次。首次成功观测
+    //    （last_observed_at 尚 null）以进考察时刻 observeStartAt 作空洞起点。unknown/reauth 轮不调（不更新
+    //    last_observed_at），故那段空洞会被下次成功观测算进暂停。
+    const recordTick = (c: (typeof pending)[number]): void => {
+      const snap = db.getObservationSnapshot(c.id)
+      if (snap.observeStartAt == null) return // 防御：未冻结（正常不会——observing 必有 observeStartAt）
+      const base = db.getObserveTick(c.id).lastObservedAt ?? snap.observeStartAt
+      const now = Date.now()
+      db.recordObserveTick(c.id, {
+        lastObservedAt: now,
+        addPausedMs: pauseIncrement(now, base, env.worker.intervalMs),
+      })
+    }
+
     // —— codex：走 cpamp 巡检（能识别套餐 + 额度/失效）——
     const codexPending = pending.filter((c) => c.provider === 'codex')
     if (codexPending.length > 0) {
-      const byId = new Map((await cpa.inspect()).map((r) => [r.accountId, r]))
-      for (const c of codexPending) {
-        const r = byId.get(c.accountId)
-        if (!r) continue // 本轮巡检未覆盖（可能刚入池），下轮再判
-        const plan = r.plan && r.plan !== 'unknown' ? r.plan : c.plan
-        if (c.verifyStatus === 'observing') {
-          // 考察驱动：cpamp inspect 结果映射为观测事件（本单简化，真实差异化巡检 P2b）。
-          // reauth 直接转人工复核，不作为观测事件。
-          if (r.decision === 'reauth') {
-            db.transition(c.id, ['observing'], 'needs_review')
-            continue
-          }
-          const kind =
-            r.decision === 'ok' ? 'healthy' : r.decision === 'reject' ? 'hard_fail' : 'soft_fail'
-          db.addObservation(c.id, kind, `inspect:${r.decision}`)
-          await settle(c)
-        } else {
-          // 首检（submitted/first_check）：decision 决定去向
-          if (r.decision === 'ok') {
-            await enterObservation(c, plan) // 首检通过→进考察
-          } else if (r.decision === 'reject') {
-            try {
-              await cpa.deleteAuthFile(c.authFileName)
-            } catch {
-              /* 同上 */
+      // §3.2 未知不算失败：inspect() 整体抛错（CPA 5xx/网络/巡检侧故障）＝本轮整体不可观测。
+      // try/catch 包住——绝不把「不可观测」当硬失败：所有 codex observing 号记 unknown（不推进：不发分不
+      // 判死），这段空洞留待下次成功观测算进暂停；首检号本轮跳过、下轮再检。
+      let probes: ProbeResult[] | null = null
+      try {
+        probes = await cpa.inspect()
+      } catch {
+        probes = null
+      }
+      if (probes === null) {
+        for (const c of codexPending) {
+          if (c.verifyStatus === 'observing') db.addObservation(c.id, 'unknown', 'inspect-failed')
+        }
+      } else {
+        const byId = new Map(probes.map((r) => [r.accountId, r]))
+        for (const c of codexPending) {
+          const r = byId.get(c.accountId)
+          if (c.verifyStatus === 'observing') {
+            // 本轮巡检未覆盖该 observing 号（刚入池/掉队）＝不可观测：记 unknown（不推进），空洞留待顺延。
+            // （P2a-2 此处是 continue 跳过；改记 unknown 供故障顺延把这段空洞算进暂停。）
+            if (!r) {
+              db.addObservation(c.id, 'unknown', 'not-covered')
+              continue
             }
-            if (db.transition(c.id, ['submitted', 'first_check'], 'failed')) failed++
-          } else if (r.decision === 'reauth') {
-            db.transition(c.id, ['submitted', 'first_check'], 'needs_review')
+            // reauth（OAuth 失效需重授权）直接转人工复核，不作为观测事件（保持 P2a-2 现状）。
+            if (r.decision === 'reauth') {
+              db.transition(c.id, ['observing'], 'needs_review')
+              continue
+            }
+            // 成功观测（healthy/soft/hard）：先记故障顺延账（算空洞→暂停），再记观测事件，再结算。
+            recordTick(c)
+            db.addObservation(c.id, observationKind(r), `inspect:${r.decision}`)
+            await settle(c)
           } else {
-            // retry：临时（限流/额度满），保留隔离，转 first_check 下轮复检
-            db.transition(c.id, ['submitted'], 'first_check')
+            // 首检（submitted/first_check）：未覆盖则本轮跳过；否则 decision 决定去向。
+            if (!r) continue
+            const plan = r.plan && r.plan !== 'unknown' ? r.plan : c.plan
+            if (r.decision === 'ok') {
+              await enterObservation(c, plan) // 首检通过→进考察
+            } else if (r.decision === 'reject') {
+              try {
+                await cpa.deleteAuthFile(c.authFileName)
+              } catch {
+                /* 同上 */
+              }
+              if (db.transition(c.id, ['submitted', 'first_check'], 'failed')) failed++
+            } else if (r.decision === 'reauth') {
+              db.transition(c.id, ['submitted', 'first_check'], 'needs_review')
+            } else {
+              // retry：临时（限流/额度满），保留隔离，转 first_check 下轮复检
+              db.transition(c.id, ['submitted'], 'first_check')
+            }
           }
         }
       }

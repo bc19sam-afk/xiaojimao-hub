@@ -585,6 +585,42 @@ export const db = {
       snapshotPriority: r?.snapshot_priority ?? null,
     }
   },
+
+  // ===== 故障顺延记账（P2b §3.2）=====
+  // 考察窗口 T 只在「可观测时段」流逝：不可观测（worker 停机 / inspect 失败 / 本站重启）时段暂停计时。
+  // 用「暂停时长累积」近似——worker 每轮成功观测时，把超出预期间隔的观测空洞累加进 observe_paused_ms；
+  // 到期判定用「wall-clock − observe_paused_ms」（见 collect.settle）。这两列独立于考察快照五列
+  // （故意不并入 getObservationSnapshot：保其返回形状稳定，不惊动既有 deepEqual 测试）。
+
+  // 记一次成功观测：更新 last_observed_at=本次观测时刻 + 累加暂停增量 addPausedMs（0 亦可，正常轮）。
+  // COALESCE 兜 null→0（migration 006 加列时既有 observing 行为 null）。仅成功观测调用；unknown 轮不调，
+  // 故 last_observed_at 停在上次成功观测——下次成功观测时那段空洞会被算进暂停（§3.2 顺延语义）。
+  recordObserveTick(
+    contributionId: string,
+    tick: { lastObservedAt: number; addPausedMs: number },
+  ): void {
+    const now = Date.now()
+    conn
+      .prepare(
+        `UPDATE contributions
+         SET last_observed_at=?, observe_paused_ms=COALESCE(observe_paused_ms, 0) + ?, updated_at=?
+         WHERE id=?`,
+      )
+      .run(tick.lastObservedAt, tick.addPausedMs, now, contributionId)
+  },
+  // 读回暂停累积与上次成功观测时刻。pausedMs：null→0（settle 用它扣减 wall-clock）；
+  // lastObservedAt：null＝尚无成功观测（记账时以 observeStartAt 兜底作空洞起点）。
+  getObserveTick(contributionId: string): { pausedMs: number; lastObservedAt: number | null } {
+    const r = conn
+      .prepare('SELECT observe_paused_ms, last_observed_at FROM contributions WHERE id=?')
+      .get(contributionId) as unknown as
+      | { observe_paused_ms: number | null; last_observed_at: number | null }
+      | undefined
+    return {
+      pausedMs: r?.observe_paused_ms ?? 0,
+      lastObservedAt: r?.last_observed_at ?? null,
+    }
+  },
 }
 
 export interface PointRule {
