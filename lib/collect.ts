@@ -15,8 +15,15 @@ function recordIngest(
   result: IngestResult,
   method: 'oauth' | 'rt',
 ): CollectResult {
-  if (result.duplicate || !result.accountId) {
-    return { ok: false, error: '该账号已被贡献过（重复账号）' }
+  // 认不出身份：findNew 没找到本 provider 的新号（accountId 空），或三家稳定字段全读不到的
+  // 残缺号——这不是「重复」，用重复文案会误导用户。诚实提示重试即可（认不出身份的号进
+  // needs_review + 人工录入 canonical ID 留待 P2；三家都有稳定字段后此处只剩残缺/异常号）。
+  if (!result.accountId) {
+    return { ok: false, error: '未能确认到新授权的账号，请确认已完成授权后重试' }
+  }
+  // 真重复：拿到了 accountId，但该 (provider, accountId) 已被贡献过 / 池中已有。
+  if (result.duplicate) {
+    return { ok: false, error: '这个号交过了，不能再交' }
   }
   const now = Date.now()
   const contribution: Contribution = {
@@ -38,7 +45,7 @@ function recordIngest(
     updatedAt: now,
   }
   const { duplicate } = db.insertUnique(contribution)
-  if (duplicate) return { ok: false, error: '该账号已被贡献过（重复账号）' }
+  if (duplicate) return { ok: false, error: '这个号交过了，不能再交' }
   return { ok: true, contribution }
 }
 

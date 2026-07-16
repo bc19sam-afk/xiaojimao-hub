@@ -66,13 +66,13 @@ test('① 端到端：同一 accountId 跨 provider（codex+claude）都成功�
 })
 
 // ② 端到端同 provider 判重：同 provider 同 accountId 第二次提交 → 拒绝，DB 仍一行。
-test('② 端到端：同 provider 同 accountId 二次提交被拒（该账号已被贡献过），DB 仍一行', async () => {
+test('② 端到端：同 provider 同 accountId 二次提交被拒（这个号交过了），DB 仍一行', async () => {
   const uid = 3102
   const a = await collect.finishOAuth(user(uid), 'codex', 'seed://same-account-2')
   const b = await collect.finishOAuth(user(uid), 'codex', 'seed://same-account-2')
   if (!a.ok) assert.fail(`首次应成功，却报错：${a.error}`)
   assert.equal(b.ok, false)
-  if (!b.ok) assert.match(b.error, /已被贡献过/)
+  if (!b.ok) assert.match(b.error, /交过了/)
 
   const mine = db.byUser(uid).filter((c) => c.provider === 'codex' && c.accountId === a.contribution.accountId)
   assert.equal(mine.length, 1)
@@ -85,7 +85,7 @@ test('②b 端到端：同一 RT 二次提交被拒，DB 仍一行', async () =>
   const b = await collect.ingestRT(user(uid), 'refresh-token-xyz-123456')
   if (!a.ok) assert.fail(`首次应成功，却报错：${a.error}`)
   assert.equal(b.ok, false)
-  if (!b.ok) assert.match(b.error, /已被贡献过/)
+  if (!b.ok) assert.match(b.error, /交过了/)
 
   const mine = db.byUser(uid).filter((c) => c.accountId === a.contribution.accountId)
   assert.equal(mine.length, 1)

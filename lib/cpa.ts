@@ -210,7 +210,7 @@ async function req(method: string, path: string, body?: unknown): Promise<unknow
 
 interface RawFile {
   name?: string; filename?: string; type?: string; provider?: string
-  account_id?: string; accountId?: string; account?: string
+  account_id?: string; accountId?: string; account?: string; sub?: string
   email?: string; plan?: string; planType?: string; disabled?: boolean
 }
 function normFile(f: RawFile): AuthFile {
@@ -221,11 +221,18 @@ function normFile(f: RawFile): AuthFile {
     providerFromToken(f.provider) ?? providerFromToken(f.type) ?? providerFromToken(name.split('-')[0])
   return {
     name,
-    // 稳定业务 ID 的字段名跨 provider 不同：codex 用 account_id；claude（P0-A 实测）
-    // 稳定 ID 在 account 字段（无 account_id）。account_id 优先；account 兜底**仅限 claude**——
-    // grok 的稳定 ID 尚无样本验证（P0-A），若泛认 account 会把未验证字段当 canonical ID 放行发分；
-    // 也绝不用 claude 的 id 字段（那非稳定业务 ID，会把唯一键锚错）。
-    accountId: f.account_id ?? f.accountId ?? (provider === 'claude' ? f.account : undefined) ?? '',
+    // 稳定业务 ID 的字段名跨 provider 不同，每条兜底都按 provider 划界、绝不跨 provider 泛认
+    // （泛认未验证字段会把错的当 canonical ID 放行发分）：
+    //   codex  —— account_id；
+    //   claude —— account（P0-A 实测，无 account_id）；
+    //   grok   —— sub（OIDC subject；P0-A 扒 CLIProxyAPI xai 源码确认为稳定唯一标识，跨重授权稳定）。
+    // account_id/accountId 最优先；也绝不用 claude 的 id 字段（那非稳定业务 ID，会把唯一键锚错）。
+    accountId:
+      f.account_id ??
+      f.accountId ??
+      (provider === 'claude' ? f.account : undefined) ??
+      (provider === 'grok' ? f.sub : undefined) ??
+      '',
     email: f.email ?? '',
     plan: f.plan ?? f.planType ?? 'unknown',
     disabled: Boolean(f.disabled),
@@ -266,11 +273,22 @@ export async function findNew(
   before: Set<string> = new Set(),
 ): Promise<IngestResult> {
   const files = await client.listAuthFiles()
-  const created = files.find(
-    (f) => f.provider === provider && f.accountId && !known.has(f.accountId) && !before.has(f.name),
-  )
-  if (!created) return { accountId: '', email: '', plan: 'unknown', authFileName: '', duplicate: true }
-  return { accountId: created.accountId, email: created.email, plan: created.plan, authFileName: created.name, duplicate: false }
+  const fresh = files.filter((f) => f.provider === provider && f.accountId && !before.has(f.name))
+  const created = fresh.find((f) => !known.has(f.accountId))
+  if (created) {
+    return { accountId: created.accountId, email: created.email, plan: created.plan, authFileName: created.name, duplicate: false }
+  }
+  // 快照外有新文件、但 accountId 已在 known ＝「已交过的号重新授权又落了一份文件」
+  // （典型：号被拒后文件已删，用户重交——§2.4 要拦的场景）。带回 accountId 让 collect 层
+  // 报「这个号交过了」而非「未能确认」；authFileName 留空——绝不能让 isolate() 去禁用
+  // 池中那个可能正在服务的文件（重交不该有任何外部副作用）。
+  const rejoined = fresh.find((f) => known.has(f.accountId))
+  if (rejoined) {
+    return { accountId: rejoined.accountId, email: rejoined.email, plan: rejoined.plan, authFileName: '', duplicate: true }
+  }
+  // 快照外无本 provider 新文件：授权未完成 / 文件被 cpamp 原地覆盖（重交在池号，原理上与
+  // 未完成不可区分，彻底区分留 P1b-5 响应关联）→ 认不出，collect 层报「未能确认」。
+  return { accountId: '', email: '', plan: 'unknown', authFileName: '', duplicate: true }
 }
 
 const realClient: CpaClient = {
