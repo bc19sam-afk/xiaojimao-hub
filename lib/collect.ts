@@ -62,7 +62,7 @@ export async function finishOAuth(
   provider: ProviderId,
   redirectUrl: string,
 ): Promise<CollectResult> {
-  const known = db.all().map((c) => c.accountId)
+  const known = db.accountIdsFor(provider) // 仅当前 provider 的已知号（account_id 按 provider 独立）
   const result = await cpa.finishOAuth(provider, redirectUrl, known)
   await isolate(result.authFileName)
   return recordIngest(user, provider, result, 'oauth')
@@ -74,7 +74,7 @@ export async function checkOAuth(
   provider: ProviderId,
   state: string,
 ): Promise<{ done: true; result: CollectResult } | { done: false; error?: string }> {
-  const known = db.all().map((c) => c.accountId)
+  const known = db.accountIdsFor(provider) // 仅当前 provider 的已知号
   const r = await cpa.checkOAuth(provider, state, known)
   if (r.status === 'error') return { done: false, error: r.error }
   if (r.status !== 'ok') return { done: false }
@@ -84,7 +84,7 @@ export async function checkOAuth(
 
 // —— 直贴 RT（仅 codex）——
 export async function ingestRT(user: SessionUser, rt: string): Promise<CollectResult> {
-  const known = db.all().map((c) => c.accountId)
+  const known = db.accountIdsFor('codex') // RT 仅 codex
   const result = await cpa.ingestRefreshToken(rt, known)
   await isolate(result.authFileName)
   return recordIngest(user, 'codex', result, 'rt')

@@ -36,6 +36,24 @@ export interface AuthFile {
   email: string
   plan: string
   disabled: boolean
+  provider?: ProviderId // 识别不出时 undefined（findNew 会保守跳过）
+}
+
+// 文件的 provider 标识（type 字段或文件名前缀）→ ProviderId。
+// 两套名字都认：codex；claude=anthropic；grok=xai。识别不出返回 undefined。
+function providerFromToken(token: string | undefined): ProviderId | undefined {
+  switch ((token || '').toLowerCase()) {
+    case 'codex':
+      return 'codex'
+    case 'claude':
+    case 'anthropic':
+      return 'claude'
+    case 'grok':
+    case 'xai':
+      return 'grok'
+    default:
+      return undefined
+  }
 }
 export interface IngestResult {
   accountId: string
@@ -64,13 +82,16 @@ export interface ProbeResult {
   reason: string
 }
 
+// knownAccountIds 语义：**该 provider** 已入库的 accountId 列表（不是全局）。
+// account_id 命名空间按 provider 独立，跨 provider 撞同一 id 是合法新号，
+// 故判重必须按 provider 划界——调用方（collect.ts）负责按 provider 过滤后传入。
 export interface CpaClient {
   startOAuth(provider: ProviderId): Promise<StartResult>
   // redirect 流程：提交回调 URL 完成
   finishOAuth(provider: ProviderId, redirectUrl: string, knownAccountIds: string[]): Promise<IngestResult>
   // device 流程：轮询一次，ok 则落号
   checkOAuth(provider: ProviderId, state: string, knownAccountIds: string[]): Promise<CheckResult>
-  // 直贴 RT（仅 codex）
+  // 直贴 RT（仅 codex）；knownAccountIds 为 codex 的已知 accountId
   ingestRefreshToken(rt: string, knownAccountIds: string[]): Promise<IngestResult>
   listAuthFiles(): Promise<AuthFile[]>
   setDisabled(name: string, disabled: boolean): Promise<void>
@@ -88,7 +109,7 @@ function hash(s: string): string {
   for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0
   return Math.abs(h).toString(36)
 }
-const MOCK_CPA_PATH = join(process.cwd(), 'data', 'mock-cpa.json')
+const MOCK_CPA_PATH = process.env.MOCK_CPA_PATH || join(process.cwd(), 'data', 'mock-cpa.json')
 function mockLoad(): Map<string, AuthFile> {
   try {
     return new Map(Object.entries(JSON.parse(readFileSync(MOCK_CPA_PATH, 'utf8')) as Record<string, AuthFile>))
@@ -101,13 +122,16 @@ function mockSave(store: Map<string, AuthFile>): void {
   writeFileSync(MOCK_CPA_PATH, JSON.stringify(Object.fromEntries(store), null, 2), 'utf8')
 }
 const MOCK_PLAN: Record<ProviderId, string> = { codex: 'plus', claude: 'pro', grok: 'super' }
+// seed 决定 accountId（provider 无关：同 seed 跨 provider → 同 accountId，模拟同一上游号）。
+// authFileName 含 provider 前缀，故判重天然按 (provider, accountId) 划界：
+// 同 provider 同 seed 二次提交 → duplicate；跨 provider 同 seed → 各落一份。
 function mockCreate(provider: ProviderId, seed: string): IngestResult {
   const store = mockLoad()
   const accountId = `acct_${hash(seed)}`
   const authFileName = `${provider}-${accountId}.json`
   if (store.has(authFileName)) return { accountId, email: '', plan: MOCK_PLAN[provider], authFileName, duplicate: true }
   const email = `${provider}_${hash(seed).slice(0, 6)}@example.com`
-  store.set(authFileName, { name: authFileName, accountId, email, plan: MOCK_PLAN[provider], disabled: true })
+  store.set(authFileName, { name: authFileName, accountId, email, plan: MOCK_PLAN[provider], disabled: true, provider })
   mockSave(store)
   return { accountId, email, plan: MOCK_PLAN[provider], authFileName, duplicate: false }
 }
@@ -120,12 +144,13 @@ const mockClient: CpaClient = {
     }
     return { state, url: `https://auth.openai.com/oauth/authorize?mock=1&state=${state}`, flow: 'redirect' }
   },
-  async finishOAuth(provider) {
-    return mockCreate(provider, provider + Math.random())
+  async finishOAuth(provider, redirectUrl) {
+    // seed 取回调 URL：同一号重复提交幂等落同一 accountId（与真实语义一致）
+    return mockCreate(provider, redirectUrl)
   },
-  async checkOAuth(provider) {
-    // mock：直接当作已授权，造号
-    return { status: 'ok', ingest: mockCreate(provider, provider + Math.random()) }
+  async checkOAuth(provider, state) {
+    // mock：直接当作已授权，造号。seed 取 state，同一授权会话轮询幂等
+    return { status: 'ok', ingest: mockCreate(provider, state) }
   },
   async ingestRefreshToken(rt) {
     return mockCreate('codex', 'rt' + rt.slice(0, 12))
@@ -173,17 +198,21 @@ async function req(method: string, path: string, body?: unknown): Promise<unknow
 }
 
 interface RawFile {
-  name?: string; filename?: string
+  name?: string; filename?: string; type?: string
   account_id?: string; accountId?: string
   email?: string; plan?: string; planType?: string; disabled?: boolean
 }
 function normFile(f: RawFile): AuthFile {
+  const name = f.name ?? f.filename ?? ''
+  // provider：优先 auth file 的 type 字段，缺则从文件名前缀（首个 '-' 前）推断
+  const provider = providerFromToken(f.type) ?? providerFromToken(name.split('-')[0])
   return {
-    name: f.name ?? f.filename ?? '',
+    name,
     accountId: f.account_id ?? f.accountId ?? '',
     email: f.email ?? '',
     plan: f.plan ?? f.planType ?? 'unknown',
     disabled: Boolean(f.disabled),
+    provider,
   }
 }
 function parseIdToken(idToken: string): { accountId: string; email: string } {
@@ -205,10 +234,12 @@ async function getAuthStatus(state: string): Promise<{ status: string; error?: s
     error?: string
   }
 }
-// 授权完成后，找出新落的号（accountId 不在已知集合）
-async function findNew(client: CpaClient, known: Set<string>): Promise<IngestResult> {
+// 授权完成后，找出**当前 provider** 新落的号。
+// 先按 provider 过滤候选文件（绝不跨 provider 拿错号；识别不出 provider 的文件保守跳过），
+// 再查 known（该 provider 已知 accountId）。known 只含该 provider，故跨 provider 同 id 不误判重复。
+export async function findNew(client: CpaClient, provider: ProviderId, known: Set<string>): Promise<IngestResult> {
   const files = await client.listAuthFiles()
-  const created = files.find((f) => f.accountId && !known.has(f.accountId))
+  const created = files.find((f) => f.provider === provider && f.accountId && !known.has(f.accountId))
   if (!created) return { accountId: '', email: '', plan: 'unknown', authFileName: '', duplicate: true }
   return { accountId: created.accountId, email: created.email, plan: created.plan, authFileName: created.name, duplicate: false }
 }
@@ -240,15 +271,14 @@ const realClient: CpaClient = {
         await sleep(1000)
       }
     }
-    return findNew(this, known)
+    return findNew(this, provider, known)
   },
 
   async checkOAuth(provider, state, knownAccountIds) {
-    void provider
     const s = await getAuthStatus(state)
     if (s.status === 'error') return { status: 'error', error: s.error || '授权失败' }
     if (s.status !== 'ok') return { status: 'wait' }
-    const ingest = await findNew(this, new Set(knownAccountIds))
+    const ingest = await findNew(this, provider, new Set(knownAccountIds))
     return { status: 'ok', ingest }
   },
 
