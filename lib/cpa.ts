@@ -210,7 +210,7 @@ async function req(method: string, path: string, body?: unknown): Promise<unknow
 
 interface RawFile {
   name?: string; filename?: string; type?: string; provider?: string
-  account_id?: string; accountId?: string; account?: string
+  account_id?: string; accountId?: string; account?: string; sub?: string
   email?: string; plan?: string; planType?: string; disabled?: boolean
 }
 function normFile(f: RawFile): AuthFile {
@@ -221,11 +221,18 @@ function normFile(f: RawFile): AuthFile {
     providerFromToken(f.provider) ?? providerFromToken(f.type) ?? providerFromToken(name.split('-')[0])
   return {
     name,
-    // 稳定业务 ID 的字段名跨 provider 不同：codex 用 account_id；claude（P0-A 实测）
-    // 稳定 ID 在 account 字段（无 account_id）。account_id 优先；account 兜底**仅限 claude**——
-    // grok 的稳定 ID 尚无样本验证（P0-A），若泛认 account 会把未验证字段当 canonical ID 放行发分；
-    // 也绝不用 claude 的 id 字段（那非稳定业务 ID，会把唯一键锚错）。
-    accountId: f.account_id ?? f.accountId ?? (provider === 'claude' ? f.account : undefined) ?? '',
+    // 稳定业务 ID 的字段名跨 provider 不同，每条兜底都按 provider 划界、绝不跨 provider 泛认
+    // （泛认未验证字段会把错的当 canonical ID 放行发分）：
+    //   codex  —— account_id；
+    //   claude —— account（P0-A 实测，无 account_id）；
+    //   grok   —— sub（OIDC subject；P0-A 扒 CLIProxyAPI xai 源码确认为稳定唯一标识，跨重授权稳定）。
+    // account_id/accountId 最优先；也绝不用 claude 的 id 字段（那非稳定业务 ID，会把唯一键锚错）。
+    accountId:
+      f.account_id ??
+      f.accountId ??
+      (provider === 'claude' ? f.account : undefined) ??
+      (provider === 'grok' ? f.sub : undefined) ??
+      '',
     email: f.email ?? '',
     plan: f.plan ?? f.planType ?? 'unknown',
     disabled: Boolean(f.disabled),
