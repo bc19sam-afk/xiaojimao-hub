@@ -199,7 +199,7 @@ async function req(method: string, path: string, body?: unknown): Promise<unknow
 
 interface RawFile {
   name?: string; filename?: string; type?: string; provider?: string
-  account_id?: string; accountId?: string
+  account_id?: string; accountId?: string; account?: string
   email?: string; plan?: string; planType?: string; disabled?: boolean
 }
 function normFile(f: RawFile): AuthFile {
@@ -210,7 +210,10 @@ function normFile(f: RawFile): AuthFile {
     providerFromToken(f.provider) ?? providerFromToken(f.type) ?? providerFromToken(name.split('-')[0])
   return {
     name,
-    accountId: f.account_id ?? f.accountId ?? '',
+    // 稳定业务 ID 的字段名跨 provider 不同：codex 用 account_id；claude（P0-A 实测）
+    // 稳定 ID 在 account 字段（无 account_id）。统一 fallback 链，account_id 优先、
+    // account 末位兜底——绝不用 claude 的 id 字段（那非稳定业务 ID，会把唯一键锚错）。
+    accountId: f.account_id ?? f.accountId ?? f.account ?? '',
     email: f.email ?? '',
     plan: f.plan ?? f.planType ?? 'unknown',
     disabled: Boolean(f.disabled),
