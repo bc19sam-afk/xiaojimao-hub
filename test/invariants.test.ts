@@ -98,3 +98,34 @@ test('状态转移：仅当当前状态∈from 才成功；不匹配不改状态
   assert.ok(afterOk)
   assert.equal(afterOk.verifyStatus, 'verifying')
 })
+
+// ⑤ 终身账本：一号一辈子只发一次分（worker 重试/重入不得重复发分）
+// §3.1/§3.6：唯一号一辈子只发一次分；contributions 一号一行=永久账本永不删除；
+// awardPoints 幂等（UNIQUE(reason,ref)，ref=contribution.id）锁死重入不重复入账。
+test('终身账本：一号一辈子只发一次分（awardPoints 重入幂等、账本行稳定）', () => {
+  const uid = 9005
+  const cid = 'terminal-ledger'
+  const pts = 20
+  const base = db.balance(uid)
+
+  // 落一个唯一号（复合唯一键 provider+account_id）
+  const ins = db.insertUnique(
+    makeContribution({ id: cid, accountId: 'terminal-acc', linuxdoId: uid, provider: 'claude', plan: 'pro' }),
+  )
+  assert.equal(ins.duplicate, false)
+
+  // 首次发分（mirror grant()：幂等发分 + 落 reward 字段）→ 入账，余额 +pts
+  assert.equal(db.awardPoints(uid, pts, 'contribution', cid), true)
+  db.update(cid, { points: pts, rewardStatus: 'granted' })
+  assert.equal(db.balance(uid), base + pts)
+  const afterFirst = db.byUser(uid).find((c) => c.id === cid)
+  assert.ok(afterFirst)
+
+  // worker 重试/重入：同一 (reason='contribution', ref=cid) 二次发分尝试
+  assert.equal(db.awardPoints(uid, pts, 'contribution', cid), false) // 幂等：不再入账
+  assert.equal(db.balance(uid), base + pts) // 余额只加一次，岿然不动
+
+  // 账本行不因二次发分尝试而变化；points / rewardStatus 等 reward 字段稳定
+  const afterSecond = db.byUser(uid).find((c) => c.id === cid)
+  assert.deepEqual(afterSecond, afterFirst)
+})
