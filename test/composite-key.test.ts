@@ -81,12 +81,23 @@ test('升级路径：v1 数据 migrate 到最新后 contributions 行数与内�
   const beforeRows = d.prepare('SELECT * FROM contributions ORDER BY id').all()
 
   const version = migrate(d)
-  assert.equal(version, LATEST_VERSION) // 跑满迁移链到最新（P1b-4 后 LATEST=3，含 003 加表）
+  assert.equal(version, LATEST_VERSION) // 跑满迁移链到最新（含 002 复合唯一键、003 加表、004 加快照列）
   assert.ok(LATEST_VERSION >= 2) // 002（复合唯一键）仍在链上
 
-  const afterRows = d.prepare('SELECT * FROM contributions ORDER BY id').all()
+  const afterRows = d.prepare('SELECT * FROM contributions ORDER BY id').all() as Record<
+    string,
+    unknown
+  >[]
   assert.equal(afterRows.length, beforeRows.length) // 行数不变
-  assert.deepEqual(afterRows, beforeRows) // 内容逐行不变
+  // migration 004 给 contributions 追加了 5 个可空快照列（ALTER ADD COLUMN，向后兼容）：既有行数据
+  // 一字未改、只是 SELECT * 列形状多出几列 null。故按「迁移前的列集」把两侧都归一为普通对象再逐行比
+  // 对——证明原有数据逐行不变，且对未来任何「加可空列」的迁移都稳健（不写死列名）。
+  // （node:sqlite 行对象是 null 原型，两侧须走同一 Object.fromEntries 归一，否则 deepStrictEqual 先
+  //   比原型即失败。）
+  const beforeCols = Object.keys(beforeRows[0] as Record<string, unknown>)
+  const project = (rows: Record<string, unknown>[]) =>
+    rows.map((r) => Object.fromEntries(beforeCols.map((k) => [k, r[k]])))
+  assert.deepEqual(project(afterRows), project(beforeRows as Record<string, unknown>[])) // 原有列逐行不变
   d.close()
 })
 

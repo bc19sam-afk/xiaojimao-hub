@@ -107,12 +107,11 @@ after(() => {
 
 // ── 迁移 003 ──────────────────────────────────────────────────────────────
 
-// 空库 migrate → v3 且 oauth_snapshots 表在、可用
-test('迁移：空库 migrate → v3 且 oauth_snapshots 表建好可用', () => {
+// 空库 migrate → 最新，且 oauth_snapshots 表在、可用（003 在通往最新版的链路上建表）
+test('迁移：空库 migrate → 最新，oauth_snapshots 表建好可用', () => {
   const d = new DatabaseSync(':memory:')
   const version = migrate(d)
-  assert.equal(version, 3)
-  assert.equal(version, LATEST_VERSION)
+  assert.equal(version, LATEST_VERSION) // 003 的 oauth_snapshots 在通往最新版的链路上建好
   assert.ok(tableNames(d).has('oauth_snapshots'), '应建 oauth_snapshots 表')
   // 结构可用：state 主键、file_names、created_at
   d.prepare('INSERT INTO oauth_snapshots (state, file_names, created_at) VALUES (?,?,?)').run('s', '["a.json"]', 1)
@@ -123,15 +122,14 @@ test('迁移：空库 migrate → v3 且 oauth_snapshots 表建好可用', () =>
   d.close()
 })
 
-// v2 旧库（P1a 后有数据）migrate → v3：加表、原数据不丢、version=3（首个「新增功能表」迁移，向后兼容）
-test('迁移：v2 旧库（有数据）migrate → v3 加 oauth_snapshots、原 contributions 不丢、version=3', () => {
+// v2 旧库（P1a 后有数据）migrate → 最新：加 oauth_snapshots、原数据不丢（003 是首个「新增功能表」迁移，向后兼容）
+test('迁移：v2 旧库（有数据）migrate → 最新，加 oauth_snapshots、原 contributions 不丢', () => {
   const d = makeV2Db()
   d.prepare(INSERT_CONTRIB).run('v2row', 42, 'accV2', 'codex') // v2 已有一行贡献
   assert.equal(currentVersion(d), 2)
   assert.ok(!tableNames(d).has('oauth_snapshots'), '前置：v2 不应有 oauth_snapshots')
 
   const version = migrate(d)
-  assert.equal(version, 3)
   assert.equal(version, LATEST_VERSION)
   assert.ok(tableNames(d).has('oauth_snapshots'), 'migrate 后应加上 oauth_snapshots')
 
@@ -142,10 +140,10 @@ test('迁移：v2 旧库（有数据）migrate → v3 加 oauth_snapshots、原 
   }
   assert.equal(row.account_id, 'accV2')
   assert.equal(row.linuxdo_id, 42)
-  // schema_version 单行 = 3
+  // schema_version 单行 = 最新
   const sv = d.prepare('SELECT version FROM schema_version').all() as unknown as { version: number }[]
   assert.equal(sv.length, 1)
-  assert.equal(sv[0].version, 3)
+  assert.equal(sv[0].version, LATEST_VERSION)
   d.close()
 })
 
