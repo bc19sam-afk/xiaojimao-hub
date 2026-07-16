@@ -49,20 +49,20 @@ export default function DashboardShell({
 
   // 有待处理的号时，自动轮询刷新，让后台巡检的结果实时显现（无需手动刷新）
   useEffect(() => {
-    // 进行中三态（submitted 待首检 / first_check 首检中 / observing 考察中）时自动轮询，
-    // 让后台首检→考察→发分的结果实时显现（考察中每轮观测、到期发分都会改变列表）。
-    const hasPending = list.some(
-      (c) =>
-        c.verifyStatus === 'submitted' ||
-        c.verifyStatus === 'first_check' ||
-        c.verifyStatus === 'observing',
+    // 首检态（submitted/first_check）几秒内出结果 → 5s 快轮询；
+    // 考察中（observing）只在窗口 T 到期时才变（真实默认 24h），持续 5s 轮询会造成约 6.9 万请求/天/页
+    //   （codex xhigh review）→ 仅 observing 时降到 30s 慢轮询（MOCK 8s 窗口仍能在 30s 内刷新显现发分）。
+    const hasFastChanging = list.some(
+      (c) => c.verifyStatus === 'submitted' || c.verifyStatus === 'first_check',
     )
-    if (!hasPending) return
+    const hasObserving = list.some((c) => c.verifyStatus === 'observing')
+    if (!hasFastChanging && !hasObserving) return
+    const intervalMs = hasFastChanging ? 5000 : 30000
     const t = setInterval(() => {
       load()
       setLbKey((k) => k + 1)
       setStoreKey((k) => k + 1)
-    }, 5000)
+    }, intervalMs)
     return () => clearInterval(t)
   }, [list, load])
 

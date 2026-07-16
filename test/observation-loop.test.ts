@@ -47,7 +47,7 @@ test('迁移005：旧 7 态→新 6 态映射正确、行数不丢、版本到�
     verifying: 'first_check',
     active: 'granted',
     rejected: 'failed',
-    quarantined: 'observing',
+    quarantined: 'first_check', // 重走首检记快照，避免无快照的 observing 卡死（codex xhigh review）
     reauth: 'needs_review',
     duplicate: 'failed',
   }
