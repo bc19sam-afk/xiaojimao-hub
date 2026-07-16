@@ -141,6 +141,15 @@ export const db = {
     return (conn.prepare('SELECT * FROM contributions').all() as unknown as Row[]).map(toContribution)
   },
 
+  // 某 provider 已入库的 accountId 列表（收号链路按 provider 判重用；account_id 命名空间按 provider 独立）
+  accountIdsFor(provider: string): string[] {
+    return (
+      conn.prepare('SELECT account_id FROM contributions WHERE provider = ?').all(provider) as unknown as {
+        account_id: string
+      }[]
+    ).map((r) => r.account_id)
+  },
+
   byUser(linuxdoId: number): Contribution[] {
     const rows = conn
       .prepare('SELECT * FROM contributions WHERE linuxdo_id = ? ORDER BY created_at DESC')
