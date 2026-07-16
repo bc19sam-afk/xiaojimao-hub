@@ -387,14 +387,20 @@ interface RawInspectionResult {
   accountId?: string; disabled?: boolean; status?: string; action?: string
   actionReason?: string; statusCode?: number | null; isQuota?: boolean; planType?: string; errorKind?: string
 }
-function mapInspection(r: RawInspectionResult): ProbeResult {
+// cpamp codex-inspection 建议动作（P0-A 文档）→ ProbeDecision。文档动作：保留 keep / 启用 enable /
+// 重新登录 relogin / 禁用 disable / 删除 delete。⚠️ relogin/disable 必须在 `!errorKind→ok` 宽松兜底
+// **之前**拦截——否则「需重登/被禁用」的号无 errorKind 时会 fall-through 成 ok→被当健康发分。
+// （真实 cpamp 的 action 字段名待对接样本最终核对，见 P1b-5 类「真实对接前必验」清单。）
+export function mapInspection(r: RawInspectionResult): ProbeResult {
   const code = r.statusCode ?? 0
   const plan = (r.planType || 'unknown').toLowerCase()
   const reason = r.actionReason || r.errorKind || r.status || ''
   let decision: ProbeDecision
-  if (r.isQuota || code === 402 || code === 429) decision = 'retry'
+  // disable=禁用观察（额度超阈/状态异常）→ 软失败：不判死、继续观察（reason 词表在 observationKind 再细分）
+  if (r.isQuota || code === 402 || code === 429 || r.action === 'disable') decision = 'retry'
   else if (code === 401 || r.errorKind === 'invalidated' || r.action === 'delete') decision = 'reject'
-  else if (r.action === 'reauth' || r.errorKind === 'reauth') decision = 'reauth'
+  // relogin/reauth=OAuth 失效需重授权 → 转人工复核（不作为观测事件，见 processPending）
+  else if (r.action === 'reauth' || r.action === 'relogin' || r.errorKind === 'reauth') decision = 'reauth'
   else if (code === 200 || r.action === 'enable' || r.action === 'keep' || !r.errorKind) decision = 'ok'
   else decision = 'retry'
   return { accountId: r.accountId ?? '', decision, plan, reason }

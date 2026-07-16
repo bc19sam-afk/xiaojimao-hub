@@ -266,6 +266,35 @@ export const migrations: Migration[] = [
       }
     },
   },
+  {
+    version: 6,
+    // migration 006（P2b）：故障顺延（§3.2 不可观测时段暂停考察计时）数据地基。纯新增、向后兼容——
+    //   给 contributions 加两列（仿 004 的 ALTER ADD COLUMN，一列一条）：
+    //     ① observe_paused_ms —— 累积暂停时长（不可观测时段，不计入考察窗口 T）。null 按 0 处理。
+    //     ② last_observed_at  —— 上次**成功观测**时刻，供下轮算观测空洞增量。null＝尚无成功观测。
+    //   ADD COLUMN 只追加可空列，不重写已有行、不改约束，旧代码不读新列即无影响——故非破坏。
+    up(db) {
+      db.exec('ALTER TABLE contributions ADD COLUMN observe_paused_ms INTEGER')
+      db.exec('ALTER TABLE contributions ADD COLUMN last_observed_at INTEGER')
+      // 回填 in-flight observing 行的 last_observed_at（从最近一次非 unknown 观测时刻）。
+      // 否则部署 P2b 时正在考察的号，首次 recordTick 会以 observe_start_at 为基点、把整个部署前
+      // 考察窗口误算成停机 → 有效进度重置、发分大延迟。只回填「有观测记录」的行（EXISTS 守卫）；
+      // 从没被观测过的 observing 行留 null（首次 tick 以 observe_start_at 兜底，语义正确）。
+      db.exec(`
+        UPDATE contributions
+        SET last_observed_at = (
+          SELECT MAX(o.observed_at) FROM observations o
+          WHERE o.contribution_id = contributions.id AND o.kind != 'unknown'
+        )
+        WHERE verify_status = 'observing'
+          AND last_observed_at IS NULL
+          AND EXISTS (
+            SELECT 1 FROM observations o2
+            WHERE o2.contribution_id = contributions.id AND o2.kind != 'unknown'
+          )
+      `)
+    },
+  },
 ]
 
 // 代码所知的最新 schema 版本（从 migrations 数组派生，勿手写）
