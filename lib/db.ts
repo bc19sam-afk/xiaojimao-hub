@@ -595,6 +595,9 @@ export const db = {
   // 记一次成功观测：更新 last_observed_at=本次观测时刻 + 累加暂停增量 addPausedMs（0 亦可，正常轮）。
   // COALESCE 兜 null→0（migration 006 加列时既有 observing 行为 null）。仅成功观测调用；unknown 轮不调，
   // 故 last_observed_at 停在上次成功观测——下次成功观测时那段空洞会被算进暂停（§3.2 顺延语义）。
+  // ⚠️ 单实例假设：无条件累加 observe_paused_ms。首版部署形态为单机单实例单 worker（processPending
+  // 有 running 锁串行），故不会并发。多实例演进（换 PostgreSQL/worker 独立进程）时须改 CAS——守
+  // last_observed_at=期望旧值，否则多 worker 各读同一 last_observed_at、把同一次停机重复累加。见路线图。
   recordObserveTick(
     contributionId: string,
     tick: { lastObservedAt: number; addPausedMs: number },

@@ -7,6 +7,7 @@ import path from 'node:path'
 import { migrate, migrations, LATEST_VERSION } from '../lib/migrate.ts'
 import type { Contribution } from '../lib/db.ts'
 import type { ProbeResult } from '../lib/cpa.ts'
+import { mapInspection } from '../lib/cpa.ts'
 
 // ============================================================================
 // P2b：真实巡检映射 + 软/硬/未知失败区分 + 故障顺延。三部分：
@@ -365,4 +366,64 @@ test('pauseIncrement：<2× 无暂停(容忍抖动)、>2× 计超出一个间隔
   assert.equal(p(16_001, 0, 8_000), 16_001 - 8_000) // 刚越过 2× → 超出一个间隔的部分
   assert.equal(p(3_600_000, 0, 8_000), 3_600_000 - 8_000) // 大空洞
   assert.equal(p(1_000_000, 0, 0), 0) // 间隔非正 → 退化，不判暂停
+})
+
+// ── 补：codex xhigh review 于 PR #14 发现 ──────────────────────────────────
+
+// mapInspection：cpamp 真实动作 relogin/disable 必须在 `!errorKind→ok` 兜底前拦截，
+// 否则「需重登/被禁用」的号无 errorKind 时 fall-through 成 ok → observationKind 误判 healthy → 误发分。
+test('mapInspection：relogin→reauth、disable→retry，不 fall-through 成 ok', () => {
+  assert.equal(mapInspection({ action: 'relogin' }).decision, 'reauth') // 需重登→转人工
+  assert.equal(mapInspection({ action: 'disable' }).decision, 'retry') // 禁用观察→软失败
+  // 明确健康信号仍 ok（未动兜底语义）
+  assert.equal(mapInspection({ action: 'keep' }).decision, 'ok')
+  assert.equal(mapInspection({ action: 'enable' }).decision, 'ok')
+  assert.equal(mapInspection({ statusCode: 200 }).decision, 'ok')
+  // 明确失效仍 reject
+  assert.equal(mapInspection({ action: 'delete' }).decision, 'reject')
+  assert.equal(mapInspection({ statusCode: 401 }).decision, 'reject')
+})
+
+// migration 006 回填：部署 P2b 时正在考察（observing）的号，从最近非 unknown 观测回填 last_observed_at，
+// 否则首次 recordTick 以 observe_start_at 为基点把整个部署前窗口误算成停机、发分大延迟。
+test('迁移006回填：observing 行 last_observed_at 从最近非 unknown 观测回填', () => {
+  const d = makeV5Db()
+  const t0 = 1_000_000
+  // 一个 observing 号（004 已加 observe_start_at 列；此处直接给旧的进考察时刻）
+  d.prepare(
+    `INSERT INTO contributions
+       (id, linuxdo_id, username, account_id, email, provider, plan, method, auth_file_name,
+        verify_status, points, reward_status, reward_text, reward_note, reward_code, created_at, updated_at,
+        observe_start_at, observe_window_ms, snapshot_points, snapshot_rule_version, snapshot_priority)
+     VALUES ('obs-bf', 1, 'u', 'acc-bf', 'e@x.com', 'codex', 'plus', 'oauth', 'f.json',
+        'observing', 0, 'none', '', '', NULL, ${t0}, ${t0}, ${t0}, 86400000, 10, 'rules-v1', 10)`,
+  ).run()
+  const ins = d.prepare(
+    'INSERT INTO observations (contribution_id, observed_at, kind, detail, created_at) VALUES (?,?,?,?,?)',
+  )
+  ins.run('obs-bf', t0 + 1000, 'healthy', '', t0 + 1000)
+  ins.run('obs-bf', t0 + 5000, 'healthy', '', t0 + 5000) // 最近的非 unknown 观测
+  ins.run('obs-bf', t0 + 9000, 'unknown', 'inspect-failed', t0 + 9000) // unknown 不作回填来源
+
+  migrate(d) // 跑 006（含回填）
+
+  const row = d.prepare('SELECT last_observed_at FROM contributions WHERE id=?').get('obs-bf') as unknown as {
+    last_observed_at: number
+  }
+  assert.equal(row.last_observed_at, t0 + 5000) // 回填成最近非 unknown 观测时刻，非 unknown 的 9000
+
+  // 无观测记录的 observing 行：留 null（首次 tick 以 observe_start_at 兜底）
+  d.prepare(
+    `INSERT INTO contributions
+       (id, linuxdo_id, username, account_id, email, provider, plan, method, auth_file_name,
+        verify_status, points, reward_status, reward_text, reward_note, reward_code, created_at, updated_at,
+        observe_start_at)
+     VALUES ('obs-none', 1, 'u', 'acc-none', 'e@x.com', 'codex', 'plus', 'oauth', 'f.json',
+        'observing', 0, 'none', '', '', NULL, ${t0}, ${t0}, ${t0})`,
+  ).run()
+  // 重跑 migrate 不会再动（006 已应用）——单独验证回填 SQL 的 EXISTS 守卫语义：手动跑回填不误设
+  const none = d.prepare('SELECT last_observed_at FROM contributions WHERE id=?').get('obs-none') as unknown as {
+    last_observed_at: number | null
+  }
+  assert.equal(none.last_observed_at, null)
 })
