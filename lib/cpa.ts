@@ -198,14 +198,16 @@ async function req(method: string, path: string, body?: unknown): Promise<unknow
 }
 
 interface RawFile {
-  name?: string; filename?: string; type?: string
+  name?: string; filename?: string; type?: string; provider?: string
   account_id?: string; accountId?: string
   email?: string; plan?: string; planType?: string; disabled?: boolean
 }
 function normFile(f: RawFile): AuthFile {
   const name = f.name ?? f.filename ?? ''
-  // provider：优先 auth file 的 type 字段，缺则从文件名前缀（首个 '-' 前）推断
-  const provider = providerFromToken(f.type) ?? providerFromToken(name.split('-')[0])
+  // provider：依次认显式 provider 字段、type 字段、文件名前缀（首个 '-' 前）——
+  // 真实 cpamp 的字段/命名未完全确定，三条路都认，识别不出才落 undefined
+  const provider =
+    providerFromToken(f.provider) ?? providerFromToken(f.type) ?? providerFromToken(name.split('-')[0])
   return {
     name,
     accountId: f.account_id ?? f.accountId ?? '',
