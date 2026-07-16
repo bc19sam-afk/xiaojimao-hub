@@ -201,6 +201,33 @@ export const migrations: Migration[] = [
       `)
     },
   },
+  {
+    version: 4,
+    // migration 004（P2a-1）：考察期数据地基。纯新增、向后兼容——
+    //   ① 新表 observations：考察期观测事件持久化（发分判定「以系统实际观测并持久化的事件为准」的依据）。
+    //   ② contributions 加 5 个考察快照可空列：进考察时冻结窗口 T / 分值 / 规则版本 / 优先级 + 计时起点。
+    // 本项目首个用 ALTER TABLE ADD COLUMN 的迁移（002 是重建表）：SQLite 的 ADD COLUMN 只追加可空列，
+    //   既不重写已有行、也不改约束，旧代码不读新列即无影响——故非破坏。SQLite 不能一条 ALTER 加多列，一列一条。
+    up(db) {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS observations (
+          id             INTEGER PRIMARY KEY AUTOINCREMENT,
+          contribution_id TEXT NOT NULL,
+          observed_at    INTEGER NOT NULL,
+          kind           TEXT NOT NULL,   -- healthy / hard_fail / soft_fail / unknown
+          detail         TEXT NOT NULL DEFAULT '',
+          created_at     INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_obs_contrib ON observations(contribution_id);
+      `)
+      // 考察快照列：都可空＝未进考察时为 null（向后兼容）。一列一条 ALTER ADD COLUMN，不重建表。
+      db.exec('ALTER TABLE contributions ADD COLUMN observe_start_at INTEGER')
+      db.exec('ALTER TABLE contributions ADD COLUMN observe_window_ms INTEGER')
+      db.exec('ALTER TABLE contributions ADD COLUMN snapshot_points INTEGER')
+      db.exec('ALTER TABLE contributions ADD COLUMN snapshot_rule_version TEXT')
+      db.exec('ALTER TABLE contributions ADD COLUMN snapshot_priority INTEGER')
+    },
+  },
 ]
 
 // 代码所知的最新 schema 版本（从 migrations 数组派生，勿手写）
