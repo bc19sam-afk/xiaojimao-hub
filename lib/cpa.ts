@@ -240,12 +240,24 @@ async function getAuthStatus(state: string): Promise<{ status: string; error?: s
     error?: string
   }
 }
-// 授权完成后，找出**当前 provider** 新落的号。
-// 先按 provider 过滤候选文件（绝不跨 provider 拿错号；识别不出 provider 的文件保守跳过），
-// 再查 known（该 provider 已知 accountId）。known 只含该 provider，故跨 provider 同 id 不误判重复。
-export async function findNew(client: CpaClient, provider: ProviderId, known: Set<string>): Promise<IngestResult> {
+// 授权完成后，找出**当前 provider** 新落的号。三重过滤：
+//   ① provider——绝不跨 provider 拿错号；识别不出 provider 的文件保守跳过；
+//   ② known（该 provider 已知 accountId）——只含该 provider，故跨 provider 同 id 不误判重复；
+//   ③ before——授权动作**之前**的 auth-files 文件名快照，只认快照外的**新文件**。
+// ③ 是防「抢注号池既有号」的关键：cpamp 号池官方号/贡献号共用，池里本就有一堆不属于 hub
+//   （不在 known）的号；没有快照时 findNew 会把池中某个既有号误当成用户刚授权的新号，进而记到
+//   提交者名下、被 isolate() 禁用（那是生产号！）、错发分。before 用文件名（f.name）做身份——
+//   比 accountId 稳、且唯一。before 为空集 → 该条件恒真＝退化为原行为（无快照的调用方仍可用）。
+export async function findNew(
+  client: CpaClient,
+  provider: ProviderId,
+  known: Set<string>,
+  before: Set<string> = new Set(),
+): Promise<IngestResult> {
   const files = await client.listAuthFiles()
-  const created = files.find((f) => f.provider === provider && f.accountId && !known.has(f.accountId))
+  const created = files.find(
+    (f) => f.provider === provider && f.accountId && !known.has(f.accountId) && !before.has(f.name),
+  )
   if (!created) return { accountId: '', email: '', plan: 'unknown', authFileName: '', duplicate: true }
   return { accountId: created.accountId, email: created.email, plan: created.plan, authFileName: created.name, duplicate: false }
 }
@@ -268,6 +280,9 @@ const realClient: CpaClient = {
     } catch {
       throw new Error('回调链接格式不对，请粘贴完整的地址栏 URL')
     }
+    // 授权前快照：oauth-callback 本身就可能落文件，快照必须早于它。findNew 只认快照外的新文件名，
+    // 避免把号池里既有号（不在 hub known、授权前就存在）误当成用户刚授权的新号（见 findNew 注释③）。
+    const before = new Set((await this.listAuthFiles()).map((f) => f.name).filter(Boolean))
     await req('POST', '/v0/management/oauth-callback', { provider: CPA_PROVIDER[provider], redirect_url: redirectUrl })
     if (state) {
       for (let i = 0; i < 15; i++) {
@@ -277,14 +292,18 @@ const realClient: CpaClient = {
         await sleep(1000)
       }
     }
-    return findNew(this, provider, known)
+    return findNew(this, provider, known, before)
   },
 
   async checkOAuth(provider, state, knownAccountIds) {
     const s = await getAuthStatus(state)
     if (s.status === 'error') return { status: 'error', error: s.error || '授权失败' }
     if (s.status !== 'ok') return { status: 'wait' }
-    const ingest = await findNew(this, provider, new Set(knownAccountIds))
+    // ⚠️ 已知残留洞（grok 对接前必补）：device 流程跨请求（startOAuth 拿 state → 用户别处授权 →
+    // 本请求轮询落号），单请求内拿不到「授权前」快照，故显式传空 before＝退化为旧行为，仍可能抢注
+    // 号池既有号（见 findNew 注释③）。grok 目前无号（P0-A）、device 流程整体未验证，跨请求快照
+    // 存储设计留到 grok 对接单再做——不在本单为没有号的流程做半吊子存储。
+    const ingest = await findNew(this, provider, new Set(knownAccountIds), new Set())
     return { status: 'ok', ingest }
   },
 
