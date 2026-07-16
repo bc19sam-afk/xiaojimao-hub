@@ -222,3 +222,63 @@ test('device 反证：空 before（旧行为）会抢注池中既有 poolC', asy
   const grabbed = await findNew(client, 'grok', new Set<string>(), new Set<string>())
   assert.equal(grabbed.accountId, 'acct-poolC') // 没有快照就抢注池中既有号（正是本单要修的）
 })
+
+// ── fail-closed：快照缺失即拒绝（codex xhigh 于 PR #10 指出）─────────────────
+// 静默降级空 before ＝ 完全退化回抢注号池既有号的旧行为。触发面：入库成功已删快照但响应丢失后的
+// 重试、快照过期被清理、部署前发起的授权。真实模式必须拒绝并引导重新发起授权；且拒绝要发生在
+// oauth-callback 之前（否则号已落、又必孤立）。
+
+// finishOAuth：快照缺失 → 拒绝，且绝不触发任何 CPA 请求（callback 前拦下）
+test('fail-closed：finishOAuth 快照缺失即拒绝，不触发 oauth-callback', async () => {
+  const uid = 4003
+  const state = 'st-missing-1' // 从未 setOAuthSnapshot（模拟已消费/过期/部署前发起）
+  let touched = 0
+  globalThis.fetch = (async () => {
+    touched++
+    throw new Error('fail-closed 下不该有任何 CPA 请求')
+  }) as typeof fetch
+
+  const r = await collect.finishOAuth(user(uid), 'claude', `https://app/callback?state=${state}`)
+  assert.equal(r.ok, false)
+  if (!r.ok) assert.match(r.error, /重新点击「发起授权」/)
+  assert.equal(touched, 0) // callback 之前就拦下——号不会孤立
+  assert.equal(db.byUser(uid).length, 0) // 未入任何库
+})
+
+// checkOAuth（device）：快照缺失 → done:false + 错误提示，同样不触发 CPA 请求
+test('fail-closed：checkOAuth 快照缺失即拒绝，不触发 CPA 请求', async () => {
+  const uid = 4004
+  let touched = 0
+  globalThis.fetch = (async () => {
+    touched++
+    throw new Error('fail-closed 下不该有任何 CPA 请求')
+  }) as typeof fetch
+
+  const r = await collect.checkOAuth(user(uid), 'grok', 'st-missing-2')
+  assert.equal(r.done, false)
+  if (!r.done) assert.match(r.error ?? '', /重新点击「发起授权」/)
+  assert.equal(touched, 0)
+})
+
+// 入库成功删快照后，同 state 重试（响应丢失场景）→ 被 fail-closed 拒绝，绝不抢注池中号
+test('fail-closed：成功入库删快照后同 state 重试被拒绝，不退化为抢注', async () => {
+  const uid = 4005
+  const state = 'st-consumed-1'
+  const cbUrl = `https://app/callback?state=${state}`
+  db.setOAuthSnapshot(state, ['anthropic-poolA.json'])
+  installFetch([
+    { name: 'anthropic-poolA.json', provider: 'anthropic', account: 'acct-poolA' },
+    { name: 'anthropic-newE.json', provider: 'anthropic', account: 'acct-newE' },
+  ])
+
+  const first = await collect.finishOAuth(user(uid), 'claude', cbUrl)
+  if (!first.ok) assert.fail(`首次应成功：${first.error}`)
+  assert.equal(db.getOAuthSnapshot(state), null) // 快照已消费删除
+
+  // 响应丢失，用户重试同一回调 URL：快照已无 → 拒绝（修复前：空 before → 抢注 poolA）
+  const retry = await collect.finishOAuth(user(uid), 'claude', cbUrl)
+  assert.equal(retry.ok, false)
+  if (!retry.ok) assert.match(retry.error, /重新点击「发起授权」/)
+  // poolA 从未被记到任何人名下
+  assert.equal(db.byUser(uid).filter((c) => c.accountId === 'acct-poolA').length, 0)
+})

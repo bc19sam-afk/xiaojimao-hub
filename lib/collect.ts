@@ -1,6 +1,7 @@
 import { randomBytes } from 'crypto'
 import { cpa, type IngestResult, type ProviderId, type StartResult } from './cpa'
 import { db, type Contribution } from './db'
+import { env } from './env'
 import type { SessionUser } from './session'
 
 type CollectResult =
@@ -51,8 +52,8 @@ async function isolate(authFileName: string): Promise<void> {
   }
 }
 
-// 从回调 URL 解析 OAuth state（快照键）。解析不出返回 ''——降级为空 before＝仍安全；
-// 真正的「回调链接格式不对」由 cpa.finishOAuth 内的严格解析负责报给用户。
+// 从回调 URL 解析 OAuth state（快照键）。解析不出返回 ''——真实模式下无 state＝无法定位授权前
+// 快照，走 fail-closed 拒绝（见 finishOAuth）；「回调链接格式不对」的用户提示仍由 cpa.finishOAuth 负责。
 function parseState(redirectUrl: string): string {
   try {
     return new URL(redirectUrl).searchParams.get('state') ?? ''
@@ -60,6 +61,12 @@ function parseState(redirectUrl: string): string {
     return ''
   }
 }
+
+// 真实模式下快照缺失的 fail-closed 拒绝语（codex xhigh 于 PR #10 指出：静默降级为空 before
+// ＝完全退化回抢注号池既有号的旧行为——响应丢失后的重试、快照过期、部署前发起的授权都会踩中）。
+// mock 模式不设此门：mock 的 finishOAuth/checkOAuth 走 mockCreate 不调 findNew，空 before 无害，
+// 且演示/测试常直接调 finishOAuth 不经 startOAuth。
+const SNAPSHOT_MISSING_ERROR = '授权会话已过期或已完成，请重新点击「发起授权」后再试'
 
 // —— 发起授权（provider 决定流程：redirect / device）——
 // P1b-4：授权前给 auth-files 拍文件名快照，按 state 持久化跨请求。finishOAuth/checkOAuth 读它作
@@ -83,7 +90,11 @@ export async function finishOAuth(
 ): Promise<CollectResult> {
   const known = db.accountIdsFor(provider) // 仅当前 provider 的已知号（account_id 按 provider 独立）
   const state = parseState(redirectUrl)
-  const before = new Set(db.getOAuthSnapshot(state) ?? []) // 授权前持久化快照（无则空＝降级仍安全）
+  const snapshot = state ? db.getOAuthSnapshot(state) : null
+  // fail-closed：真实模式下快照缺失（已消费/过期/部署前发起/无 state）→ 在 oauth-callback **之前**
+  // 拒绝——空 before 会退化回抢注号池既有号；若放行到 callback 后号已落、又必孤立。
+  if (!snapshot && !env.mock) return { ok: false, error: SNAPSHOT_MISSING_ERROR }
+  const before = new Set(snapshot ?? [])
   const result = await cpa.finishOAuth(provider, redirectUrl, known, before)
   await isolate(result.authFileName)
   const recorded = recordIngest(user, provider, result, 'oauth')
@@ -98,7 +109,10 @@ export async function checkOAuth(
   state: string,
 ): Promise<{ done: true; result: CollectResult } | { done: false; error?: string }> {
   const known = db.accountIdsFor(provider) // 仅当前 provider 的已知号
-  const before = new Set(db.getOAuthSnapshot(state) ?? []) // startOAuth 按 state 持久化的授权前快照
+  const snapshot = state ? db.getOAuthSnapshot(state) : null
+  // fail-closed 同 finishOAuth：真实模式快照缺失即拒绝，绝不带空 before 去认号
+  if (!snapshot && !env.mock) return { done: false, error: SNAPSHOT_MISSING_ERROR }
+  const before = new Set(snapshot ?? [])
   const r = await cpa.checkOAuth(provider, state, known, before)
   if (r.status === 'error') return { done: false, error: r.error }
   if (r.status !== 'ok') return { done: false }
