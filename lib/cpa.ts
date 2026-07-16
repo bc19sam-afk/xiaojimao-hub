@@ -87,10 +87,21 @@ export interface ProbeResult {
 // 故判重必须按 provider 划界——调用方（collect.ts）负责按 provider 过滤后传入。
 export interface CpaClient {
   startOAuth(provider: ProviderId): Promise<StartResult>
-  // redirect 流程：提交回调 URL 完成
-  finishOAuth(provider: ProviderId, redirectUrl: string, knownAccountIds: string[]): Promise<IngestResult>
-  // device 流程：轮询一次，ok 则落号
-  checkOAuth(provider: ProviderId, state: string, knownAccountIds: string[]): Promise<CheckResult>
+  // redirect 流程：提交回调 URL 完成。before＝授权前 auth-files 文件名快照（P1b-4 由 collect 层从
+  // 按 state 持久化的快照读出后传入），交给 findNew 挡号池既有号（见 findNew 注释③）。
+  finishOAuth(
+    provider: ProviderId,
+    redirectUrl: string,
+    knownAccountIds: string[],
+    before: Set<string>,
+  ): Promise<IngestResult>
+  // device 流程：轮询一次，ok 则落号。before 同上（device 跨请求，快照由 startOAuth 拍并持久化）。
+  checkOAuth(
+    provider: ProviderId,
+    state: string,
+    knownAccountIds: string[],
+    before: Set<string>,
+  ): Promise<CheckResult>
   // 直贴 RT（仅 codex）；knownAccountIds 为 codex 的已知 accountId
   ingestRefreshToken(rt: string, knownAccountIds: string[]): Promise<IngestResult>
   listAuthFiles(): Promise<AuthFile[]>
@@ -272,7 +283,7 @@ const realClient: CpaClient = {
     return { state: data.state, url: data.url, flow, userCode: data.user_code }
   },
 
-  async finishOAuth(provider, redirectUrl, knownAccountIds) {
+  async finishOAuth(provider, redirectUrl, knownAccountIds, before) {
     const known = new Set(knownAccountIds)
     let state = ''
     try {
@@ -280,9 +291,9 @@ const realClient: CpaClient = {
     } catch {
       throw new Error('回调链接格式不对，请粘贴完整的地址栏 URL')
     }
-    // 授权前快照：oauth-callback 本身就可能落文件，快照必须早于它。findNew 只认快照外的新文件名，
-    // 避免把号池里既有号（不在 hub known、授权前就存在）误当成用户刚授权的新号（见 findNew 注释③）。
-    const before = new Set((await this.listAuthFiles()).map((f) => f.name).filter(Boolean))
+    // before＝授权前 auth-files 文件名快照（P1b-4：由 collect 层在 startOAuth 拍、按 state 持久化后读入
+    // 传来）。快照拍于授权动作之前，findNew 只认快照外的新文件名，避免把号池既有号（不在 hub known、
+    // 授权前就存在）误当成用户刚授权的新号（见 findNew 注释③）。持久化跨请求＝retry 读同一快照不孤立。
     await req('POST', '/v0/management/oauth-callback', { provider: CPA_PROVIDER[provider], redirect_url: redirectUrl })
     if (state) {
       for (let i = 0; i < 15; i++) {
@@ -295,15 +306,14 @@ const realClient: CpaClient = {
     return findNew(this, provider, known, before)
   },
 
-  async checkOAuth(provider, state, knownAccountIds) {
+  async checkOAuth(provider, state, knownAccountIds, before) {
     const s = await getAuthStatus(state)
     if (s.status === 'error') return { status: 'error', error: s.error || '授权失败' }
     if (s.status !== 'ok') return { status: 'wait' }
-    // ⚠️ 已知残留洞（grok 对接前必补）：device 流程跨请求（startOAuth 拿 state → 用户别处授权 →
-    // 本请求轮询落号），单请求内拿不到「授权前」快照，故显式传空 before＝退化为旧行为，仍可能抢注
-    // 号池既有号（见 findNew 注释③）。grok 目前无号（P0-A）、device 流程整体未验证，跨请求快照
-    // 存储设计留到 grok 对接单再做——不在本单为没有号的流程做半吊子存储。
-    const ingest = await findNew(this, provider, new Set(knownAccountIds), new Set())
+    // device 流程跨请求（startOAuth 拿 state → 用户别处授权 → 本请求轮询落号）：授权前快照由
+    // startOAuth 拍、按 state 持久化，collect 层读出后作 before 传入（P1b-4 修好了 P1b-3 遗留的
+    // 「device 传空 before」抢注洞）。findNew 只认快照外新文件，挡号池既有号（见 findNew 注释③）。
+    const ingest = await findNew(this, provider, new Set(knownAccountIds), before)
     return { status: 'ok', ingest }
   },
 

@@ -77,24 +77,22 @@ test('③ 向后兼容：空 before 下 provider 过滤与 known 判重仍生效
   assert.equal(none.accountId, '')
 })
 
-// ④ 端到端（真实 redirect 链）：cpa.finishOAuth 授权前拍快照（仅 poolA），授权后 auth-files
-//    变为 [poolA, newB]，结果只认 newB。证明整条链只认授权后新增号，不抢注池中 poolA。
-test('④ 端到端：redirect 链只认授权后新增号，不抢注池中 poolA', async () => {
+// ④ 端到端（真实 redirect 链）：P1b-4 后 cpa.finishOAuth 不再自拍快照，改用调用方传入的授权前快照
+//    （collect 层从按 state 持久化的快照读出）。授权后 auth-files=[poolA, newB]、传入快照={poolA}，
+//    findNew 只认快照外的 newB。证明整条链只认授权后新增号，不抢注池中 poolA。
+test('④ 端到端：redirect 链用调用方传入的授权前快照，只认新增号不抢注 poolA', async () => {
   let listCalls = 0
   globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
     const u = String(url)
     const method = (init?.method || 'GET').toUpperCase()
     if (u.endsWith('/v0/management/auth-files') && method === 'GET') {
       listCalls++
-      // 首次（授权前快照）：仅 poolA；第二次（findNew）：poolA + 新落的 newB。
+      // 授权后 auth-files：poolA（池中既有）+ newB（本次授权新落）。快照不再由 finishOAuth 自拍。
       // claude 号稳定 ID 在 account 字段（normFile 对 claude 采纳 account 作 accountId）。
-      const files =
-        listCalls === 1
-          ? [{ name: 'anthropic-poolA.json', provider: 'anthropic', account: 'acct-poolA' }]
-          : [
-              { name: 'anthropic-poolA.json', provider: 'anthropic', account: 'acct-poolA' },
-              { name: 'anthropic-newB.json', provider: 'anthropic', account: 'acct-newB' },
-            ]
+      const files = [
+        { name: 'anthropic-poolA.json', provider: 'anthropic', account: 'acct-poolA' },
+        { name: 'anthropic-newB.json', provider: 'anthropic', account: 'acct-newB' },
+      ]
       return new Response(JSON.stringify({ files }), { status: 200 })
     }
     if (u.endsWith('/v0/management/oauth-callback') && method === 'POST') {
@@ -106,10 +104,12 @@ test('④ 端到端：redirect 链只认授权后新增号，不抢注池中 poo
     throw new Error('测试桩：不该请求 ' + method + ' ' + u)
   }) as typeof fetch
 
-  const r = await cpa.finishOAuth('claude', 'https://app/callback?state=st-p1b3', [])
+  // 调用方传入授权前快照 {poolA}（P1b-4：由 startOAuth 拍、按 state 持久化，此处模拟已读出后传入）
+  const before = new Set(['anthropic-poolA.json'])
+  const r = await cpa.finishOAuth('claude', 'https://app/callback?state=st-p1b3', [], before)
   assert.equal(r.duplicate, false)
   assert.equal(r.accountId, 'acct-newB')
   assert.equal(r.authFileName, 'anthropic-newB.json')
   assert.notEqual(r.accountId, 'acct-poolA') // 池中既有号绝不被当新号
-  assert.equal(listCalls, 2) // 一次授权前快照 + 一次 findNew
+  assert.equal(listCalls, 1) // 快照移到 startOAuth/collect 层，finishOAuth 内只剩一次 findNew 的 list
 })

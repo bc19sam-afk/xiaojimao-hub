@@ -51,9 +51,28 @@ async function isolate(authFileName: string): Promise<void> {
   }
 }
 
+// 从回调 URL 解析 OAuth state（快照键）。解析不出返回 ''——降级为空 before＝仍安全；
+// 真正的「回调链接格式不对」由 cpa.finishOAuth 内的严格解析负责报给用户。
+function parseState(redirectUrl: string): string {
+  try {
+    return new URL(redirectUrl).searchParams.get('state') ?? ''
+  } catch {
+    return ''
+  }
+}
+
 // —— 发起授权（provider 决定流程：redirect / device）——
+// P1b-4：授权前给 auth-files 拍文件名快照，按 state 持久化跨请求。finishOAuth/checkOAuth 读它作
+// findNew 的 before，挡号池既有号（见 cpa.ts findNew 注释③）。此刻（授权前）池里还没本次将落的新号、
+// 且快照固定不变——retry 同 state 读同一快照不孤立、device 同样能读。state 为空则跳过（降级空 before）。
 export async function startOAuth(provider: ProviderId): Promise<StartResult> {
-  return cpa.startOAuth(provider)
+  const result = await cpa.startOAuth(provider)
+  if (result.state) {
+    const names = (await cpa.listAuthFiles()).map((f) => f.name).filter(Boolean)
+    db.setOAuthSnapshot(result.state, names)
+    db.cleanupOAuthSnapshots(3600_000) // 顺带清理 1h 前的过期快照
+  }
+  return result
 }
 
 // —— redirect 流程：提交回调 URL ——
@@ -63,9 +82,13 @@ export async function finishOAuth(
   redirectUrl: string,
 ): Promise<CollectResult> {
   const known = db.accountIdsFor(provider) // 仅当前 provider 的已知号（account_id 按 provider 独立）
-  const result = await cpa.finishOAuth(provider, redirectUrl, known)
+  const state = parseState(redirectUrl)
+  const before = new Set(db.getOAuthSnapshot(state) ?? []) // 授权前持久化快照（无则空＝降级仍安全）
+  const result = await cpa.finishOAuth(provider, redirectUrl, known, before)
   await isolate(result.authFileName)
-  return recordIngest(user, provider, result, 'oauth')
+  const recorded = recordIngest(user, provider, result, 'oauth')
+  if (recorded.ok && state) db.deleteOAuthSnapshot(state) // 入库成功才删——失败留快照给 retry 重读，不孤立
+  return recorded
 }
 
 // —— device 流程：轮询一次，ok 则落号 ——
@@ -75,11 +98,14 @@ export async function checkOAuth(
   state: string,
 ): Promise<{ done: true; result: CollectResult } | { done: false; error?: string }> {
   const known = db.accountIdsFor(provider) // 仅当前 provider 的已知号
-  const r = await cpa.checkOAuth(provider, state, known)
+  const before = new Set(db.getOAuthSnapshot(state) ?? []) // startOAuth 按 state 持久化的授权前快照
+  const r = await cpa.checkOAuth(provider, state, known, before)
   if (r.status === 'error') return { done: false, error: r.error }
   if (r.status !== 'ok') return { done: false }
   await isolate(r.ingest.authFileName)
-  return { done: true, result: recordIngest(user, provider, r.ingest, 'oauth') }
+  const recorded = recordIngest(user, provider, r.ingest, 'oauth')
+  if (recorded.ok && state) db.deleteOAuthSnapshot(state) // 入库成功才删
+  return { done: true, result: recorded }
 }
 
 // —— 直贴 RT（仅 codex）——

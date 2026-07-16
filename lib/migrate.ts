@@ -185,6 +185,22 @@ export const migrations: Migration[] = [
       }
     },
   },
+  {
+    version: 3,
+    // migration 003（P1b-4）：新增 oauth_snapshots 表，把「授权前 auth-files 文件名快照」按 OAuth
+    // state 持久化跨请求。startOAuth 拍快照并存；redirect 的 finishOAuth / device 的 checkOAuth 读同一
+    // 份做 findNew 的 before（挡号池既有号，见 cpa.ts findNew 注释③）；成功入库后删、过期清理。
+    // 本项目首个「新增功能表」迁移：只 CREATE TABLE 新表，向后兼容——旧代码不用此表也能跑（先加纪律）。
+    up(db) {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS oauth_snapshots (
+          state      TEXT PRIMARY KEY,
+          file_names TEXT NOT NULL,   -- 授权前 auth-files 文件名的 JSON 数组
+          created_at INTEGER NOT NULL
+        );
+      `)
+    },
+  },
 ]
 
 // 代码所知的最新 schema 版本（从 migrations 数组派生，勿手写）
