@@ -23,7 +23,7 @@ function makeContribution(over: Partial<Contribution>): Contribution {
     plan: 'plus',
     method: 'oauth',
     authFileName: 'f.json',
-    verifyStatus: 'pending',
+    verifyStatus: 'submitted',
     points: 0,
     rewardStatus: 'none',
     rewardText: '',
@@ -79,24 +79,24 @@ test('原子扣分：余额不足拒绝且不变；余额够只扣一次', () =>
   assert.equal(db.balance(uid), 10) // 只扣一次
 })
 
-// ④ 状态转移：仅当当前状态 ∈ from 才成功；不匹配不改状态
+// ④ 状态转移：仅当当前状态 ∈ from 才成功；不匹配不改状态（需求 §3.2 新 6 态）
 test('状态转移：仅当当前状态∈from 才成功；不匹配不改状态', () => {
   const id = 'trans-1'
   db.insertUnique(
-    makeContribution({ id, accountId: 'trans-acc', linuxdoId: 9004, verifyStatus: 'pending' }),
+    makeContribution({ id, accountId: 'trans-acc', linuxdoId: 9004, verifyStatus: 'submitted' }),
   )
-  // 当前 pending，from=['verifying'] 不匹配 → 失败，状态不变
-  const noMatch = db.transition(id, ['verifying'], 'active')
+  // 当前 submitted，from=['first_check'] 不匹配 → 失败，状态不变
+  const noMatch = db.transition(id, ['first_check'], 'observing')
   assert.equal(noMatch, false)
   const afterNoMatch = db.byUser(9004).find((c) => c.id === id)
   assert.ok(afterNoMatch)
-  assert.equal(afterNoMatch.verifyStatus, 'pending')
-  // from=['pending'] 匹配 → 成功，状态变 verifying
-  const ok = db.transition(id, ['pending'], 'verifying')
+  assert.equal(afterNoMatch.verifyStatus, 'submitted')
+  // from=['submitted'] 匹配 → 成功，状态变 first_check
+  const ok = db.transition(id, ['submitted'], 'first_check')
   assert.equal(ok, true)
   const afterOk = db.byUser(9004).find((c) => c.id === id)
   assert.ok(afterOk)
-  assert.equal(afterOk.verifyStatus, 'verifying')
+  assert.equal(afterOk.verifyStatus, 'first_check')
 })
 
 // ⑤ 终身账本：一号一辈子只发一次分（worker 重试/重入不得重复发分）

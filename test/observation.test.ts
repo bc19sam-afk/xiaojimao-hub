@@ -48,7 +48,7 @@ function makeContribution(over: Partial<Contribution>): Contribution {
     plan: 'plus',
     method: 'oauth',
     authFileName: 'f.json',
-    verifyStatus: 'pending',
+    verifyStatus: 'submitted',
     points: 0,
     rewardStatus: 'none',
     rewardText: '',
@@ -106,7 +106,7 @@ test('迁移004：v3 旧库（有数据）migrate→最新，加表加列、原�
      VALUES ('v3row', 5, 'u', 'v3-acc', 'e@example.com', 'codex', 'pro', 'oauth', 'f.json', 'active', 30, 'granted', '', '', NULL, 100, 100)`,
   ).run()
 
-  const v = migrate(d) // 只应跑 004（schema_version=3）
+  const v = migrate(d) // stamped v3 → 跑 004（加表加列）+ 005（状态值迁移，本行 'active'→'granted'）到最新
   assert.equal(v, LATEST_VERSION)
 
   // 加表加列

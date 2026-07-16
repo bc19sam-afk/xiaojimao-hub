@@ -10,19 +10,19 @@ interface Contribution {
   provider: string
   plan: string
   method: 'oauth' | 'rt'
-  verifyStatus: 'pending' | 'verifying' | 'active' | 'rejected' | 'duplicate' | 'quarantined' | 'reauth'
+  verifyStatus: 'submitted' | 'first_check' | 'observing' | 'granted' | 'failed' | 'needs_review'
   points: number
   createdAt: number
 }
 
+// 需求 §3.2 六态中文
 const VERIFY: Record<string, { label: string; cls: string }> = {
-  pending: { label: '待验证', cls: 'bg-amber-400/15 text-amber-300' },
-  verifying: { label: '验证中', cls: 'bg-sky-400/15 text-sky-300' },
-  quarantined: { label: '复检中', cls: 'bg-amber-400/15 text-amber-300' },
-  reauth: { label: '需重新授权', cls: 'bg-orange-400/15 text-orange-300' },
-  active: { label: '已入池', cls: 'bg-emerald-400/15 text-emerald-300' },
-  rejected: { label: '验证失败', cls: 'bg-rose-400/15 text-rose-300' },
-  duplicate: { label: '重复账号', cls: 'bg-slate-400/15 text-slate-300' },
+  submitted: { label: '已提交', cls: 'bg-amber-400/15 text-amber-300' },
+  first_check: { label: '首检中', cls: 'bg-sky-400/15 text-sky-300' },
+  observing: { label: '考察中', cls: 'bg-indigo-400/15 text-indigo-300' },
+  granted: { label: '已发分', cls: 'bg-emerald-400/15 text-emerald-300' },
+  failed: { label: '已失败', cls: 'bg-rose-400/15 text-rose-300' },
+  needs_review: { label: '待人工复核', cls: 'bg-orange-400/15 text-orange-300' },
 }
 
 export default function Contributions({
@@ -98,7 +98,7 @@ export default function Contributions({
             </thead>
             <tbody>
               {list.map((c) => {
-                const v = VERIFY[c.verifyStatus] ?? VERIFY.pending
+                const v = VERIFY[c.verifyStatus] ?? VERIFY.submitted
                 return (
                   <tr key={c.id} className="border-b border-white/5 last:border-0">
                     <td className="px-4 py-3">
@@ -116,7 +116,7 @@ export default function Contributions({
                       </span>
                     </td>
                     <td className="px-4 py-3">
-                      {c.verifyStatus === 'active' && c.points > 0 ? (
+                      {c.verifyStatus === 'granted' && c.points > 0 ? (
                         <span className="mono text-sm font-bold text-[var(--brand-bright)]">
                           +{c.points}
                         </span>

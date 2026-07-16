@@ -28,7 +28,7 @@ function makeContribution(over: Partial<Contribution>): Contribution {
     plan: 'plus',
     method: 'oauth',
     authFileName: 'f.json',
-    verifyStatus: 'pending',
+    verifyStatus: 'submitted',
     points: 0,
     rewardStatus: 'none',
     rewardText: '',
@@ -65,9 +65,10 @@ after(() => {
   fs.rmSync(tmpDir, { recursive: true, force: true })
 })
 
-// ① 升级路径：v1 有数据 → migrate 到最新，contributions 行数与内容逐行不变（002 重建不丢数据）
-// （P1b-4 加了 migration 003 后 migrate 直达 v3；003 只加 oauth_snapshots 表、不碰 contributions）
-test('升级路径：v1 数据 migrate 到最新后 contributions 行数与内容不变', () => {
+// ① 升级路径：v1 有数据 → migrate 到最新，行数不变、非状态列逐行不变、verify_status 按 005 映射
+// （003 只加 oauth_snapshots 表、004 加 5 快照列均不碰既有 contributions 数据；005 破坏性重写
+//   verify_status 值域，故 verify_status 单列另行按映射校验，其余列证明重建/加列不丢不篡改。）
+test('升级路径：v1 数据 migrate 到最新后行数不变、非状态列不变、verify_status 按 005 映射', () => {
   const d = makeV1Db()
   // v1 的 account_id 是全局 UNIQUE，故各行 account_id 互不相同；覆盖三 provider
   const seed: [string, number, string, string][] = [
@@ -81,7 +82,7 @@ test('升级路径：v1 数据 migrate 到最新后 contributions 行数与内�
   const beforeRows = d.prepare('SELECT * FROM contributions ORDER BY id').all()
 
   const version = migrate(d)
-  assert.equal(version, LATEST_VERSION) // 跑满迁移链到最新（含 002 复合唯一键、003 加表、004 加快照列）
+  assert.equal(version, LATEST_VERSION) // 跑满迁移链到最新（002 复合唯一键、003 加表、004 加快照列、005 状态值迁移）
   assert.ok(LATEST_VERSION >= 2) // 002（复合唯一键）仍在链上
 
   const afterRows = d.prepare('SELECT * FROM contributions ORDER BY id').all() as Record<
@@ -89,15 +90,18 @@ test('升级路径：v1 数据 migrate 到最新后 contributions 行数与内�
     unknown
   >[]
   assert.equal(afterRows.length, beforeRows.length) // 行数不变
-  // migration 004 给 contributions 追加了 5 个可空快照列（ALTER ADD COLUMN，向后兼容）：既有行数据
-  // 一字未改、只是 SELECT * 列形状多出几列 null。故按「迁移前的列集」把两侧都归一为普通对象再逐行比
-  // 对——证明原有数据逐行不变，且对未来任何「加可空列」的迁移都稳健（不写死列名）。
+  // 004 给 contributions 追加 5 个可空快照列（既有行数据一字未改、只多出 null 列）；005 破坏性重写
+  // verify_status 值域（此处 3 行原为 'pending'）。故按「迁移前列集去掉 verify_status」把两侧归一为
+  // 普通对象逐行比对——证明 002 重建 + 004 加列不丢/不篡改数据；verify_status 单列另按 005 映射校验。
   // （node:sqlite 行对象是 null 原型，两侧须走同一 Object.fromEntries 归一，否则 deepStrictEqual 先
   //   比原型即失败。）
   const beforeCols = Object.keys(beforeRows[0] as Record<string, unknown>)
+  const stableCols = beforeCols.filter((k) => k !== 'verify_status')
   const project = (rows: Record<string, unknown>[]) =>
-    rows.map((r) => Object.fromEntries(beforeCols.map((k) => [k, r[k]])))
-  assert.deepEqual(project(afterRows), project(beforeRows as Record<string, unknown>[])) // 原有列逐行不变
+    rows.map((r) => Object.fromEntries(stableCols.map((k) => [k, r[k]])))
+  assert.deepEqual(project(afterRows), project(beforeRows as Record<string, unknown>[])) // 非状态列逐行不变
+  // 005 映射：三行原 verify_status 均为 'pending' → 迁移后均为 'submitted'
+  for (const r of afterRows) assert.equal(r.verify_status, 'submitted')
   d.close()
 })
 

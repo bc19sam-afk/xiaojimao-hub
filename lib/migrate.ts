@@ -228,6 +228,44 @@ export const migrations: Migration[] = [
       db.exec('ALTER TABLE contributions ADD COLUMN snapshot_priority INTEGER')
     },
   },
+  {
+    version: 5,
+    // migration 005（P2a-2，⚠️ 破坏性）：verify_status 值域从旧 7 态迁到需求 §3.2 的 6 态。
+    // 只 UPDATE 现有行的值、不改表结构。旧→新映射：
+    //   pending→submitted / verifying→first_check / active→granted /
+    //   rejected→failed / quarantined→first_check / reauth→needs_review / duplicate→failed
+    // ⚠️ quarantined→**first_check**（不是 observing）：quarantined 号从没走过 startObservation，
+    //    考察快照列全 NULL；若映射成 observing，processPending 的 settle() 见 observeStartAt==null
+    //    直接 return → 号永久卡死（永不启用/发分/判死）。映射回 first_check 让它重走首检、由
+    //    enterObservation 冻结快照再进考察，规避无快照的 observing 孤立（codex xhigh review 发现）。
+    // 破坏性＝改写既有数据的 verify_status 值域；表结构与行数均不变。
+    // 迁移前后行数校验（仿 002）：纯 UPDATE 行数必守恒，此为兜底防意外。
+    up(db) {
+      const before = (
+        db.prepare('SELECT COUNT(*) AS n FROM contributions').get() as unknown as { n: number }
+      ).n
+      // 新旧值域不相交（新 6 态无一属旧 7 态），故映射顺序无关、无二次映射，重跑亦幂等。
+      const mapping: [string, string][] = [
+        ['pending', 'submitted'],
+        ['verifying', 'first_check'],
+        ['active', 'granted'],
+        ['rejected', 'failed'],
+        ['quarantined', 'first_check'], // 重走首检记快照，避免无快照的 observing 卡死
+        ['reauth', 'needs_review'],
+        ['duplicate', 'failed'],
+      ]
+      const stmt = db.prepare('UPDATE contributions SET verify_status=? WHERE verify_status=?')
+      for (const [from, to] of mapping) stmt.run(to, from)
+      const after = (
+        db.prepare('SELECT COUNT(*) AS n FROM contributions').get() as unknown as { n: number }
+      ).n
+      if (after !== before) {
+        throw new Error(
+          `[migrate 005] 迁移后行数不一致（迁移前 ${before}，迁移后 ${after}），已回滚。`,
+        )
+      }
+    },
+  },
 ]
 
 // 代码所知的最新 schema 版本（从 migrations 数组派生，勿手写）
