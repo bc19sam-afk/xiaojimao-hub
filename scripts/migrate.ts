@@ -5,7 +5,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { migrate } from '../lib/migrate.ts'
 
-const DB_PATH = path.join(process.cwd(), 'data', 'app.db') // 与 lib/db.ts 的 DB_PATH 保持一致
+const DB_PATH = process.env.DB_PATH || path.join(process.cwd(), 'data', 'app.db') // 认 DB_PATH env（与 lib/db.ts、scripts/backup.ts 一致）
 
 fs.mkdirSync(path.dirname(DB_PATH), { recursive: true })
 const db = new DatabaseSync(DB_PATH)

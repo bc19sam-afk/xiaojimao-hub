@@ -9,8 +9,9 @@ import { DatabaseSync } from 'node:sqlite'
 //   拿锁后会重读版本——锁外读到的版本可能已过期（另一进程刚应用完同一迁移），
 //   重读发现已应用则跳过，防止双重执行（对未来的破坏性迁移是硬保护）。
 // - baseline 001：把框架之前 openDb() 里的建表原样固化。全新库与旧库走同一迁移链。
-// - 无版本旧库认定：没有 schema_version 但已存在 contributions（框架之前建的旧库）
-//   → 认定 baseline 001 已应用，只登记 version=1、不重跑建表；全新空库则从 0 正常跑 001。
+// - 无 schema_version 的库（全新空库 / 框架之前的旧库 / 半建库）一律登记 version=0，从 001 跑起。
+//   001 全是 CREATE TABLE IF NOT EXISTS（幂等）：对完整旧库重跑无害、数据不丢；对半建库补全缺表。
+//   （不按 contributions 是否存在特判 baseline=1，否则半建库会被误判已迁移、跳过 001。）
 //
 // 后续加迁移：往 migrations 追加 { version: 2, up(db) {...} }（含"重建表模式"改约束，属 P1a）。
 // ============================================================================
@@ -221,8 +222,10 @@ export function assertSchemaCurrent(db: DatabaseSync): void {
   }
 }
 
-// 读起始版本；schema_version 不存在时初始化：
-//   已有 contributions 的旧库 → 认定 baseline 已应用(1)；全新空库 → 0。
+// 读起始版本；schema_version 不存在时初始化为 0：
+//   全新空库、框架之前的旧库、半建库一律登记 0，由 migrate 主循环从 001 跑起。
+//   （不再按 contributions 是否存在特判 baseline=1——那会把「有 contributions 但缺其余
+//   baseline 表」的半建库误判为已迁移、跳过 001，随后 seedDefaults 查缺表即抛。）
 function startingVersion(db: DatabaseSync): number {
   if (hasTable(db, 'schema_version')) {
     const row = db.prepare('SELECT version FROM schema_version LIMIT 1').get() as unknown as
@@ -230,12 +233,11 @@ function startingVersion(db: DatabaseSync): number {
       | undefined
     return row?.version ?? 0
   }
-  const baseline = hasTable(db, 'contributions') ? 1 : 0
   db.exec('CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)')
   db.prepare(
-    'INSERT INTO schema_version (version) SELECT ? WHERE NOT EXISTS (SELECT 1 FROM schema_version)',
-  ).run(baseline)
-  return baseline
+    'INSERT INTO schema_version (version) SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM schema_version)',
+  ).run()
+  return 0
 }
 
 // 应用所有未应用迁移（按 version 升序），返回最终版本。重复调用幂等。
