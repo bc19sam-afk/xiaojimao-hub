@@ -32,6 +32,9 @@ test('真实客户端：claude auth-file 仅有 account 字段时采纳为 accou
             { name: 'anthropic-xxx.json', provider: 'anthropic', account: 'acc12345678901' },
             // codex 号：同时有 account_id 与 account → account_id 必须优先，account 不得夺锚
             { name: 'codex-yyy.json', provider: 'codex', account_id: 'acct-codex-1', account: 'should-not-win' },
+            // grok 号：无 account_id、带 account → 不得采纳（grok 稳定 ID 无样本验证，
+            // 泛认会把未验证字段当 canonical ID 放行发分；account 兜底仅限 claude）
+            { name: 'xai-zzz.json', provider: 'xai', account: 'grok-unverified' },
           ],
         }),
         { status: 200 },
@@ -49,4 +52,9 @@ test('真实客户端：claude auth-file 仅有 account 字段时采纳为 accou
   // codex：account_id 优先于 account，fallback 链不改既有语义
   assert.equal(files[1].provider, 'codex')
   assert.equal(files[1].accountId, 'acct-codex-1')
+
+  // grok：account 兜底仅限 claude——grok 的 account 不被采纳，accountId 落空
+  // （findNew 要求 accountId 非空，故此号不会被当新号放行）
+  assert.equal(files[2].provider, 'grok')
+  assert.equal(files[2].accountId, '')
 })

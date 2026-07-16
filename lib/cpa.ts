@@ -211,9 +211,10 @@ function normFile(f: RawFile): AuthFile {
   return {
     name,
     // 稳定业务 ID 的字段名跨 provider 不同：codex 用 account_id；claude（P0-A 实测）
-    // 稳定 ID 在 account 字段（无 account_id）。统一 fallback 链，account_id 优先、
-    // account 末位兜底——绝不用 claude 的 id 字段（那非稳定业务 ID，会把唯一键锚错）。
-    accountId: f.account_id ?? f.accountId ?? f.account ?? '',
+    // 稳定 ID 在 account 字段（无 account_id）。account_id 优先；account 兜底**仅限 claude**——
+    // grok 的稳定 ID 尚无样本验证（P0-A），若泛认 account 会把未验证字段当 canonical ID 放行发分；
+    // 也绝不用 claude 的 id 字段（那非稳定业务 ID，会把唯一键锚错）。
+    accountId: f.account_id ?? f.accountId ?? (provider === 'claude' ? f.account : undefined) ?? '',
     email: f.email ?? '',
     plan: f.plan ?? f.planType ?? 'unknown',
     disabled: Boolean(f.disabled),
