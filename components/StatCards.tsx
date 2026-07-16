@@ -8,18 +8,19 @@ interface Contribution {
 
 export default function StatCards({ list, balance }: { list: Contribution[]; balance: number }) {
   const total = list.length
-  const active = list.filter((c) => c.verifyStatus === 'active').length
-  const pending = list.filter(
+  const granted = list.filter((c) => c.verifyStatus === 'granted').length
+  // 进行中：submitted 待首检 / first_check 首检中 / observing 考察中
+  const inProgress = list.filter(
     (c) =>
-      c.verifyStatus === 'pending' ||
-      c.verifyStatus === 'verifying' ||
-      c.verifyStatus === 'quarantined',
+      c.verifyStatus === 'submitted' ||
+      c.verifyStatus === 'first_check' ||
+      c.verifyStatus === 'observing',
   ).length
 
   const stats = [
     { label: '已贡献', value: total, Icon: StackIcon, color: 'text-neutral-300' },
-    { label: '已入池', value: active, Icon: CheckCircleIcon, color: 'text-[var(--brand-bright)]' },
-    { label: '待验证', value: pending, Icon: HourglassIcon, color: 'text-amber-300' },
+    { label: '已入池', value: granted, Icon: CheckCircleIcon, color: 'text-[var(--brand-bright)]' },
+    { label: '进行中', value: inProgress, Icon: HourglassIcon, color: 'text-amber-300' },
     { label: '我的积分', value: balance, Icon: CoinsIcon, color: 'text-[var(--brand-bright)]' },
   ]
 

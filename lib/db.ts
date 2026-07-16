@@ -23,16 +23,15 @@ export interface Contribution {
   plan: string
   method: 'oauth' | 'rt'
   authFileName: string
-  // pending 待巡检 / verifying 巡检中 / active 已入池 / rejected 淘汰 /
-  // duplicate 重复 / quarantined 隔离复检 / reauth 需重新授权
+  // 需求 §3.2 六态：submitted 已提交 / first_check 首检中 / observing 考察中 /
+  // granted 已发分 / failed 已失败 / needs_review 待人工复核
   verifyStatus:
-    | 'pending'
-    | 'verifying'
-    | 'active'
-    | 'rejected'
-    | 'duplicate'
-    | 'quarantined'
-    | 'reauth'
+    | 'submitted'
+    | 'first_check'
+    | 'observing'
+    | 'granted'
+    | 'failed'
+    | 'needs_review'
   points: number // 验证通过后发放的积分（0=未发/未通过）
   rewardStatus: 'waiting' | 'granted' | 'none'
   rewardText: string
@@ -93,6 +92,14 @@ function seedDefaults(d: DatabaseSync): void {
       'INSERT INTO redeem_items (name, description, cost, kind, sort) VALUES (?,?,?,?,?)',
     )
     for (const [n, desc, cost, kind, sort] of items) stmt.run(n, desc, cost, kind, sort)
+  }
+  // 考察窗口 T 默认值（app_config KV）：mock 8s 便于演示 / 真实 24h。仅键缺失时播种，管理页可改。
+  if (d.prepare('SELECT 1 FROM app_config WHERE key=?').get('observe_window_ms') == null) {
+    d.prepare('INSERT INTO app_config (key, value, updated_at) VALUES (?,?,?)').run(
+      'observe_window_ms',
+      String(env.mock ? 8000 : 86_400_000),
+      Date.now(),
+    )
   }
 }
 
@@ -289,7 +296,7 @@ export const db = {
     return conn
       .prepare(
         `SELECT linuxdo_id AS linuxdoId, username, COUNT(*) AS count
-         FROM contributions WHERE verify_status = 'active'
+         FROM contributions WHERE verify_status = 'granted'
          GROUP BY linuxdo_id ORDER BY count DESC, MIN(created_at) ASC LIMIT ?`,
       )
       .all(limit) as unknown as { linuxdoId: number; username: string; count: number }[]
@@ -300,7 +307,7 @@ export const db = {
     const mine = conn
       .prepare(
         `SELECT COUNT(*) AS count FROM contributions
-         WHERE verify_status = 'active' AND linuxdo_id = ?`,
+         WHERE verify_status = 'granted' AND linuxdo_id = ?`,
       )
       .get(linuxdoId) as unknown as { count: number }
     const count = mine?.count ?? 0
@@ -310,7 +317,7 @@ export const db = {
       .prepare(
         `SELECT COUNT(*) AS n FROM (
            SELECT linuxdo_id, COUNT(*) AS c FROM contributions
-           WHERE verify_status = 'active' GROUP BY linuxdo_id HAVING c > ?
+           WHERE verify_status = 'granted' GROUP BY linuxdo_id HAVING c > ?
          )`,
       )
       .get(count) as unknown as { n: number }

@@ -17,7 +17,7 @@ interface Contribution {
   provider: string
   plan: string
   method: 'oauth' | 'rt'
-  verifyStatus: 'pending' | 'verifying' | 'active' | 'rejected' | 'duplicate' | 'quarantined' | 'reauth'
+  verifyStatus: 'submitted' | 'first_check' | 'observing' | 'granted' | 'failed' | 'needs_review'
   points: number
   createdAt: number
 }
@@ -49,11 +49,13 @@ export default function DashboardShell({
 
   // 有待处理的号时，自动轮询刷新，让后台巡检的结果实时显现（无需手动刷新）
   useEffect(() => {
+    // 进行中三态（submitted 待首检 / first_check 首检中 / observing 考察中）时自动轮询，
+    // 让后台首检→考察→发分的结果实时显现（考察中每轮观测、到期发分都会改变列表）。
     const hasPending = list.some(
       (c) =>
-        c.verifyStatus === 'pending' ||
-        c.verifyStatus === 'verifying' ||
-        c.verifyStatus === 'quarantined',
+        c.verifyStatus === 'submitted' ||
+        c.verifyStatus === 'first_check' ||
+        c.verifyStatus === 'observing',
     )
     if (!hasPending) return
     const t = setInterval(() => {
