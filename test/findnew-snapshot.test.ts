@@ -71,10 +71,12 @@ test('③ 向后兼容：空 before 下 provider 过滤与 known 判重仍生效
   assert.equal(r.duplicate, false)
   assert.equal(r.accountId, 'acct-fresh')
 
-  // 全部已知/被过滤 → duplicate（保守，与原行为一致）
+  // 全部已知/被过滤 → duplicate；accountId 带回已知号身份（重交语义：collect 层报
+  // 「这个号交过了」而非「未能确认」），authFileName 留空保证 isolate() 零副作用
   const none = await findNew(client, 'claude', new Set<string>(['acct-known', 'acct-fresh']), new Set<string>())
   assert.equal(none.duplicate, true)
-  assert.equal(none.accountId, '')
+  assert.equal(none.accountId, 'acct-known')
+  assert.equal(none.authFileName, '')
 })
 
 // ④ 端到端（真实 redirect 链）：P1b-4 后 cpa.finishOAuth 不再自拍快照，改用调用方传入的授权前快照
@@ -112,4 +114,30 @@ test('④ 端到端：redirect 链用调用方传入的授权前快照，只认�
   assert.equal(r.authFileName, 'anthropic-newB.json')
   assert.notEqual(r.accountId, 'acct-poolA') // 池中既有号绝不被当新号
   assert.equal(listCalls, 1) // 快照移到 startOAuth/collect 层，finishOAuth 内只剩一次 findNew 的 list
+})
+
+// ── 重交已交过的号（codex xhigh 于 PR #11 指出）───────────────────────────────
+// 号被拒/失效后 cpamp 文件已删，用户重新授权 → 落**新文件**（不在快照）但 accountId 已在
+// known ＝「已交过的号」。findNew 须带回 accountId（collect 层报「这个号交过了」而非
+// 「未能确认」），且 authFileName 留空——绝不能让 isolate() 去禁用池中文件（重交零副作用）。
+test('重交已交号：快照外新文件但 accountId 在 known → duplicate 带 accountId、authFileName 空', async () => {
+  const client = stubClient([
+    authFile({ name: 'anthropic-poolA.json', accountId: 'acct-poolA' }), // 池中既有（在快照）
+    authFile({ name: 'anthropic-rejoin2.json', accountId: 'acct-known-1' }), // 重授权新落，但号已交过
+  ])
+  const r = await findNew(client, 'claude', new Set(['acct-known-1']), new Set(['anthropic-poolA.json']))
+  assert.equal(r.duplicate, true)
+  assert.equal(r.accountId, 'acct-known-1') // 带回身份 → collect 报「这个号交过了」
+  assert.equal(r.authFileName, '') // 留空 → isolate() 空转，不碰池中文件
+})
+
+// 优先级：快照外同时有「真新号」和「重交号」→ 必须先认真新号（不能把真新号误报成重复）
+test('重交与真新号并存：优先返回真新号', async () => {
+  const client = stubClient([
+    authFile({ name: 'anthropic-rejoin3.json', accountId: 'acct-known-2' }), // 重交（排前面）
+    authFile({ name: 'anthropic-brand-new.json', accountId: 'acct-brand-new' }), // 真新号
+  ])
+  const r = await findNew(client, 'claude', new Set(['acct-known-2']), new Set<string>())
+  assert.equal(r.duplicate, false)
+  assert.equal(r.accountId, 'acct-brand-new')
 })

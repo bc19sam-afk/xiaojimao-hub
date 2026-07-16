@@ -273,11 +273,22 @@ export async function findNew(
   before: Set<string> = new Set(),
 ): Promise<IngestResult> {
   const files = await client.listAuthFiles()
-  const created = files.find(
-    (f) => f.provider === provider && f.accountId && !known.has(f.accountId) && !before.has(f.name),
-  )
-  if (!created) return { accountId: '', email: '', plan: 'unknown', authFileName: '', duplicate: true }
-  return { accountId: created.accountId, email: created.email, plan: created.plan, authFileName: created.name, duplicate: false }
+  const fresh = files.filter((f) => f.provider === provider && f.accountId && !before.has(f.name))
+  const created = fresh.find((f) => !known.has(f.accountId))
+  if (created) {
+    return { accountId: created.accountId, email: created.email, plan: created.plan, authFileName: created.name, duplicate: false }
+  }
+  // 快照外有新文件、但 accountId 已在 known ＝「已交过的号重新授权又落了一份文件」
+  // （典型：号被拒后文件已删，用户重交——§2.4 要拦的场景）。带回 accountId 让 collect 层
+  // 报「这个号交过了」而非「未能确认」；authFileName 留空——绝不能让 isolate() 去禁用
+  // 池中那个可能正在服务的文件（重交不该有任何外部副作用）。
+  const rejoined = fresh.find((f) => known.has(f.accountId))
+  if (rejoined) {
+    return { accountId: rejoined.accountId, email: rejoined.email, plan: rejoined.plan, authFileName: '', duplicate: true }
+  }
+  // 快照外无本 provider 新文件：授权未完成 / 文件被 cpamp 原地覆盖（重交在池号，原理上与
+  // 未完成不可区分，彻底区分留 P1b-5 响应关联）→ 认不出，collect 层报「未能确认」。
+  return { accountId: '', email: '', plan: 'unknown', authFileName: '', duplicate: true }
 }
 
 const realClient: CpaClient = {
