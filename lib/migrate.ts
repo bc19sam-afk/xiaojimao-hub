@@ -349,6 +349,43 @@ export const migrations: Migration[] = [
       }
     },
   },
+  {
+    version: 8,
+    // migration 008（P2-R2）：按日用量结算数据地基。纯新增两表、向后兼容——仿 003/004，只 CREATE 新表，
+    // 旧代码不用这两表也能跑。R2 装「按 cpamp 每日调用量折算积分、按日结算」的发分引擎。
+    //   ① usage_rates —— 每次调用积分单价（按 provider/套餐分档、后台可配）。points_per_call 用 REAL：
+    //      单价可为小数（如 0.1 分/次），结算时 Math.round(次数 × 单价) 落整数积分。老 point_rules（固定
+    //      分值表）留库不动、不回滚——本单不触碰它。
+    //   ② daily_settlements —— 每号每日一笔结算，UNIQUE(contribution_id, date) 保证同号同日只结一次
+    //      （worker 重跑/重启幂等的第一道闸；第二道是 point_ledger 的 UNIQUE(reason, ref)）。
+    up(db) {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS usage_rates (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          provider        TEXT NOT NULL,
+          plan            TEXT NOT NULL,          -- '*' 为该 provider 的兜底档
+          points_per_call REAL NOT NULL,          -- 每次调用积分单价（可小数）
+          enabled         INTEGER NOT NULL DEFAULT 1,
+          label           TEXT NOT NULL DEFAULT '',
+          UNIQUE(provider, plan)
+        );
+
+        -- 每号每日结算：一号一日一笔。UNIQUE(contribution_id, date) = 按日结算幂等键。
+        CREATE TABLE IF NOT EXISTS daily_settlements (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          contribution_id TEXT NOT NULL,
+          date            TEXT NOT NULL,           -- 'YYYY-MM-DD' 自然日（时区随服务器）
+          provider        TEXT NOT NULL,
+          account_id      TEXT NOT NULL,
+          call_count      INTEGER NOT NULL,        -- 当日调用次数
+          points          INTEGER NOT NULL,        -- 折算积分 = round(call_count × 单价)
+          settled_at      INTEGER NOT NULL,
+          UNIQUE(contribution_id, date)
+        );
+        CREATE INDEX IF NOT EXISTS idx_settle_contrib ON daily_settlements(contribution_id);
+      `)
+    },
+  },
 ]
 
 // 代码所知的最新 schema 版本（从 migrations 数组派生，勿手写）

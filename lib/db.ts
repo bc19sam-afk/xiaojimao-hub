@@ -79,6 +79,26 @@ function seedDefaults(d: DatabaseSync): void {
     )
     for (const [p, pl, pts, label] of rules) stmt.run(p, pl, pts, label)
   }
+  // 用量单价（usage_rates，P2-R2）：每次调用积分单价，占位值、后台可调（管理 UI 留 R3）。分档演示
+  // codex-pro 高于 plus；claude/grok 用兜底档。数字皆占位——需求 §3.4「数字全为占位、随时调」。
+  const rateCount = (d.prepare('SELECT COUNT(*) AS n FROM usage_rates').get() as { n: number }).n
+  if (rateCount === 0) {
+    const rates: [string, string, number, string][] = [
+      ['codex', 'plus', 1, 'Codex Plus 每次调用'],
+      ['codex', 'pro', 2, 'Codex Pro 每次调用'],
+      ['codex', '*', 1, 'Codex 其它每次调用'],
+      ['claude', '*', 1, 'Claude 每次调用'],
+      ['grok', '*', 1, 'SuperGrok 每次调用'],
+    ]
+    // ON CONFLICT DO NOTHING：next build 并行拉起多个 worker 各自 openDb→seedDefaults 打同一库，
+    // 「if count==0 then INSERT」非原子（两进程同读 0 再各插 → 撞 UNIQUE）。幂等插入让并发败者静默跳过，
+    // 不新增 build 偶发失败面（老 point_rules/redeem_items 播种同款隐患已存在，见 PR 说明，本单不改它们）。
+    const stmt = d.prepare(
+      `INSERT INTO usage_rates (provider, plan, points_per_call, label) VALUES (?,?,?,?)
+       ON CONFLICT(provider, plan) DO NOTHING`,
+    )
+    for (const [p, pl, ppc, label] of rates) stmt.run(p, pl, ppc, label)
+  }
   const itemCount = (d.prepare('SELECT COUNT(*) AS n FROM redeem_items').get() as { n: number }).n
   if (itemCount === 0) {
     const items: [string, string, number, string, number][] = [
@@ -196,6 +216,30 @@ function toObservation(r: ObsRow): Observation {
     kind: r.kind as ObservationKind, // 写入侧 addObservation 已校验，落库值必属合法集
     detail: r.detail,
     createdAt: r.created_at,
+  }
+}
+
+// 按日结算行（P2-R2）：daily_settlements 一行 = 某号某自然日一笔结算
+interface DsRow {
+  id: number
+  contribution_id: string
+  date: string
+  provider: string
+  account_id: string
+  call_count: number
+  points: number
+  settled_at: number
+}
+function toDailySettlement(r: DsRow): DailySettlement {
+  return {
+    id: r.id,
+    contributionId: r.contribution_id,
+    date: r.date,
+    provider: r.provider,
+    accountId: r.account_id,
+    callCount: r.call_count,
+    points: r.points,
+    settledAt: r.settled_at,
   }
 }
 
@@ -452,6 +496,62 @@ export const db = {
     return r.changes > 0
   },
 
+  // ===== 用量折算 + 按日结算（P2-R2）=====
+  // (provider, plan) 每次调用积分单价：先精确 (provider, plan)、再 provider 兜底 plan='*'、都没有=0。
+  // 仿 pointsFor 风格；单价可为小数（usage_rates.points_per_call REAL），折算 = round(次数 × 单价) 由调用方做。
+  ratePerCall(provider: string, plan: string): number {
+    const p = provider.toLowerCase()
+    const pl = (plan || '').toLowerCase()
+    const exact = conn
+      .prepare('SELECT points_per_call FROM usage_rates WHERE provider=? AND plan=? AND enabled=1')
+      .get(p, pl) as unknown as { points_per_call: number } | undefined
+    if (exact) return exact.points_per_call
+    const wild = conn
+      .prepare("SELECT points_per_call FROM usage_rates WHERE provider=? AND plan='*' AND enabled=1")
+      .get(p) as unknown as { points_per_call: number } | undefined
+    return wild?.points_per_call ?? 0
+  },
+
+  // 记一笔当日结算：INSERT，(contribution_id, date) 冲突则 DO NOTHING（按日结算幂等）。返回是否本次真正落库。
+  // 这是「同号同日只结一次」的第一道闸；发分幂等由 awardPoints 的 UNIQUE(reason, ref) 兜第二道。
+  recordSettlement(rec: {
+    contributionId: string
+    date: string
+    provider: string
+    accountId: string
+    callCount: number
+    points: number
+  }): boolean {
+    const r = conn
+      .prepare(
+        `INSERT INTO daily_settlements
+           (contribution_id, date, provider, account_id, call_count, points, settled_at)
+         VALUES (?,?,?,?,?,?,?)
+         ON CONFLICT(contribution_id, date) DO NOTHING`,
+      )
+      .run(rec.contributionId, rec.date, rec.provider, rec.accountId, rec.callCount, rec.points, Date.now())
+    return r.changes > 0
+  },
+
+  // 该号该日是否已结算（settleDailyUsage 的快速跳过闸；真正防重复结算/发分靠两层 UNIQUE 约束）
+  hasSettled(contributionId: string, date: string): boolean {
+    return !!conn
+      .prepare('SELECT 1 FROM daily_settlements WHERE contribution_id=? AND date=? LIMIT 1')
+      .get(contributionId, date)
+  },
+
+  // 某号全部按日结算记录（供 R3 展示累计），按自然日升序、同日以自增 id 兜底稳序
+  settlementsFor(contributionId: string): DailySettlement[] {
+    return (
+      conn
+        .prepare(
+          `SELECT id, contribution_id, date, provider, account_id, call_count, points, settled_at
+           FROM daily_settlements WHERE contribution_id=? ORDER BY date ASC, id ASC`,
+        )
+        .all(contributionId) as unknown as DsRow[]
+    ).map(toDailySettlement)
+  },
+
   // ===== 兑换记录 =====
   createRedemption(rec: {
     id: string
@@ -667,4 +767,14 @@ export interface RedemptionRow {
   status: string
   result: string
   createdAt: number
+}
+export interface DailySettlement {
+  id: number
+  contributionId: string
+  date: string // 'YYYY-MM-DD'
+  provider: string
+  accountId: string
+  callCount: number
+  points: number
+  settledAt: number
 }

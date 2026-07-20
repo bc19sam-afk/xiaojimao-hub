@@ -1,4 +1,5 @@
 import { processPending } from './collect'
+import { settleDailyUsage } from './settle'
 import { env } from './env'
 
 // ============================================================================
@@ -29,6 +30,16 @@ export function startWorker() {
       }
     } catch (e) {
       console.error('[worker] 巡检出错：', e)
+    }
+    // 首检入池后，按日用量结算（P2-R2）：拉 cpamp 每日调用量 → pooled 号折算发分。独立 try/catch，
+    // 结算故障不拖累首检；两者共用同一 tick 周期，各自 running 锁防叠跑。
+    try {
+      const s = await settleDailyUsage()
+      if (s.settled || s.awarded) {
+        console.log(`[worker] 按日结算：结算 ${s.settled} 笔，发分 ${s.awarded} 笔`)
+      }
+    } catch (e) {
+      console.error('[worker] 结算出错：', e)
     }
   }
 
