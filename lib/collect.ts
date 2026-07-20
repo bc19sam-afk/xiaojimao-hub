@@ -1,5 +1,5 @@
 import { randomBytes } from 'crypto'
-import { cpa, type IngestResult, type ProbeResult, type ProviderId, type StartResult } from './cpa'
+import { cpa, type AuthFile, type IngestResult, type ProbeResult, type ProviderId, type StartResult } from './cpa'
 import { db, type Contribution, type ObservationKind } from './db'
 import { env } from './env'
 import type { SessionUser } from './session'
@@ -46,6 +46,8 @@ function recordIngest(
   }
   const { duplicate } = db.insertUnique(contribution)
   if (duplicate) return { ok: false, error: '这个号交过了，不能再交' }
+  // 修好重交成功入库 → 清掉**本人**该号旧退回记录，dashboard 的「未收下」提示随之消失（codex xhigh 于 PR #18）
+  db.clearRejections(contribution.linuxdoId, provider, contribution.accountId)
   return { ok: true, contribution }
 }
 
@@ -203,7 +205,9 @@ export async function processPending(): Promise<{
         return // 启用失败：不入池，保持原态下轮重试
       }
       if (plan !== c.plan) db.update(c.id, { plan })
-      if (db.transition(c.id, ['submitted', 'first_check'], 'pooled')) pooled++
+      if (db.transitionToPool(c.id, ['submitted', 'first_check'], Date.now())) {
+        pooled++ // 转态+写 pooled_at 同一原子 UPDATE（首次进池时刻＝结算资格判据 migration 010）
+      }
     }
 
     // 首检失败·退回（§2.4/§3.2）：号 401/撤权/封号、压根没入池 → **先删 cpamp auth 文件、成功后才
@@ -218,7 +222,17 @@ export async function processPending(): Promise<{
         db.transition(c.id, ['submitted'], 'first_check') // 文件还在：保留行下轮重试，不释放唯一键
         return
       }
-      if (db.deleteContribution(c.id, ['submitted', 'first_check'])) rejected++ // CAS：已入池则不删
+      if (db.deleteContribution(c.id, ['submitted', 'first_check'])) {
+        // 删行成功（唯一键已释放）→ 记一条**中性人话**退回提示（§3.2 告知用户「登录失败/被封、未收」），
+        // 让号从 dashboard 消失时用户知道原委、可修好重交。绝不透传 CPA 报错原文（§8）。
+        db.recordRejection({
+          linuxdoId: c.linuxdoId,
+          provider: c.provider,
+          accountId: c.accountId,
+          reason: '登录失败或已被封号，未入池',
+        })
+        rejected++ // CAS：已入池则不删（recordRejection 也不会触发）
+      }
     }
 
     // —— codex：走 cpamp 巡检（能识别套餐 + 能登录/失效判定）——
@@ -269,5 +283,100 @@ export async function processPending(): Promise<{
     return { checked: pending.length, activated: pooled, rejected }
   } finally {
     running = false
+  }
+}
+
+// —— 号存活巡检（P2-R3，需求 §3.5「明确失效才停、限额/零用量不算停」）——
+// 号进 pooled 后无人再看它死活——死号会一直挂 pooled、settle 侧也白扫。本函数由 worker 周期调用，
+// **只碰 pooled 态**（绝不动首检两态 submitted/first_check，与 processPending 首检逻辑正交）：明确失效
+// → stopped，停止新计量。三家判失效策略不同（诚实标注见 PR）：
+//   codex —— cpamp 深度巡检 inspect()：reject（401/撤权/删除＝明确失效）→ stopped；retry（限额/额度暂满，
+//     §3.2「限额不算失败」）→ 保持 pooled；reauth（OAuth 失效需重授权）→ needs_review；ok/未覆盖 → 保持。
+//     inspect 整体抛错＝本轮不可观测：所有 codex 跳过、下轮再看，绝不把「不可观测」当失效误停（仿 processPending）。
+//   claude/grok —— cpamp 无深度 inspect，保守判失效：listAuthFiles() 里该号（provider+accountId）文件
+//     已不存在（被删/撤销）→ stopped；仍存在（含 disabled——§3.3 管理员手动禁用/限额不算失败）→ 保持 pooled。
+//     listAuthFiles 抛错 → 本轮全跳过（同不误判死）。
+// stopped 后 settleDailyUsage 只结历史日（R2 行为不变，「昨天有量今天停用」的欠薪照补，不受影响）。
+let healthRunning = false
+// 存活巡检节流（codex xhigh 于 PR #18 指出）：默认 worker tick=8s，每轮都全量 inspect()（codex 巡检可
+// 轮询达 30s）＝持续满负荷。巡检该分钟级、比结算勤即可；此处限至少隔 5 分钟跑一次（now/force 供测试）。
+const HEALTH_INTERVAL_MS = 5 * 60_000
+let lastHealthAt = 0
+
+export async function checkPooledHealth(
+  now: number = Date.now(),
+  opts: { force?: boolean } = {},
+): Promise<{
+  checked: number // 本轮巡检的 pooled 号数
+  stopped: number // 本轮判失效停用数
+  skipped?: boolean
+}> {
+  if (healthRunning) return { checked: 0, stopped: 0, skipped: true }
+  if (!opts.force && now - lastHealthAt < HEALTH_INTERVAL_MS) return { checked: 0, stopped: 0, skipped: true }
+  healthRunning = true
+  try {
+    lastHealthAt = now
+    const pooled = db.byVerifyStatus(['pooled'])
+    if (pooled.length === 0) return { checked: 0, stopped: 0 }
+    let stopped = 0
+
+    // —— codex：cpamp 深度巡检 ——
+    const codexPooled = pooled.filter((c) => c.provider === 'codex')
+    if (codexPooled.length > 0) {
+      let probes: ProbeResult[] | null = null
+      try {
+        probes = await cpa.inspect()
+      } catch {
+        probes = null // 不可观测：本轮跳过所有 codex，绝不误判死
+      }
+      if (probes !== null) {
+        const byId = new Map(probes.map((r) => [r.accountId, r]))
+        for (const c of codexPooled) {
+          const r = byId.get(c.accountId)
+          if (!r) continue // 本轮巡检未覆盖 → 保持 pooled，下轮再查
+          if (r.decision === 'reject') {
+            // 401/撤权/删除＝明确失效 → 停用（CAS 守 pooled，防并发/过期结果误停已转他态的号）
+            if (db.transition(c.id, ['pooled'], 'stopped')) stopped++
+          } else if (r.decision === 'reauth') {
+            // OAuth 失效需重授权 → 转人工复核
+            db.transition(c.id, ['pooled'], 'needs_review')
+          }
+          // ok / retry（限额不算失败，§3.2）→ 保持 pooled，不动
+        }
+      }
+    }
+
+    // —— claude / grok：无深度 inspect，文件存在性保守判失效 ——
+    const otherPooled = pooled.filter((c) => c.provider !== 'codex')
+    if (otherPooled.length > 0) {
+      let files: AuthFile[] | null = null
+      try {
+        files = await cpa.listAuthFiles()
+      } catch {
+        files = null // 拉不到号池清单：本轮跳过，绝不误判死
+      }
+      // ⚠️ 空清单保护（codex xhigh 于 PR #18 指出）：real client 把缺失 files 字段归一为 []，一次 200
+      // 空响应（如 {}）会让下面把**整个** claude/grok 池判失效停用（stopped 无恢复路径 + 锁唯一键）。
+      // 空清单更可能是 cpamp glitch（正巡检的这些号至少该在池里）→ 视为不可观测、本轮跳过、不停用。
+      // 真「号池全空」极罕见，宁可漏停也不错停整池。（连续多轮确认缺失可留后续单细化。）
+      if (files !== null && files.length > 0) {
+        // 现存号身份集（provider+accountId）：只认能识别 provider 且有稳定 id 的文件。'\0' 作分隔符
+        // （不会出现在 provider/id 里），与 settle.ts 同款按 (provider, accountId) 划界。
+        const present = new Set(
+          files.filter((f) => f.provider && f.accountId).map((f) => f.provider + '\0' + f.accountId),
+        )
+        for (const c of otherPooled) {
+          if (!present.has(c.provider + '\0' + c.accountId)) {
+            // 文件不存在＝被删/撤销＝明确失效 → 停用（CAS 守 pooled）
+            if (db.transition(c.id, ['pooled'], 'stopped')) stopped++
+          }
+          // 文件仍在（含 disabled）→ 保持 pooled
+        }
+      }
+    }
+
+    return { checked: pooled.length, stopped }
+  } finally {
+    healthRunning = false
   }
 }

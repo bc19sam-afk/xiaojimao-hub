@@ -1,4 +1,4 @@
-import { processPending } from './collect'
+import { checkPooledHealth, processPending } from './collect'
 import { settleDailyUsage } from './settle'
 import { env } from './env'
 
@@ -30,6 +30,16 @@ export function startWorker() {
       }
     } catch (e) {
       console.error('[worker] 巡检出错：', e)
+    }
+    // 号存活巡检（P2-R3）：pooled 号明确失效 → stopped。独立 try/catch，巡检故障不拖累首检/结算；
+    // 与首检共用同一 tick 周期、各自 running 锁防叠跑。放结算前：本轮先停失效号，再结历史日欠薪。
+    try {
+      const h = await checkPooledHealth()
+      if (h.stopped) {
+        console.log(`[worker] 存活巡检：停用 ${h.stopped} 个失效号`)
+      }
+    } catch (e) {
+      console.error('[worker] 存活巡检出错：', e)
     }
     // 首检入池后，按日用量结算（P2-R2）：拉 cpamp 每日调用量 → pooled 号折算发分。独立 try/catch，
     // 结算故障不拖累首检；两者共用同一 tick 周期，各自 running 锁防叠跑。

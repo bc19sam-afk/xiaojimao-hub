@@ -44,6 +44,8 @@ export interface Contribution {
   snapshotPoints?: number // 分值快照（进考察时按当时规则算好、冻结）
   snapshotRuleVersion?: string // 检测规则版本快照
   snapshotPriority?: number // 入池优先级快照
+  // 首次进池时刻（P2-R3）：结算资格判据——非空＝入过池（该按量结算历史日）；null＝从没入池
+  pooledAt?: number
 }
 
 const DB_PATH = process.env.DB_PATH || path.join(process.cwd(), 'data', 'app.db')
@@ -167,6 +169,7 @@ interface Row {
   snapshot_points: number | null
   snapshot_rule_version: string | null
   snapshot_priority: number | null
+  pooled_at: number | null
 }
 
 function toContribution(r: Row): Contribution {
@@ -194,6 +197,7 @@ function toContribution(r: Row): Contribution {
     snapshotPoints: r.snapshot_points ?? undefined,
     snapshotRuleVersion: r.snapshot_rule_version ?? undefined,
     snapshotPriority: r.snapshot_priority ?? undefined,
+    pooledAt: r.pooled_at ?? undefined,
   }
 }
 
@@ -291,6 +295,18 @@ export const db = {
     return rows.map(toContribution)
   },
 
+  // 结算资格号（P2-R3，codex xhigh 于 PR #18 指出）：**入过池**的号（pooled_at 非空），不看当前
+  // verify_status——含 pooled（在池计量）+ stopped/needs_review（存活巡检转态后补结历史欠薪）。
+  // 从没入池的（首检 reauth→needs_review、submitted/first_check）pooled_at 为 null、不在此集，
+  // 绝不给从没入池的号错发分。
+  eligibleForSettlement(): Contribution[] {
+    return (
+      conn
+        .prepare('SELECT * FROM contributions WHERE pooled_at IS NOT NULL')
+        .all() as unknown as Row[]
+    ).map(toContribution)
+  },
+
   // 插入；(provider, account_id) 冲突则不插入并返回 duplicate=true（依赖复合 UNIQUE 约束，原子防重）
   insertUnique(c: Contribution): { duplicate: boolean } {
     const r = conn
@@ -326,6 +342,7 @@ export const db = {
       snapshotPoints: 'snapshot_points',
       snapshotRuleVersion: 'snapshot_rule_version',
       snapshotPriority: 'snapshot_priority',
+      pooledAt: 'pooled_at',
     }
     const sets: string[] = []
     const vals: unknown[] = []
@@ -350,6 +367,20 @@ export const db = {
          WHERE id = ? AND verify_status IN (${ph})`,
       )
       .run(to, Date.now(), id, ...from)
+    return r.changes > 0
+  },
+
+  // 原子进池：转态为 pooled 与写入 pooled_at（首次进池时刻＝结算资格判据）合并进同一条 UPDATE。单语句
+  // ＝天然原子，杜绝「transition 成功、随后 update 未落」的 pooled+NULL 悬号——那种号会被
+  // eligibleForSettlement 永久排除，在池计量却永不发分（codex 于 PR #18 复审指出分两句非原子、崩溃即漏发）。
+  transitionToPool(id: string, from: string[], ts: number): boolean {
+    const ph = from.map(() => '?').join(',')
+    const r = conn
+      .prepare(
+        `UPDATE contributions SET verify_status = 'pooled', pooled_at = ?, updated_at = ?
+         WHERE id = ? AND verify_status IN (${ph})`,
+      )
+      .run(ts, Date.now(), id, ...from)
     return r.changes > 0
   },
 
@@ -514,6 +545,17 @@ export const db = {
     return r.changes > 0
   },
 
+  // 某用户积分明细（P2-R3，§6）：point_ledger 每笔加/扣，按时间倒序（最近在前）。展示侧由
+  // describeLedgerEntry 把 reason='usage' 的裸 ref 转人话；limit 防明细无限增长拖慢 dashboard。
+  ledgerFor(linuxdoId: number, limit = 50): LedgerEntry[] {
+    return conn
+      .prepare(
+        `SELECT id, delta, reason, ref, created_at AS createdAt FROM point_ledger
+         WHERE linuxdo_id=? ORDER BY created_at DESC, id DESC LIMIT ?`,
+      )
+      .all(linuxdoId, limit) as unknown as LedgerEntry[]
+  },
+
   // ===== 用量折算 + 按日结算（P2-R2）=====
   // (provider, plan) 每次调用积分单价：先精确 (provider, plan)、再 provider 兜底 plan='*'、都没有=0。
   // 仿 pointsFor 风格；单价可为小数（usage_rates.points_per_call REAL），折算 = round(次数 × 单价) 由调用方做。
@@ -598,6 +640,15 @@ export const db = {
     ).map(toDailySettlement)
   },
 
+  // 某号累计积分（P2-R3，§4/§6）＝该号全部按日结算 points 之和。v4 积分不再挂在 contributions.points
+  // 列（那列 v4 恒 0），号主靠这个号累计赚的分一律由 daily_settlements 汇总——dashboard 每号一行据此显示。
+  contributionPoints(contributionId: string): number {
+    const r = conn
+      .prepare('SELECT COALESCE(SUM(points),0) AS pts FROM daily_settlements WHERE contribution_id=?')
+      .get(contributionId) as unknown as { pts: number }
+    return r?.pts ?? 0
+  },
+
   // ===== 兑换记录 =====
   createRedemption(rec: {
     id: string
@@ -660,6 +711,34 @@ export const db = {
   // 删掉 created_at 早于 now-olderThanMs 的过期快照（startOAuth 顺带调用，防表无限增长）
   cleanupOAuthSnapshots(olderThanMs: number): void {
     conn.prepare('DELETE FROM oauth_snapshots WHERE created_at < ?').run(Date.now() - olderThanMs)
+  },
+
+  // ===== 首检退回记录（P2-R3，§3.2「告知用户登录失败/被封」）=====
+  // 首检失败会删 contribution 行释放唯一键，号随即从 dashboard 消失——记一条退回，让用户知道「交了但没收、
+  // 可修好重交」。reason 存中性人话（调用方给，绝不透传 CPA 原文，§8）；account_id 落库仅供归属/排查。
+  recordRejection(rec: { linuxdoId: number; provider: string; accountId: string; reason: string }): void {
+    conn
+      .prepare(
+        'INSERT INTO rejections (linuxdo_id, provider, account_id, reason, created_at) VALUES (?,?,?,?,?)',
+      )
+      .run(rec.linuxdoId, rec.provider, rec.accountId, rec.reason, Date.now())
+  },
+  // 清掉**该用户**某 (provider, account_id) 的退回记录（P2-R3）：号修好重交并成功入库后调用——否则旧
+  // 退回提示「部分号未收下」会一直挂在 dashboard。必须限定 linuxdo_id（codex 于 PR #18 复审指出）：否则
+  // 用户 B 交同一 account_id 成功会连带删掉用户 A 名下对该号的真实退回记录。
+  clearRejections(linuxdoId: number, provider: string, accountId: string): void {
+    conn
+      .prepare('DELETE FROM rejections WHERE linuxdo_id=? AND provider=? AND account_id=?')
+      .run(linuxdoId, provider, accountId)
+  },
+  // 某用户最近退回记录（dashboard 展示用），按时间倒序；limit 只取最近几条免刷屏
+  rejectionsFor(linuxdoId: number, limit = 10): RejectionRow[] {
+    return conn
+      .prepare(
+        `SELECT id, provider, account_id AS accountId, reason, created_at AS createdAt
+         FROM rejections WHERE linuxdo_id=? ORDER BY created_at DESC, id DESC LIMIT ?`,
+      )
+      .all(linuxdoId, limit) as unknown as RejectionRow[]
   },
 
   // @deprecated v4（R1 拆考察期）：以下考察期观测事件 / 考察快照 / 故障顺延三组数据层函数，其消费方
@@ -823,4 +902,54 @@ export interface DailySettlement {
   callCount: number
   points: number
   settledAt: number
+}
+export interface RejectionRow {
+  id: number
+  provider: string
+  accountId: string
+  reason: string
+  createdAt: number
+}
+export interface LedgerEntry {
+  id: number
+  delta: number
+  reason: string
+  ref: string
+  createdAt: number
+}
+
+// ============================================================================
+// 展示助手（P2-R3，§6）：把裸数据转 dashboard 人话。纯函数、无 DB 依赖，便于直接单测。
+// 铁律（§8）：绝不返回完整敏感号 / email / token——账号一律掩码成「provider 中文名 + 尾 4 位」。
+// ============================================================================
+const PROVIDER_CN: Record<string, string> = { codex: 'ChatGPT', claude: 'Claude', grok: 'Grok' }
+
+// 账号短标识：中文 provider + accountId 尾 4 位（不足 4 位则原样，空则仅 provider）。
+// 例：('codex','acct_1a2b3c4d') → 'ChatGPT·3c4d'。绝不返回完整 accountId/email/token。
+export function shortAccountLabel(provider: string, accountId: string): string {
+  const name = PROVIDER_CN[provider] ?? provider
+  const id = accountId || ''
+  const tail = id.length > 4 ? id.slice(-4) : id
+  return tail ? `${name}·${tail}` : name
+}
+
+// 一笔积分流水 → 中文原因文案。usage 笔解析 ref（'usage:<cid>:YYYY-MM-DD'）出日期 + 账号短标识，
+// 显示「〔账号〕M 月 D 日 用量结算」；其它 reason（redeem / 贡献老笔）给稳定中文、原样保留。
+// accountOf：cid → 该号 (provider, accountId)，由调用方按用户号表构建（解析不到则回落「账号」）。
+export function describeLedgerEntry(
+  e: { reason: string; ref: string },
+  accountOf: (cid: string) => { provider: string; accountId: string } | undefined,
+): string {
+  if (e.reason === 'usage') {
+    const m = /^usage:([^:]+):(\d{4})-(\d{2})-(\d{2})$/.exec(e.ref)
+    if (m) {
+      const acct = accountOf(m[1])
+      const who = acct ? shortAccountLabel(acct.provider, acct.accountId) : '账号'
+      return `〔${who}〕${Number(m[3])} 月 ${Number(m[4])} 日 用量结算`
+    }
+    return '用量结算'
+  }
+  if (e.reason === 'redeem') return '积分兑换'
+  if (e.reason === 'contribution') return '贡献奖励'
+  return '积分变动'
 }

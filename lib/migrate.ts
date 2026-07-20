@@ -386,6 +386,46 @@ export const migrations: Migration[] = [
       `)
     },
   },
+  {
+    version: 9,
+    // migration 009（P2-R3）：首检退回记录表。纯新增、向后兼容——仿 003/008，只 CREATE 新表，
+    // 旧代码不用此表也能跑。首检失败（reject）会删掉 contribution 行释放唯一键（§2.4），号随即从
+    // dashboard 消失、用户不知为何（§3.2「告知用户登录失败/被封」）。rejections 在删行前后各留一条
+    // 中性退回提示，dashboard 据此显示「你交的某号登录失败/被封，未收——修好可重交」。
+    //   reason 存**中性人话**（如「登录失败或已被封号」），绝不透传 CPA 报错原文（§8）；
+    //   account_id 落库仅供归属/排查，展示侧由 shortAccountLabel 掩码成 provider+短标识，不泄完整敏感号。
+    up(db) {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS rejections (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          linuxdo_id INTEGER NOT NULL,
+          provider   TEXT NOT NULL,
+          account_id TEXT NOT NULL,
+          reason     TEXT NOT NULL DEFAULT '',
+          created_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_rejections_user ON rejections(linuxdo_id);
+      `)
+    },
+  },
+  {
+    version: 10,
+    // migration 010（P2-R3 补，codex xhigh 于 PR #18 指出）：加 pooled_at＝号**首次进池**时刻。
+    // 结算资格从「看当前 verify_status」改为「看有没有入过池」——首检 reauth 直接转 needs_review 的号
+    // 从没入池（pooled_at 为 null）不该结算；pooled 存活巡检失效/reauth 转 stopped/needs_review 的号
+    // 入过池（pooled_at 非空）该补结历史欠薪。一个字段消除两类 needs_review 的歧义。向后兼容加列。
+    // 回填：pooled/stopped 一定入过池（stopped 只由存活巡检从 pooled 转入）→ pooled_at=created_at（交号
+    //   时刻＝入池时间的**安全下界**：号必在 created_at 之后入池，且 v4 计量自迁移后才有、老号入池前无
+    //   cpamp 量，取早下界只多不少、绝不漏结）。不用 updated_at：stopped 的 updated_at 是停用时刻，回填后
+    //   下界会挡掉停用日前尚未结的历史欠薪（codex 于 PR #18 复审指出）。needs_review 有歧义（首检 reauth
+    //   vs 巡检 reauth）→ **不回填**（宁漏结几个历史边缘老号、不错发从没入池的号）；当前业务数据为 0。
+    up(db) {
+      db.exec('ALTER TABLE contributions ADD COLUMN pooled_at INTEGER')
+      db.exec(
+        "UPDATE contributions SET pooled_at=created_at WHERE verify_status IN ('pooled','stopped') AND pooled_at IS NULL",
+      )
+    },
+  },
 ]
 
 // 代码所知的最新 schema 版本（从 migrations 数组派生，勿手写）
