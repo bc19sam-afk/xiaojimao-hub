@@ -540,6 +540,34 @@ export const db = {
       .get(contributionId, date)
   },
 
+  // 发分 + 记结算：**同一事务**（codex xhigh 于 PR #16 指出：两写分离时，夹缝崩溃会让下轮以变化后的
+  // 用量/单价补记 settlement，与已入账的 ledger 笔数值分叉）。BEGIN IMMEDIATE 内两写同成同败；两层
+  // UNIQUE（point_ledger(reason,ref) / daily_settlements(contribution_id,date)）仍各自幂等兜底。
+  // 返回 { settled, awarded }＝本次是否真正落库/入账。
+  settleAndAward(rec: {
+    contributionId: string
+    date: string
+    provider: string
+    accountId: string
+    callCount: number
+    points: number
+    linuxdoId: number
+  }): { settled: boolean; awarded: boolean } {
+    conn.exec('BEGIN IMMEDIATE')
+    try {
+      let awarded = false
+      if (rec.points > 0) {
+        awarded = db.awardPoints(rec.linuxdoId, rec.points, 'usage', `usage:${rec.contributionId}:${rec.date}`)
+      }
+      const settled = db.recordSettlement(rec)
+      conn.exec('COMMIT')
+      return { settled, awarded }
+    } catch (err) {
+      conn.exec('ROLLBACK')
+      throw err
+    }
+  },
+
   // 某号全部按日结算记录（供 R3 展示累计），按自然日升序、同日以自增 id 兜底稳序
   settlementsFor(contributionId: string): DailySettlement[] {
     return (

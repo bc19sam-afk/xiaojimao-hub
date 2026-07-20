@@ -22,24 +22,45 @@ function dayStr(ms: number): string {
   return `${d.getFullYear()}-${m}-${day}`
 }
 
+// 日切延迟：过了午夜再等这么久才结「昨天」（默认 10 分钟＝需求 §3.3「每日 00:10 结算前一自然日」），
+// 吸收 cpamp 侧迟到落账的事件——太早结、hasSettled 闸会把迟到量永久排除（codex xhigh 于 PR #16 指出）。
+const SETTLE_GRACE_MS = 10 * 60_000
+
+// 本进程今天是否已跑过结算（按日驱动，codex xhigh 于 PR #16 指出：/v0/management/usage 是 ~19MB 全量
+// 事件流，8s tick 每轮都拉＝~205GB/天。结算一天一次就够）。进程重启后重跑一次无害——hasSettled/两层
+// UNIQUE 兜幂等，只多一次拉取。
+let lastRunDay = ''
+
 // running 锁防单进程叠跑（仿 processPending）；跨实例幂等靠 DB 两层 UNIQUE。
 let running = false
 
 // now 参数仅为可测（日界判定确定性）：worker 直接调 settleDailyUsage() 用真实时钟。
-export async function settleDailyUsage(now: number = Date.now()): Promise<{
+// force 供测试/手动触发跳过「一天一次」节流（不跳过日切延迟与幂等闸）。
+export async function settleDailyUsage(
+  now: number = Date.now(),
+  opts: { force?: boolean } = {},
+): Promise<{
   settled: number // 本轮新落库的结算笔数
   awarded: number // 本轮实际发分笔数（points>0 且首次入账）
   skipped?: boolean
 }> {
   if (running) return { settled: 0, awarded: 0, skipped: true }
+  // 日切延迟内（00:00–00:10）不结算：等迟到事件落定，今天晚些时候再结昨天
+  const sinceMidnight = now - new Date(new Date(now).setHours(0, 0, 0, 0)).getTime()
+  if (sinceMidnight < SETTLE_GRACE_MS) return { settled: 0, awarded: 0, skipped: true }
+  const today = dayStr(now)
+  // 按日驱动：本进程今天已跑过 → 跳过（不再全量拉 usage）。force 供测试/手动。
+  if (!opts.force && lastRunDay === today) return { settled: 0, awarded: 0, skipped: true }
   running = true
   try {
-    const today = dayStr(now)
     const usage = await cpa.getDailyUsage()
 
-    // 只结算 pooled 号（§3.2）：按 (provider, account_id) 建索引。非 pooled（stopped/first_check/
-    // needs_review/submitted）不在此集 → 有用量也不结算。'\0' 作分隔符（不会出现在 provider/id 里）。
-    const byKey = new Map(db.byVerifyStatus(['pooled']).map((c) => [c.provider + '\0' + c.accountId, c]))
+    // 结算资格（§3.2/§3.5）：pooled（在池计量）+ stopped（已停用——只结停用**前**产生的历史日用量，
+    // 「号昨天有用量、今天停用」那笔已挣的不赖账，codex xhigh 于 PR #16 指出）。first_check/
+    // needs_review/submitted（从未入池）不结。'\0' 作分隔符（不会出现在 provider/id 里）。
+    const byKey = new Map(
+      db.byVerifyStatus(['pooled', 'stopped']).map((c) => [c.provider + '\0' + c.accountId, c]),
+    )
 
     let settled = 0
     let awarded = 0
@@ -48,25 +69,25 @@ export async function settleDailyUsage(now: number = Date.now()): Promise<{
       // 'YYYY-MM-DD' 按字典序即时间序，date < today 等价于 date 早于今天。
       if (u.date >= today) continue
       const c = byKey.get(u.provider + '\0' + u.accountId)
-      if (!c) continue // 非 pooled 号 / 未知号 → 不结算
+      if (!c) continue // 无资格号 / 未知号 → 不结算
       if (db.hasSettled(c.id, u.date)) continue // 该日已结算 → 跳过（快速闸）
 
       const points = Math.round(u.count * db.ratePerCall(c.provider, c.plan))
-
-      // 双幂等·先发分后记结算（顺序关键）：若在两次写之间崩溃——
-      //   先发后记：重跑见 hasSettled=false → 再发（awardPoints 幂等空转）+ 补记，分不丢；
-      //   先记后发：重跑见 hasSettled=true → 跳过 → 那笔分永久丢失（lost pay）。故先发后记。
-      // points=0（当日无量 / 单价 0）：awardPoints 内部 delta==0 直接不入账；仍记 settlement 避免反复查。
-      if (points > 0 && db.awardPoints(c.linuxdoId, points, 'usage', `usage:${c.id}:${u.date}`)) awarded++
-      if (db.recordSettlement({
+      // 发分 + 记结算同一事务（settleAndAward，BEGIN IMMEDIATE）：夹缝崩溃不再产生「ledger 已入账、
+      // settlement 未记」的分叉；两层 UNIQUE 仍各自幂等兜底。points=0 不入账、仍记 settlement 免反复查。
+      const r = db.settleAndAward({
         contributionId: c.id,
         date: u.date,
         provider: c.provider,
         accountId: c.accountId,
         callCount: u.count,
         points,
-      })) settled++
+        linuxdoId: c.linuxdoId,
+      })
+      if (r.settled) settled++
+      if (r.awarded) awarded++
     }
+    lastRunDay = today // 成功跑完才记（中途抛错不记，下轮重试）
     return { settled, awarded }
   } finally {
     running = false

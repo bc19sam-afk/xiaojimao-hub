@@ -478,8 +478,13 @@ interface RawUsage {
 }
 // TODO(对接)：hub 来源标记的确切格式待 usage 样本核对。占位实现——label 含 'hub' 视为贡献号。
 // ⚠️ 真实对接前必以样本校准：误纳官方号→错发分、漏纳贡献号→少发分（同 mapInspection 的 reason 词表纪律）。
-function isHubContribution(label: string | undefined): boolean {
-  return !!label && /hub/i.test(label)
+// ⚠️ label 预过滤已降级为「优化提示」而非硬闸（codex xhigh 于 PR #16 指出：现今没有任何收号路径写
+// label——RT 上传无 label 字段、OAuth 只提交 provider+redirect_url，硬过滤＝生产零发分）。真正的
+// 「是不是我们的号」由 settle 层的 pooled 号索引判定（(provider, account_id) 匹配，权威）；此处仅当
+// label **明确是别家标记**时跳过（现阶段一律放行）。「来源标记写入」已立项（路线图 P2 残项），写入
+// 落地 + 真实 label 格式核对后，可把这里升级回预过滤以省聚合量。
+function isHubContribution(_label: string | undefined): boolean {
+  return true // 放行；归属判定交给 settle 层 pooled 索引
 }
 // TODO(对接)：timestamp 单位待核对。占位启发式——数字 <1e12 视为秒、否则毫秒；字符串按 Date.parse。
 function tsToMs(ts: string | number): number {
