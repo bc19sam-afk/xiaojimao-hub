@@ -405,6 +405,6 @@ test('存活巡检节流：5 分钟窗口内第二次 checkPooledHealth 跳过',
 test('清退回往返：recordRejection → rejectionsFor → clearRejections 清除', () => {
   db.recordRejection({ linuxdoId: 8270, provider: 'codex', accountId: 'rc-acc', reason: '登录失败或已被封号，未入池' })
   assert.equal(db.rejectionsFor(8270).length, 1)
-  db.clearRejections('codex', 'rc-acc') // recordIngest 重交成功时调用同款
+  db.clearRejections(8270, 'codex', 'rc-acc') // recordIngest 重交成功时调用同款（限本人 linuxdo_id）
   assert.equal(db.rejectionsFor(8270).length, 0)
 })

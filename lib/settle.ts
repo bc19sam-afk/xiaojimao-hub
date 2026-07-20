@@ -71,9 +71,10 @@ export async function settleDailyUsage(
       if (u.date >= today) continue
       const c = byKey.get(u.provider + '\0' + u.accountId)
       if (!c) continue // 无资格号（从没入池）/ 未知号 → 不结算
-      // 只结「进池那天起」的日：号入池前（pooled_at 之前）纵有用量也不属贡献计量（cpamp 侧可能是号主
-      // 自用/别家），加下界防误结转态后偶发的跨界数据（codex xhigh 于 PR #18 指出 post-transition 用量）。
-      if (c.pooledAt != null && u.date < dayStr(c.pooledAt)) continue
+      // 结算下界＝**入池次日**起（入池当天也不结）：cpamp getDailyUsage 按自然日给量，号入池当天那笔
+      // u.date 混了「入池前号主自用」+「入池后贡献」两段、无法按小时拆分（codex 于 PR #18 复审指出下界
+      // 只到日粒度会把入池前自用误算发分）→ 保守整日不结、次日起才发。'<=' 即把入池当日一并挡掉。
+      if (c.pooledAt != null && u.date <= dayStr(c.pooledAt)) continue
       if (db.hasSettled(c.id, u.date)) continue // 该日已结算 → 跳过（快速闸）
 
       const points = Math.round(u.count * db.ratePerCall(c.provider, c.plan))

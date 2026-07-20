@@ -414,13 +414,15 @@ export const migrations: Migration[] = [
     // 结算资格从「看当前 verify_status」改为「看有没有入过池」——首检 reauth 直接转 needs_review 的号
     // 从没入池（pooled_at 为 null）不该结算；pooled 存活巡检失效/reauth 转 stopped/needs_review 的号
     // 入过池（pooled_at 非空）该补结历史欠薪。一个字段消除两类 needs_review 的歧义。向后兼容加列。
-    // 回填：pooled/stopped 一定入过池（stopped 只由存活巡检从 pooled 转入）→ pooled_at=updated_at 近似；
-    //   needs_review 有歧义（首检 reauth vs 巡检 reauth）→ **不回填**（宁漏结几个历史边缘老号、不错发
-    //   从没入池的号）；当前业务数据为 0，回填影响≈0。
+    // 回填：pooled/stopped 一定入过池（stopped 只由存活巡检从 pooled 转入）→ pooled_at=created_at（交号
+    //   时刻＝入池时间的**安全下界**：号必在 created_at 之后入池，且 v4 计量自迁移后才有、老号入池前无
+    //   cpamp 量，取早下界只多不少、绝不漏结）。不用 updated_at：stopped 的 updated_at 是停用时刻，回填后
+    //   下界会挡掉停用日前尚未结的历史欠薪（codex 于 PR #18 复审指出）。needs_review 有歧义（首检 reauth
+    //   vs 巡检 reauth）→ **不回填**（宁漏结几个历史边缘老号、不错发从没入池的号）；当前业务数据为 0。
     up(db) {
       db.exec('ALTER TABLE contributions ADD COLUMN pooled_at INTEGER')
       db.exec(
-        "UPDATE contributions SET pooled_at=updated_at WHERE verify_status IN ('pooled','stopped') AND pooled_at IS NULL",
+        "UPDATE contributions SET pooled_at=created_at WHERE verify_status IN ('pooled','stopped') AND pooled_at IS NULL",
       )
     },
   },

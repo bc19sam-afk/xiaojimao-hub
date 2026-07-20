@@ -370,6 +370,20 @@ export const db = {
     return r.changes > 0
   },
 
+  // 原子进池：转态为 pooled 与写入 pooled_at（首次进池时刻＝结算资格判据）合并进同一条 UPDATE。单语句
+  // ＝天然原子，杜绝「transition 成功、随后 update 未落」的 pooled+NULL 悬号——那种号会被
+  // eligibleForSettlement 永久排除，在池计量却永不发分（codex 于 PR #18 复审指出分两句非原子、崩溃即漏发）。
+  transitionToPool(id: string, from: string[], ts: number): boolean {
+    const ph = from.map(() => '?').join(',')
+    const r = conn
+      .prepare(
+        `UPDATE contributions SET verify_status = 'pooled', pooled_at = ?, updated_at = ?
+         WHERE id = ? AND verify_status IN (${ph})`,
+      )
+      .run(ts, Date.now(), id, ...from)
+    return r.changes > 0
+  },
+
   // 条件删除某贡献行——首检失败·退回专用（§2.4/§3.2）：号首检就 401/封号、压根没入池，删行以释放
   // (provider, account_id) 唯一键，让用户修好后可重交。⚠️ 只用于「从未真正入池」的号；已入池号
   // 一辈子锁唯一键、永不删（§2.4「入池后掉号不支持重交」）。
@@ -709,10 +723,13 @@ export const db = {
       )
       .run(rec.linuxdoId, rec.provider, rec.accountId, rec.reason, Date.now())
   },
-  // 清掉某 (provider, account_id) 的退回记录（P2-R3，codex xhigh 于 PR #18 指出）：号修好重交并成功
-  // 入库后调用——否则旧退回提示「部分号未收下」会一直挂在 dashboard、与已接受的号并存误导用户。
-  clearRejections(provider: string, accountId: string): void {
-    conn.prepare('DELETE FROM rejections WHERE provider=? AND account_id=?').run(provider, accountId)
+  // 清掉**该用户**某 (provider, account_id) 的退回记录（P2-R3）：号修好重交并成功入库后调用——否则旧
+  // 退回提示「部分号未收下」会一直挂在 dashboard。必须限定 linuxdo_id（codex 于 PR #18 复审指出）：否则
+  // 用户 B 交同一 account_id 成功会连带删掉用户 A 名下对该号的真实退回记录。
+  clearRejections(linuxdoId: number, provider: string, accountId: string): void {
+    conn
+      .prepare('DELETE FROM rejections WHERE linuxdo_id=? AND provider=? AND account_id=?')
+      .run(linuxdoId, provider, accountId)
   },
   // 某用户最近退回记录（dashboard 展示用），按时间倒序；limit 只取最近几条免刷屏
   rejectionsFor(linuxdoId: number, limit = 10): RejectionRow[] {

@@ -342,3 +342,24 @@ test('节流：同日第二次 settleDailyUsage 跳过；日切后 10 分钟内�
   const r4 = await withUsage([], () => settle.settleDailyUsage(new Date(base.getFullYear(), base.getMonth(), base.getDate() + 2, 0, 15).getTime()))
   assert.ok(!r4.skipped)
 })
+
+// ⑨ 入池当日不结、次日起结（codex 于 PR #18 复审）：cpamp getDailyUsage 按自然日给量，入池当日那笔混了
+//    「入池前号主自用」，无法按小时拆分 → 保守整日不结（settle 下界 '<='）。入池当日=前天、量不结；昨天量结。
+test('入池当日不结、次日起结：pooled_at 当天 u.date 被下界挡、次日照发', async () => {
+  const uid = 7090
+  const id = 'settle-poolday'
+  const accountId = 'poolday-acc'
+  const now = Date.now()
+  const poolDay = now - 2 * 86_400_000 // 前天＝入池当日
+  const nextDay = now - 1 * 86_400_000 // 昨天＝入池次日
+  seedC({ id, provider: 'grok', accountId, plan: 'super', linuxdoId: uid }) // grok/*=1 分/次
+  db.update(id, { pooledAt: poolDay }) // 精确设入池当日
+  const usage = [
+    { accountId, provider: 'grok', date: ymd(poolDay), count: 5 }, // 入池当日 → 不结（'<=' 下界挡）
+    { accountId, provider: 'grok', date: ymd(nextDay), count: 3 }, // 次日 → 结
+  ]
+  const r = await withUsage(usage, () => settle.settleDailyUsage(undefined, { force: true }))
+  assert.equal(r.settled, 1) // 只结次日一笔
+  assert.equal(db.balance(uid), 3) // 只发次日 3 次 × 1，入池当日 5 次不算
+  assert.equal(db.settlementsFor(id).length, 1)
+})

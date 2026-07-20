@@ -46,8 +46,8 @@ function recordIngest(
   }
   const { duplicate } = db.insertUnique(contribution)
   if (duplicate) return { ok: false, error: '这个号交过了，不能再交' }
-  // 修好重交成功入库 → 清掉该号旧退回记录，dashboard 的「未收下」提示随之消失（codex xhigh 于 PR #18）
-  db.clearRejections(provider, contribution.accountId)
+  // 修好重交成功入库 → 清掉**本人**该号旧退回记录，dashboard 的「未收下」提示随之消失（codex xhigh 于 PR #18）
+  db.clearRejections(contribution.linuxdoId, provider, contribution.accountId)
   return { ok: true, contribution }
 }
 
@@ -205,9 +205,8 @@ export async function processPending(): Promise<{
         return // 启用失败：不入池，保持原态下轮重试
       }
       if (plan !== c.plan) db.update(c.id, { plan })
-      if (db.transition(c.id, ['submitted', 'first_check'], 'pooled')) {
-        db.update(c.id, { pooledAt: Date.now() }) // 记首次进池时刻＝结算资格判据（migration 010）
-        pooled++
+      if (db.transitionToPool(c.id, ['submitted', 'first_check'], Date.now())) {
+        pooled++ // 转态+写 pooled_at 同一原子 UPDATE（首次进池时刻＝结算资格判据 migration 010）
       }
     }
 
