@@ -57,7 +57,10 @@ export default function RedeemStore({ refreshKey, onRedeemed }: { refreshKey: nu
       // 若 fetch 直接抛（网络/超时、无响应）则跳过此清除，token 保留供重试复用（超时重试幂等）。
       delete tokens.current[item.id]
       if (!res.ok) throw new Error(d.error || '兑换失败')
-      setToast({ ok: true, text: `已兑换「${item.name}」` })
+      // 成功文案直接带上发出的码（若是可复制码）——不依赖后续 load，即便 /api/store 刷新失败用户当场也拿得到
+      // 码（codex 复审 P2：吞了 load 错误后成功却暂时看不到码）。码也已落 redemption，可在兑换记录找回。
+      const isCode = typeof d.result === 'string' && /^[\x21-\x7e]+$/.test(d.result)
+      setToast({ ok: true, text: isCode ? `已兑换「${item.name}」：${d.result}` : `已兑换「${item.name}」` })
       // 成功已定（以兑换响应为准）——后续刷新失败绝不可翻转成「兑换失败」，否则用户以为没成、重试会生成
       // 新 token 二次扣分二次发码（codex 复审 P1）。故 load 不 await、吞掉其错误；余额/记录下次刷新自愈。
       load().catch(() => {})

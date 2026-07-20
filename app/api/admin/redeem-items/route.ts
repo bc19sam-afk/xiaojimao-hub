@@ -18,8 +18,11 @@ export async function PUT(req: NextRequest) {
     config: typeof b.config === 'string' ? b.config : JSON.stringify(b.config ?? {}),
     // 履约类型（placeholder/cdk）+ 每人限购透传：未带则 upsert 里 COALESCE 保留原值 / 新建用默认。
     // 缺这俩透传＝导了 CDK 码也没入口把项激活成发码类（codex+bot 复审 P1：用户被扣分却只收占位、CDK 永不出库）。
-    fulfillment: typeof b.fulfillment === 'string' ? b.fulfillment : undefined,
-    perUserLimit: b.perUserLimit != null ? Number(b.perUserLimit) : undefined,
+    // 值域收敛（codex 复审 P2）：fulfillment 只认白名单——非法值（如 'cdk ' 带空格）会被 performRedeem
+    // 的严格 ===' cdk' 当成 placeholder → 扣分却不发已导入的码；非白名单一律视作未传（undefined→保留原值/
+    // 新建默认 placeholder）。perUserLimit 钳非负——负值绕过前端 min 会让 '>0' 限购判断失效＝变无限购。
+    fulfillment: b.fulfillment === 'cdk' || b.fulfillment === 'placeholder' ? b.fulfillment : undefined,
+    perUserLimit: b.perUserLimit != null ? Math.max(0, Number(b.perUserLimit) || 0) : undefined,
   })
   return NextResponse.json({ ok: true, redeemItems: db.listRedeemItems(false) })
 }
