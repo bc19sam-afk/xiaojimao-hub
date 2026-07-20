@@ -322,8 +322,17 @@ export const migrations: Migration[] = [
         .get() as unknown as { n: number }
       const released = releasedRow.n
       db.exec("DELETE FROM contributions WHERE verify_status='failed' AND observe_start_at IS NULL")
+      // observing 且已记 hard_fail 观测的行（v6 worker 判死中途崩溃残留，未走到 failed）＝已知死号，
+      // 不能映成 pooled（新 worker 不再扫 pooled 做健康判定，死号会永远挂着）→ 先转 stopped
+      // （codex xhigh 于 PR #15 指出）。
+      db.exec(`
+        UPDATE contributions SET verify_status='stopped'
+        WHERE verify_status='observing'
+          AND EXISTS (SELECT 1 FROM observations o
+                      WHERE o.contribution_id = contributions.id AND o.kind='hard_fail')
+      `)
       const mapping: [string, string][] = [
-        ['observing', 'pooled'],
+        ['observing', 'pooled'], // 剩余 observing 均无 hard_fail 记录
         ['granted', 'pooled'],
         ['failed', 'stopped'], // 剩余 failed 均进过池
       ]

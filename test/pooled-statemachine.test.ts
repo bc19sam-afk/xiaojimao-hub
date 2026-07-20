@@ -322,3 +322,73 @@ test('CAS 退回守卫：已入池（pooled）的号不被 deleteContribution �
   assert.equal(db.deleteContribution('cas-guard-2', ['submitted', 'first_check']), true)
   assert.equal(db.byUser(uid).find((x) => x.id === 'cas-guard-2'), undefined)
 })
+
+// ⑪ 非配额 retry 不入池（codex xhigh 于 PR #15 指出）：mapInspection 的 retry 还兜「未分类错误/
+//    服务端异常/disable」——没证实能登录，不能入池锁唯一键，留首检循环下轮再查
+test('codex 非配额 retry（未分类/disable）→ 不入池，留 first_check 下轮复查', async () => {
+  const uid = 6011
+  const id = 'codex-retry-vague'
+  const accountId = 'codex-retry-vague-acc'
+  db.insertUnique(
+    makeContribution({ id, provider: 'codex', accountId, authFileName: `codex-${accountId}.json`, plan: 'plus', linuxdoId: uid }),
+  )
+  // reason 不命中限额词表（如 disable/未知错误）→ 不入池
+  await withInspect([{ accountId, decision: 'retry', plan: 'plus', reason: 'account disabled by action' }], () =>
+    collect.processPending(),
+  )
+  const c = db.byUser(uid).find((x) => x.id === id)
+  assert.ok(c)
+  assert.equal(c.verifyStatus, 'first_check') // 留首检循环，未锁池
+  assert.equal(db.balance(uid), 0)
+})
+
+// ⑫ 退回顺序：删 auth 文件失败 → 本轮不退回（行保留、唯一键不释放），防孤立文件挡住重交
+//    （codex xhigh 于 PR #15 指出：先删行后删文件会留孤立文件，重交同号被授权前快照挡住）
+test('退回顺序：deleteAuthFile 失败 → 行保留转 first_check、唯一键不释放，下轮重试', async () => {
+  const uid = 6012
+  const id = 'codex-rejfail'
+  const accountId = 'codex-rejfail-acc'
+  db.insertUnique(
+    makeContribution({ id, provider: 'codex', accountId, authFileName: `codex-${accountId}.json`, plan: 'plus', linuxdoId: uid }),
+  )
+  const origDelete = cpa.deleteAuthFile
+  cpa.deleteAuthFile = async () => {
+    throw new Error('CPA unavailable')
+  }
+  try {
+    await withInspect([{ accountId, decision: 'reject', plan: 'plus', reason: 'unauthorized' }], () =>
+      collect.processPending(),
+    )
+  } finally {
+    cpa.deleteAuthFile = origDelete
+  }
+  const c = db.byUser(uid).find((x) => x.id === id)
+  assert.ok(c, '文件删失败时行必须保留（唯一键不释放，防孤立文件挡重交）')
+  assert.equal(c.verifyStatus, 'first_check') // 下轮重试退回
+})
+
+// ⑬ migration 007：observing 且已记 hard_fail 的行（v6 判死中途崩溃残留）→ stopped 而非 pooled
+//    （codex xhigh 于 PR #15 指出：已知死号映成 pooled 会永远挂着无人再查）
+test('迁移007：observing+已记 hard_fail → stopped（已知死号不得进池）', () => {
+  const d = makeDbAt(6)
+  const ins = d.prepare(INSERT)
+  // 正常 observing（无 hard_fail）→ pooled
+  ins.run('obs-ok', 95, 'acc-obs-ok', 'observing')
+  // observing 但 observations 里已有 hard_fail（判死中途崩溃残留）→ stopped
+  ins.run('obs-dead', 96, 'acc-obs-dead', 'observing')
+  d.prepare(
+    'INSERT INTO observations (contribution_id, observed_at, kind, detail, created_at) VALUES (?,?,?,?,?)',
+  ).run('obs-dead', 100, 'hard_fail', 'inspect:reject', 100)
+
+  migrate(d)
+
+  const ok = d.prepare('SELECT verify_status FROM contributions WHERE id=?').get('obs-ok') as {
+    verify_status: string
+  }
+  const dead = d.prepare('SELECT verify_status FROM contributions WHERE id=?').get('obs-dead') as {
+    verify_status: string
+  }
+  assert.equal(ok.verify_status, 'pooled') // 健康 observing 正常进池
+  assert.equal(dead.verify_status, 'stopped') // 已知死号 → stopped
+  d.close()
+})

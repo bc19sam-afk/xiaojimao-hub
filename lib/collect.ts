@@ -206,18 +206,19 @@ export async function processPending(): Promise<{
       if (db.transition(c.id, ['submitted', 'first_check'], 'pooled')) pooled++
     }
 
-    // 首检失败·退回（§2.4/§3.2）：号 401/撤权/封号、压根没入池 → 先 CAS 删 contribution 行（仅当仍处
-    //   首检两态才删＝声明退回权，释放 (provider, account_id) 唯一键，用户修好可重交），删行成功才删
-    //   cpamp auth 文件（best-effort）。**先删行后删文件**：若行已被并发路径转入 pooled（过期巡检结果），
-    //   CAS 失败＝不退回、绝不误删已入池号的文件与归属（codex bot 于 PR #15 指出）。
+    // 首检失败·退回（§2.4/§3.2）：号 401/撤权/封号、压根没入池 → **先删 cpamp auth 文件、成功后才
+    //   CAS 删 contribution 行**（仅当仍处首检两态才删，释放唯一键让用户修好重交）。顺序关键
+    //   （codex xhigh 于 PR #15 指出）：若先删行、文件删失败，孤立文件会留在池里——用户重交同号时
+    //   授权前快照已含该文件名（同名覆盖认不出新落）→ findNew 挡住、修好的号反而交不进来。故文件
+    //   删失败＝本轮不退回、保留行（转 first_check），下轮重试删除；CAS 删行仍防误删已入池行。
     const rejectBack = async (c: (typeof pending)[number]): Promise<void> => {
-      if (!db.deleteContribution(c.id, ['submitted', 'first_check'])) return // 已非首检态（如已入池）→ 不退回
       try {
         await cpa.deleteAuthFile(c.authFileName)
       } catch {
-        /* 文件删除失败：唯一键已释放；孤立文件由号池侧巡检兜底 */
+        db.transition(c.id, ['submitted'], 'first_check') // 文件还在：保留行下轮重试，不释放唯一键
+        return
       }
-      rejected++
+      if (db.deleteContribution(c.id, ['submitted', 'first_check'])) rejected++ // CAS：已入池则不删
     }
 
     // —— codex：走 cpamp 巡检（能识别套餐 + 能登录/失效判定）——
@@ -237,9 +238,16 @@ export async function processPending(): Promise<{
           const r = byId.get(c.accountId)
           if (!r) continue // 本轮巡检未覆盖（刚落号/掉队）→ 跳过，下轮再检
           const plan = r.plan && r.plan !== 'unknown' ? r.plan : c.plan
-          if (r.decision === 'ok' || r.decision === 'retry') {
-            // ok=能登录未封 / retry=限额或额度暂满（不算失败）→ 均入池等被调用（§3.2）
+          if (r.decision === 'ok' || (r.decision === 'retry' && SOFT_REASON.test(r.reason || ''))) {
+            // ok=能登录未封 → 入池。retry 只认「配额类」（reason 命中限额词表＝usage_limit/quota/
+            // rate_limit…）＝§3.2「限额不算失败，先入池等恢复」。⚠️ retry 不全是限额：mapInspection
+            // 对未分类错误/服务端异常/disable 也回 retry——这些没证实「能登录」，不能入池锁唯一键
+            // （codex xhigh 于 PR #15 指出），转 first_check 下轮再查（限额恢复/问题消失后 inspect
+            // 会转 ok 自然入池，只是晚点，不算失败）。
             await enterPool(c, plan)
+          } else if (r.decision === 'retry') {
+            // 非配额 retry（未分类/服务端异常/disable）→ 留首检循环，下轮复查
+            db.transition(c.id, ['submitted'], 'first_check')
           } else if (r.decision === 'reject') {
             // 401/撤权/失效＝首检失败 → 退回（删文件 + 删行释放唯一键）
             await rejectBack(c)
