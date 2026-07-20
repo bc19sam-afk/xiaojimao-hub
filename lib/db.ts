@@ -51,8 +51,11 @@ const DB_PATH = process.env.DB_PATH || path.join(process.cwd(), 'data', 'app.db'
 function openDb(): DatabaseSync {
   fs.mkdirSync(path.dirname(DB_PATH), { recursive: true })
   const d = new DatabaseSync(DB_PATH)
-  d.exec('PRAGMA journal_mode = WAL')
+  // busy_timeout 必须先设：它一设即生效且自身不取锁，随后所有取锁语句（WAL 建立、seedDefaults 的
+  // BEGIN IMMEDIATE）都受这 5s 等待保护。若顺序颠倒，next build 多 worker 同刻 openDb 争 WAL 建立
+  // 的短暂排他锁时，journal_mode=WAL 会以 busy_timeout=0 立刻抛 "database is locked"（无重试）。
   d.exec('PRAGMA busy_timeout = 5000')
+  d.exec('PRAGMA journal_mode = WAL')
   // 迁移纪律：生产（非 mock）只校验 schema 版本，迁移由部署步骤 `npm run migrate` 执行；
   // mock（开发/演示）保持启动自动迁移。
   if (env.mock) migrate(d)
@@ -62,63 +65,78 @@ function openDb(): DatabaseSync {
 }
 
 // 首次运行播种合理默认值（管理页可随时改）。仅在表为空时插入。
-function seedDefaults(d: DatabaseSync): void {
-  const ruleCount = (d.prepare('SELECT COUNT(*) AS n FROM point_rules').get() as { n: number }).n
-  if (ruleCount === 0) {
-    const rules: [string, string, number, string][] = [
-      ['codex', 'plus', 10, 'ChatGPT Plus'],
-      ['codex', 'pro', 30, 'ChatGPT Pro'],
-      ['codex', 'team', 50, 'ChatGPT Team'],
-      ['codex', 'edu', 20, 'ChatGPT Edu / K12'],
-      ['codex', '*', 5, 'ChatGPT 其它'],
-      ['claude', '*', 20, 'Claude'],
-      ['grok', '*', 20, 'SuperGrok'],
-    ]
-    const stmt = d.prepare(
-      'INSERT INTO point_rules (provider, plan, points, label) VALUES (?,?,?,?)',
-    )
-    for (const [p, pl, pts, label] of rules) stmt.run(p, pl, pts, label)
-  }
-  // 用量单价（usage_rates，P2-R2）：每次调用积分单价，占位值、后台可调（管理 UI 留 R3）。分档演示
-  // codex-pro 高于 plus；claude/grok 用兜底档。数字皆占位——需求 §3.4「数字全为占位、随时调」。
-  const rateCount = (d.prepare('SELECT COUNT(*) AS n FROM usage_rates').get() as { n: number }).n
-  if (rateCount === 0) {
-    const rates: [string, string, number, string][] = [
-      ['codex', 'plus', 1, 'Codex Plus 每次调用'],
-      ['codex', 'pro', 2, 'Codex Pro 每次调用'],
-      ['codex', '*', 1, 'Codex 其它每次调用'],
-      ['claude', '*', 1, 'Claude 每次调用'],
-      ['grok', '*', 1, 'SuperGrok 每次调用'],
-    ]
-    // ON CONFLICT DO NOTHING：next build 并行拉起多个 worker 各自 openDb→seedDefaults 打同一库，
-    // 「if count==0 then INSERT」非原子（两进程同读 0 再各插 → 撞 UNIQUE）。幂等插入让并发败者静默跳过，
-    // 不新增 build 偶发失败面（老 point_rules/redeem_items 播种同款隐患已存在，见 PR 说明，本单不改它们）。
-    const stmt = d.prepare(
-      `INSERT INTO usage_rates (provider, plan, points_per_call, label) VALUES (?,?,?,?)
-       ON CONFLICT(provider, plan) DO NOTHING`,
-    )
-    for (const [p, pl, ppc, label] of rates) stmt.run(p, pl, ppc, label)
-  }
-  const itemCount = (d.prepare('SELECT COUNT(*) AS n FROM redeem_items').get() as { n: number }).n
-  if (itemCount === 0) {
-    const items: [string, string, number, string, number][] = [
-      ['限时额度（高）', '较高额度，限时使用', 50, 'timed_quota', 1],
-      ['永久额度', '永久有效的额度', 100, 'permanent_quota', 2],
-      ['注册邀请码', '公益站注册邀请码 ×1', 150, 'invite_code', 3],
-      ['订阅 VIP', '一段时间的 VIP 订阅', 200, 'vip', 4],
-    ]
-    const stmt = d.prepare(
-      'INSERT INTO redeem_items (name, description, cost, kind, sort) VALUES (?,?,?,?,?)',
-    )
-    for (const [n, desc, cost, kind, sort] of items) stmt.run(n, desc, cost, kind, sort)
-  }
-  // 考察窗口 T 默认值（app_config KV）：mock 8s 便于演示 / 真实 24h。仅键缺失时播种，管理页可改。
-  if (d.prepare('SELECT 1 FROM app_config WHERE key=?').get('observe_window_ms') == null) {
-    d.prepare('INSERT INTO app_config (key, value, updated_at) VALUES (?,?,?)').run(
-      'observe_window_ms',
-      String(env.mock ? 8000 : 86_400_000),
-      Date.now(),
-    )
+// ⚠️ 并发播种竞态（TOCTOU）：next build 并行拉起多个 worker 进程，各自 openDb→seedDefaults 打同一
+// data/app.db。每块「SELECT COUNT==0 then INSERT」非原子，两进程同读 count=0 再各插 →
+//   point_rules / usage_rates（UNIQUE(provider,plan)）撞唯一键抛错 → build 挂；
+//   redeem_items（无唯一键）静默插两份种子（4→8）；app_config（key 为 PRIMARY KEY）同样会撞。
+// 修法：整个函数体包进 BEGIN IMMEDIATE 单事务（openDb 已设 busy_timeout=5s）。先到者持写锁播完提交，
+// 后到者阻塞至提交后、其读到各表 count>0 全部跳过——一处修好所有块及任何未来种子表，且不改任何
+// 单条 INSERT / 种子值。与 migrate() / settleAndAward 同款「BEGIN IMMEDIATE 兼作并发锁」模式。
+// export：供 test/seed-concurrency.test.ts 直接驱动并发（子进程各开 target 连接、对齐后调本函数），
+// 测其 BEGIN IMMEDIATE 原子播种。生产无其它调用方（仅 openDb 内部用）。
+export function seedDefaults(d: DatabaseSync): void {
+  d.exec('BEGIN IMMEDIATE')
+  try {
+    const ruleCount = (d.prepare('SELECT COUNT(*) AS n FROM point_rules').get() as { n: number }).n
+    if (ruleCount === 0) {
+      const rules: [string, string, number, string][] = [
+        ['codex', 'plus', 10, 'ChatGPT Plus'],
+        ['codex', 'pro', 30, 'ChatGPT Pro'],
+        ['codex', 'team', 50, 'ChatGPT Team'],
+        ['codex', 'edu', 20, 'ChatGPT Edu / K12'],
+        ['codex', '*', 5, 'ChatGPT 其它'],
+        ['claude', '*', 20, 'Claude'],
+        ['grok', '*', 20, 'SuperGrok'],
+      ]
+      const stmt = d.prepare(
+        'INSERT INTO point_rules (provider, plan, points, label) VALUES (?,?,?,?)',
+      )
+      for (const [p, pl, pts, label] of rules) stmt.run(p, pl, pts, label)
+    }
+    // 用量单价（usage_rates，P2-R2）：每次调用积分单价，占位值、后台可调（管理 UI 留 R3）。分档演示
+    // codex-pro 高于 plus；claude/grok 用兜底档。数字皆占位——需求 §3.4「数字全为占位、随时调」。
+    const rateCount = (d.prepare('SELECT COUNT(*) AS n FROM usage_rates').get() as { n: number }).n
+    if (rateCount === 0) {
+      const rates: [string, string, number, string][] = [
+        ['codex', 'plus', 1, 'Codex Plus 每次调用'],
+        ['codex', 'pro', 2, 'Codex Pro 每次调用'],
+        ['codex', '*', 1, 'Codex 其它每次调用'],
+        ['claude', '*', 1, 'Claude 每次调用'],
+        ['grok', '*', 1, 'SuperGrok 每次调用'],
+      ]
+      // ON CONFLICT DO NOTHING：P2-R2 本块先行止血的幂等插入。现整个 seedDefaults 已包进外层
+      // BEGIN IMMEDIATE 单事务，此 ON CONFLICT 成冗余兜底、保留无害（不再单独依赖它防并发）。
+      const stmt = d.prepare(
+        `INSERT INTO usage_rates (provider, plan, points_per_call, label) VALUES (?,?,?,?)
+         ON CONFLICT(provider, plan) DO NOTHING`,
+      )
+      for (const [p, pl, ppc, label] of rates) stmt.run(p, pl, ppc, label)
+    }
+    const itemCount = (d.prepare('SELECT COUNT(*) AS n FROM redeem_items').get() as { n: number }).n
+    if (itemCount === 0) {
+      const items: [string, string, number, string, number][] = [
+        ['限时额度（高）', '较高额度，限时使用', 50, 'timed_quota', 1],
+        ['永久额度', '永久有效的额度', 100, 'permanent_quota', 2],
+        ['注册邀请码', '公益站注册邀请码 ×1', 150, 'invite_code', 3],
+        ['订阅 VIP', '一段时间的 VIP 订阅', 200, 'vip', 4],
+      ]
+      const stmt = d.prepare(
+        'INSERT INTO redeem_items (name, description, cost, kind, sort) VALUES (?,?,?,?,?)',
+      )
+      for (const [n, desc, cost, kind, sort] of items) stmt.run(n, desc, cost, kind, sort)
+    }
+    // 考察窗口 T 默认值（app_config KV）：mock 8s 便于演示 / 真实 24h。仅键缺失时播种，管理页可改。
+    if (d.prepare('SELECT 1 FROM app_config WHERE key=?').get('observe_window_ms') == null) {
+      d.prepare('INSERT INTO app_config (key, value, updated_at) VALUES (?,?,?)').run(
+        'observe_window_ms',
+        String(env.mock ? 8000 : 86_400_000),
+        Date.now(),
+      )
+    }
+    d.exec('COMMIT')
+  } catch (err) {
+    d.exec('ROLLBACK')
+    throw err
   }
 }
 
