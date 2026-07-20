@@ -82,6 +82,15 @@ export interface ProbeResult {
   reason: string
 }
 
+// 按号按自然日的调用量（P2-R2 按量计量数据源）。date＝'YYYY-MM-DD' 自然日（时区随服务器）、
+// count＝该号该日调用次数。settleDailyUsage 据此折算积分、按日结算发给号主。
+export interface DailyUsage {
+  accountId: string
+  provider: ProviderId
+  date: string
+  count: number
+}
+
 // knownAccountIds 语义：**该 provider** 已入库的 accountId 列表（不是全局）。
 // account_id 命名空间按 provider 独立，跨 provider 撞同一 id 是合法新号，
 // 故判重必须按 provider 划界——调用方（collect.ts）负责按 provider 过滤后传入。
@@ -108,6 +117,8 @@ export interface CpaClient {
   setDisabled(name: string, disabled: boolean): Promise<void>
   deleteAuthFile(name: string): Promise<void>
   inspect(): Promise<ProbeResult[]>
+  // 按号按自然日的调用量（P2-R2）。settleDailyUsage 周期拉取 → 折算积分 → 按日发给号主。
+  getDailyUsage(): Promise<DailyUsage[]>
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
@@ -119,6 +130,15 @@ function hash(s: string): string {
   let h = 0
   for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0
   return Math.abs(h).toString(36)
+}
+// 毫秒 → 'YYYY-MM-DD' 自然日（服务器本地时区，§3.3「时区随服务器」）。
+// ⚠️ 故意与 lib/settle.ts 的同名助手各留一份：保 cpa.ts 只依赖 env（低层「所有 CPA 调用关这里」），
+// 不为一个 3 行日期助手引入 cpa→settle 反向依赖。两处实现须一致（同为本地时区 YMD）。
+function dayStr(ms: number): string {
+  const d = new Date(ms)
+  const m = String(d.getMonth() + 1).padStart(2, '0')
+  const day = String(d.getDate()).padStart(2, '0')
+  return `${d.getFullYear()}-${m}-${day}`
 }
 const MOCK_CPA_PATH = process.env.MOCK_CPA_PATH || join(process.cwd(), 'data', 'mock-cpa.json')
 function mockLoad(): Map<string, AuthFile> {
@@ -184,6 +204,19 @@ const mockClient: CpaClient = {
       const bad = hash(f.accountId).charCodeAt(0) % 10 === 0
       return { accountId: f.accountId, decision: bad ? ('reject' as const) : ('ok' as const), plan: f.plan, reason: bad ? 'unauthorized' : 'ok' }
     })
+  },
+  async getDailyUsage() {
+    // MOCK：给号池里每个（能识别 provider 的）号编造稳定用量——按 accountId hash 出每日次数，
+    // 给「昨天」一笔（可被 settleDailyUsage 结算 → 驱动端到端发分演示）+「今天」一笔（进行中不结）。
+    const now = Date.now()
+    const out: DailyUsage[] = []
+    for (const f of mockLoad().values()) {
+      if (!f.provider) continue
+      const base = 10 + (parseInt(hash(f.accountId), 36) % 50) // 稳定 10..59 次/日
+      out.push({ accountId: f.accountId, provider: f.provider, date: dayStr(now - 86_400_000), count: base })
+      out.push({ accountId: f.accountId, provider: f.provider, date: dayStr(now), count: base + 3 })
+    }
+    return out
   },
 }
 
@@ -381,6 +414,33 @@ const realClient: CpaClient = {
     }
     return (detail.results ?? []).map(mapInspection)
   },
+  async getDailyUsage() {
+    // ⚠️ 骨架（同 inspect）：真实 usage 事件字段名 / hub 来源标记格式 / 是否支持查询参数缩小范围
+    //   待对接样本核对，MOCK 阶段以 mockClient 验证聚合逻辑。数据源 GET /v0/management/usage（P0-A 实探）：
+    //   { apis: { [端点]: { models: { [模型]: { details: RawUsageDetail[] } } } } }，每条 detail = 一次请求。
+    // 计量口径（§3.1/P0-A）：按 (auth_provider_snapshot, account_snapshot) 分组、timestamp 落自然日、
+    //   数 details 条数 = 该号当日调用次数；只算带 hub 来源标记（auth_label_snapshot）的贡献号。
+    const data = (await req('GET', '/v0/management/usage')) as RawUsage
+    const agg = new Map<string, DailyUsage>() // key = provider\0accountId\0date
+    for (const apiEntry of Object.values(data.apis ?? {})) {
+      for (const model of Object.values(apiEntry?.models ?? {})) {
+        for (const d of model?.details ?? []) {
+          // TODO(对接)：hub 来源标记格式待定——只算贡献号（见 isHubContribution）。来源标记写入见后续单。
+          if (!isHubContribution(d.auth_label_snapshot)) continue
+          const provider = providerFromToken(d.auth_provider_snapshot) // anthropic→claude、xai→grok
+          const accountId = d.account_snapshot ?? ''
+          const ts = d.timestamp
+          if (!provider || !accountId || ts == null) continue // 认不出 provider / 无稳定号 / 无时间戳 → 跳过
+          const date = dayStr(tsToMs(ts))
+          const key = `${provider}\0${accountId}\0${date}`
+          const cur = agg.get(key)
+          if (cur) cur.count++
+          else agg.set(key, { accountId, provider, date, count: 1 })
+        }
+      }
+    }
+    return [...agg.values()]
+  },
 }
 
 interface RawInspectionResult {
@@ -404,6 +464,32 @@ export function mapInspection(r: RawInspectionResult): ProbeResult {
   else if (code === 200 || r.action === 'enable' || r.action === 'keep' || !r.errorKind) decision = 'ok'
   else decision = 'retry'
   return { accountId: r.accountId ?? '', decision, plan, reason }
+}
+
+// —— usage 事件流原始形状（P2-R2 骨架，字段名待对接样本核对，见 getDailyUsage 注释）——
+interface RawUsageDetail {
+  account_snapshot?: string
+  auth_provider_snapshot?: string
+  auth_label_snapshot?: string
+  timestamp?: string | number
+}
+interface RawUsage {
+  apis?: Record<string, { models?: Record<string, { details?: RawUsageDetail[] }> }>
+}
+// TODO(对接)：hub 来源标记的确切格式待 usage 样本核对。占位实现——label 含 'hub' 视为贡献号。
+// ⚠️ 真实对接前必以样本校准：误纳官方号→错发分、漏纳贡献号→少发分（同 mapInspection 的 reason 词表纪律）。
+// ⚠️ label 预过滤已降级为「优化提示」而非硬闸（codex xhigh 于 PR #16 指出：现今没有任何收号路径写
+// label——RT 上传无 label 字段、OAuth 只提交 provider+redirect_url，硬过滤＝生产零发分）。真正的
+// 「是不是我们的号」由 settle 层的 pooled 号索引判定（(provider, account_id) 匹配，权威）；此处仅当
+// label **明确是别家标记**时跳过（现阶段一律放行）。「来源标记写入」已立项（路线图 P2 残项），写入
+// 落地 + 真实 label 格式核对后，可把这里升级回预过滤以省聚合量。
+function isHubContribution(_label: string | undefined): boolean {
+  return true // 放行；归属判定交给 settle 层 pooled 索引
+}
+// TODO(对接)：timestamp 单位待核对。占位启发式——数字 <1e12 视为秒、否则毫秒；字符串按 Date.parse。
+function tsToMs(ts: string | number): number {
+  if (typeof ts === 'number') return ts < 1e12 ? ts * 1000 : ts
+  return Date.parse(ts) || 0
 }
 
 export const cpa: CpaClient = env.mock ? mockClient : realClient
