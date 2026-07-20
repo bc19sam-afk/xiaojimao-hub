@@ -22,7 +22,9 @@ function fulfillPlaceholder(kind: string): string {
 // 纯函数、无 DB 依赖，便于单测（admin 导入 API 的解析逻辑即此）。db.importCdkCodes 再按 (item_id, code)
 // 唯一键做落库级去重（跨批次防重）。
 export function parseCdkCodes(raw: string | string[]): string[] {
-  const parts = Array.isArray(raw) ? raw : String(raw).split(/[\r\n,]+/)
+  // 换行 / 逗号 / 空白（空格·tab）皆作分隔符——§5.3 文档承诺「一行一码 / 逗号 / 空白分隔」，漏空格会把
+  // 「CODE-1 CODE-2」当成一个码整串入库、之后发出不可用拼接码（codex+bot 复审 P2）。
+  const parts = Array.isArray(raw) ? raw : String(raw).split(/[\s,]+/)
   const out: string[] = []
   const seen = new Set<string>()
   for (const p of parts) {
@@ -35,7 +37,10 @@ export function parseCdkCodes(raw: string | string[]): string[] {
 }
 
 // 幂等键短窗（token 缺失时的服务端兜底）：同一 (用户, 项) 在窗口内的重复请求折叠成一次。
-// 正常客户端每次兑换手势带独立 token，几乎不会走到兜底；仅裸 API / 旧缓存客户端命中。
+// 正常客户端每次兑换手势带独立 token（见 RedeemStore，crypto.randomUUID 每项一枚），几乎不会走到兜底；
+// 仅裸 API / 旧缓存客户端命中。⚠️ 固定时间桶是 best-effort：跨桶边界（如 9.9s / 10.1s）的无 token 重放会
+// 落不同桶、不折叠 → 可双花（codex 复审 P1）。无客户端稳定键时无法根治，故仅作弱兜底——真正的重复兑换
+// 防护靠客户端必带 token（已保证）。根治（如失败也落库回放 / 服务端请求指纹）留后续 task。
 const IDEM_WINDOW_MS = 10_000
 
 // 确定性幂等键 → redemptionId（既作 redemptions 主键，又作 point_ledger 的 ref）。

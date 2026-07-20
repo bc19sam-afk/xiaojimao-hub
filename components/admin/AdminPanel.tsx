@@ -19,6 +19,8 @@ interface RedeemItem {
   enabled: number
   sort: number
   config: string
+  fulfillment?: string
+  perUserLimit?: number
 }
 
 const KINDS = [
@@ -26,6 +28,11 @@ const KINDS = [
   { v: 'permanent_quota', t: '永久额度' },
   { v: 'vip', t: '订阅VIP' },
   { v: 'invite_code', t: '邀请码' },
+]
+// 履约类型：placeholder 占位文案 / cdk 发码（后台先给该项导入 CDK 码，兑换时事务内占一个码发出）
+const FULFILLMENTS = [
+  { v: 'placeholder', t: '占位' },
+  { v: 'cdk', t: 'CDK 发码' },
 ]
 
 const field =
@@ -195,11 +202,13 @@ function ItemRow({
   const [name, setName] = useState(item?.name ?? '')
   const [cost, setCost] = useState(item?.cost ?? 0)
   const [kind, setKind] = useState(item?.kind ?? 'timed_quota')
+  const [fulfillment, setFulfillment] = useState(item?.fulfillment ?? 'placeholder')
+  const [perUserLimit, setPerUserLimit] = useState(item?.perUserLimit ?? 0)
   const [description, setDescription] = useState(item?.description ?? '')
   const [enabled, setEnabled] = useState((item?.enabled ?? 1) !== 0)
 
   return (
-    <div className="grid grid-cols-[1.3fr_100px_1fr_1.4fr_auto_auto] items-center gap-2">
+    <div className="grid grid-cols-[1.2fr_80px_1fr_1fr_72px_1.2fr_auto_auto] items-center gap-2">
       <input className={field} value={name} onChange={(e) => setName(e.target.value)} placeholder="名称" />
       <input className={field} type="number" value={cost} onChange={(e) => setCost(Number(e.target.value))} />
       <select className={field} value={kind} onChange={(e) => setKind(e.target.value)}>
@@ -209,11 +218,29 @@ function ItemRow({
           </option>
         ))}
       </select>
+      <select className={field} value={fulfillment} onChange={(e) => setFulfillment(e.target.value)} title="履约类型">
+        {FULFILLMENTS.map((f) => (
+          <option key={f.v} value={f.v}>
+            {f.t}
+          </option>
+        ))}
+      </select>
+      <input
+        className={field}
+        type="number"
+        min={0}
+        value={perUserLimit}
+        onChange={(e) => setPerUserLimit(Number(e.target.value))}
+        title="每人限购（0=不限）"
+        placeholder="限购"
+      />
       <input className={field} value={description} onChange={(e) => setDescription(e.target.value)} placeholder="说明" />
       <input type="checkbox" checked={enabled} onChange={(e) => setEnabled(e.target.checked)} className="h-4 w-4 accent-emerald-500" />
       <div className="flex gap-1">
         <button
-          onClick={() => onSave({ id: item?.id, name, cost, kind, description, sort: item?.sort ?? 0, enabled: enabled ? 1 : 0 })}
+          onClick={() =>
+            onSave({ id: item?.id, name, cost, kind, fulfillment, perUserLimit, description, sort: item?.sort ?? 0, enabled: enabled ? 1 : 0 })
+          }
           className="rounded-lg bg-[var(--brand)]/20 px-2.5 py-1.5 text-xs font-medium text-[var(--brand-bright)] hover:bg-[var(--brand)]/30"
         >
           {isNew ? '新增' : '保存'}

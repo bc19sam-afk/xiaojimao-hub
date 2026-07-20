@@ -58,7 +58,9 @@ export default function RedeemStore({ refreshKey, onRedeemed }: { refreshKey: nu
       delete tokens.current[item.id]
       if (!res.ok) throw new Error(d.error || '兑换失败')
       setToast({ ok: true, text: `已兑换「${item.name}」` })
-      await load()
+      // 成功已定（以兑换响应为准）——后续刷新失败绝不可翻转成「兑换失败」，否则用户以为没成、重试会生成
+      // 新 token 二次扣分二次发码（codex 复审 P1）。故 load 不 await、吞掉其错误；余额/记录下次刷新自愈。
+      load().catch(() => {})
       onRedeemed()
     } catch (e) {
       setToast({ ok: false, text: (e as Error).message })

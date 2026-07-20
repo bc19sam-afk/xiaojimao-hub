@@ -316,3 +316,14 @@ test('parseCdkCodes：分隔/trim/去空/去重', () => {
   assert.deepEqual(redeemMod.parseCdkCodes(['X', 'X', 'Y', '  ', 'Z']), ['X', 'Y', 'Z'])
   assert.deepEqual(redeemMod.parseCdkCodes(''), [])
 })
+
+// parseCdkCodes 分隔（codex+bot 复审 P2）：§5.3 承诺「一行一码 / 逗号 / 空白分隔」，漏空格会把
+// 「CODE-1 CODE-2」当一个码整串入库、之后发出不可用拼接码。
+test('parseCdkCodes：换行/逗号/空白/tab 皆分隔 + trim + 去重', () => {
+  const p = redeemMod.parseCdkCodes
+  assert.deepEqual(p('A\nB,C'), ['A', 'B', 'C'])
+  assert.deepEqual(p('CODE-1 CODE-2'), ['CODE-1', 'CODE-2']) // 空格分隔（本次修复点）
+  assert.deepEqual(p('X\tY'), ['X', 'Y']) // tab
+  assert.deepEqual(p(' A ,, B \n\n A '), ['A', 'B']) // trim + 连续/空段折叠 + 去重
+  assert.deepEqual(p(['P', 'P', ' Q ']), ['P', 'Q']) // 数组入参也 trim + 去重
+})
