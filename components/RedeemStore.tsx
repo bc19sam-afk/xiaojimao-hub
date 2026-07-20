@@ -1,6 +1,6 @@
 'use client'
 
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { CoinsIcon, GiftIcon } from '@phosphor-icons/react'
 
 interface Item {
@@ -9,6 +9,7 @@ interface Item {
   description: string
   cost: number
   kind: string
+  soldOut?: boolean
 }
 interface Redemption {
   id: string
@@ -25,6 +26,9 @@ export default function RedeemStore({ refreshKey, onRedeemed }: { refreshKey: nu
   const [redemptions, setRedemptions] = useState<Redemption[]>([])
   const [busy, setBusy] = useState(0)
   const [toast, setToast] = useState<{ ok: boolean; text: string } | null>(null)
+  // 每项一枚幂等 token：兑换手势首次生成、收到定论（成功/业务拒绝）即清、网络错误保留供重试复用——
+  // 让重复点击/超时重试落到同一 token → 服务端幂等回放、不重复扣分。
+  const tokens = useRef<Record<number, string>>({})
 
   const load = useCallback(async () => {
     const d = await fetch('/api/store', { cache: 'no-store' }).then((r) => r.json())
@@ -41,21 +45,39 @@ export default function RedeemStore({ refreshKey, onRedeemed }: { refreshKey: nu
   async function redeem(item: Item) {
     setBusy(item.id)
     setToast(null)
+    const token = tokens.current[item.id] ?? (tokens.current[item.id] = crypto.randomUUID())
     try {
       const res = await fetch('/api/redeem', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ itemId: item.id }),
+        body: JSON.stringify({ itemId: item.id, token }),
       })
       const d = await res.json().catch(() => ({}))
+      // 收到响应（成功或业务拒绝）＝本次尝试有定论 → 清 token，下次兑换用新 token；
+      // 若 fetch 直接抛（网络/超时、无响应）则跳过此清除，token 保留供重试复用（超时重试幂等）。
+      delete tokens.current[item.id]
       if (!res.ok) throw new Error(d.error || '兑换失败')
-      setToast({ ok: true, text: `已兑换「${item.name}」` })
-      await load()
+      // 成功文案直接带上发出的码（若是可复制码）——不依赖后续 load，即便 /api/store 刷新失败用户当场也拿得到
+      // 码（codex 复审 P2：吞了 load 错误后成功却暂时看不到码）。码也已落 redemption，可在兑换记录找回。
+      const isCode = typeof d.result === 'string' && /^[\x21-\x7e]+$/.test(d.result)
+      setToast({ ok: true, text: isCode ? `已兑换「${item.name}」：${d.result}` : `已兑换「${item.name}」` })
+      // 成功已定（以兑换响应为准）——后续刷新失败绝不可翻转成「兑换失败」，否则用户以为没成、重试会生成
+      // 新 token 二次扣分二次发码（codex 复审 P1）。故 load 不 await、吞掉其错误；余额/记录下次刷新自愈。
+      load().catch(() => {})
       onRedeemed()
     } catch (e) {
       setToast({ ok: false, text: (e as Error).message })
     } finally {
       setBusy(0)
+    }
+  }
+
+  async function copyCode(code: string) {
+    try {
+      await navigator.clipboard.writeText(code)
+      setToast({ ok: true, text: '已复制到剪贴板' })
+    } catch {
+      setToast({ ok: false, text: '复制失败，请手动选择' })
     }
   }
 
@@ -79,6 +101,7 @@ export default function RedeemStore({ refreshKey, onRedeemed }: { refreshKey: nu
         <div className="space-y-2">
           {items.map((it) => {
             const affordable = balance >= it.cost
+            const canBuy = affordable && !it.soldOut
             return (
               <div
                 key={it.id}
@@ -92,14 +115,14 @@ export default function RedeemStore({ refreshKey, onRedeemed }: { refreshKey: nu
                 </div>
                 <button
                   onClick={() => redeem(it)}
-                  disabled={busy === it.id || !affordable}
+                  disabled={busy === it.id || !canBuy}
                   className={`shrink-0 rounded-lg px-3 py-1.5 text-xs font-semibold transition ${
-                    affordable
+                    canBuy
                       ? 'bg-[var(--brand)] text-white hover:bg-[var(--brand-bright)]'
                       : 'cursor-not-allowed bg-white/5 text-neutral-500'
                   } disabled:opacity-60`}
                 >
-                  {busy === it.id ? '兑换中…' : `${it.cost} 分`}
+                  {it.soldOut ? '已兑罄' : busy === it.id ? '兑换中…' : `${it.cost} 分`}
                 </button>
               </div>
             )
@@ -121,17 +144,28 @@ export default function RedeemStore({ refreshKey, onRedeemed }: { refreshKey: nu
         <div className="mt-4 border-t border-white/10 pt-3">
           <div className="mb-2 text-[11px] text-neutral-500">兑换记录</div>
           <ul className="space-y-1.5">
-            {redemptions.slice(0, 5).map((r) => (
-              <li key={r.id} className="flex items-center justify-between text-xs">
-                <span className="text-neutral-300">{r.itemName}</span>
-                <span className="mono text-neutral-500">
-                  −{r.cost}
-                  {r.result && r.result.startsWith('XJM-') && (
-                    <span className="ml-2 text-[var(--brand-bright)]">{r.result}</span>
-                  )}
-                </span>
-              </li>
-            ))}
+            {redemptions.slice(0, 5).map((r) => {
+              // 码类结果（CDK / 占位邀请码）为可打印 ASCII → 显示可复制码（§5.3「响应丢失可在兑换记录找回」）；
+              // 中文占位串（「已发放（占位…）」）不当码显示。
+              const isCode = !!r.result && /^[\x21-\x7e]+$/.test(r.result)
+              return (
+                <li key={r.id} className="flex items-center justify-between gap-2 text-xs">
+                  <span className="text-neutral-300">{r.itemName}</span>
+                  <span className="mono flex items-center gap-2 text-neutral-500">
+                    −{r.cost}
+                    {isCode && (
+                      <button
+                        onClick={() => copyCode(r.result)}
+                        title="点击复制"
+                        className="max-w-[10rem] truncate rounded bg-[var(--brand)]/15 px-1.5 py-0.5 text-[var(--brand-bright)] hover:bg-[var(--brand)]/25"
+                      >
+                        {r.result}
+                      </button>
+                    )}
+                  </span>
+                </li>
+              )
+            })}
           </ul>
         </div>
       )}

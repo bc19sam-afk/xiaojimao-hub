@@ -426,6 +426,39 @@ export const migrations: Migration[] = [
       )
     },
   },
+  {
+    version: 11,
+    // migration 011（P3-R1）：CDK 发码履约数据地基。纯新增、向后兼容——仿 003/008/009 只 CREATE 新表 +
+    // 仿 004/006/010 ALTER ADD COLUMN，旧代码不用即无影响。装「后台预导入码 → 用户花积分兑换 → 事务内占码发放」。
+    //   ① 新表 cdk_codes：码库存。status 三态 available 可用 / issued 已发放 / void 作废；发放归属三列
+    //      issued_to（linuxdo_id）/ redemption_id（关联 redemptions.id）/ issued_at。UNIQUE(item_id, code)
+    //      ＝同一兑换项内 code 不重复导入（importCdkCodes 去重的地基）。**face_value 预留**：R1 恒 null、
+    //      R2 LDC「一码一面额」用（本轮只占位，不赋语义）。
+    //   ② redeem_items 加两列（ADD COLUMN 带常量默认，只追加可空/带默认列、不重写已有行、不改约束＝非破坏）：
+    //      per_user_limit —— 每人限购件数，0＝不限（默认，等同 R1 前无限购的旧行为）；
+    //      fulfillment    —— 履约类型 placeholder 占位（默认，保持既有 4 个种子项＝占位文案）/ cdk 发码。
+    //      （既有闲置 config JSON 列不动——限购/履约用独立列，查询更直、免 JSON 解析。）
+    up(db) {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS cdk_codes (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          item_id       INTEGER NOT NULL,
+          code          TEXT NOT NULL,
+          status        TEXT NOT NULL DEFAULT 'available',   -- available 可用 / issued 已发放 / void 作废
+          face_value    INTEGER,                              -- R2 LDC 面额预留位；R1 恒 null
+          issued_to     INTEGER,                              -- 发放归属 linuxdo_id
+          redemption_id TEXT,                                 -- 关联 redemptions.id
+          issued_at     INTEGER,
+          created_at    INTEGER NOT NULL,
+          UNIQUE(item_id, code)
+        );
+        CREATE INDEX IF NOT EXISTS idx_cdk_item_status ON cdk_codes(item_id, status);
+      `)
+      // SQLite 不能一条 ALTER 加多列，一列一条。NOT NULL + 常量默认＝合法（只追加带默认列，非破坏）。
+      db.exec('ALTER TABLE redeem_items ADD COLUMN per_user_limit INTEGER NOT NULL DEFAULT 0')
+      db.exec("ALTER TABLE redeem_items ADD COLUMN fulfillment TEXT NOT NULL DEFAULT 'placeholder'")
+    },
+  },
 ]
 
 // 代码所知的最新 schema 版本（从 migrations 数组派生，勿手写）

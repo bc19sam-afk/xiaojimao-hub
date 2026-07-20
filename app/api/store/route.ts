@@ -18,9 +18,18 @@ export async function GET() {
     createdAt: e.createdAt,
     text: describeLedgerEntry(e, (cid) => acctById.get(cid)),
   }))
+  // cdk 类项按可用码数标 soldOut（§5.4 售罄提示）——只外发布尔，不泄库存数/码值（§8）。
+  const items = db.listRedeemItems(true).map((it) => ({
+    id: it.id,
+    name: it.name,
+    description: it.description,
+    cost: it.cost,
+    kind: it.kind,
+    soldOut: it.fulfillment === 'cdk' && db.availableCdkCount(it.id) === 0,
+  }))
   return NextResponse.json({
     balance: db.balance(user.id),
-    items: db.listRedeemItems(true),
+    items,
     redemptions: db.listRedemptions(user.id),
     ledger,
   })

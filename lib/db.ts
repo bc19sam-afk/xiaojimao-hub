@@ -479,16 +479,22 @@ export const db = {
 
   // ===== 配置：兑换项 =====
   listRedeemItems(onlyEnabled = false): RedeemItem[] {
-    const sql = `SELECT id, name, description, cost, kind, enabled, sort, config FROM redeem_items ${
+    const sql = `SELECT id, name, description, cost, kind, enabled, sort, config, fulfillment,
+        per_user_limit AS perUserLimit FROM redeem_items ${
       onlyEnabled ? 'WHERE enabled=1' : ''
     } ORDER BY sort, cost`
     return conn.prepare(sql).all() as unknown as RedeemItem[]
   },
   getRedeemItem(id: number): RedeemItem | undefined {
     return conn
-      .prepare('SELECT id, name, description, cost, kind, enabled, sort, config FROM redeem_items WHERE id=?')
+      .prepare(
+        `SELECT id, name, description, cost, kind, enabled, sort, config, fulfillment,
+         per_user_limit AS perUserLimit FROM redeem_items WHERE id=?`,
+      )
       .get(id) as unknown as RedeemItem | undefined
   },
+  // fulfillment/perUserLimit 可选：未传时 UPDATE 用 COALESCE 保留原值（既有「只改名/价」的 PUT 不误清），
+  // INSERT 落库时用默认（placeholder / 0）。
   upsertRedeemItem(it: {
     id?: number
     name: string
@@ -498,17 +504,29 @@ export const db = {
     enabled: boolean
     sort: number
     config?: string
+    fulfillment?: string
+    perUserLimit?: number
   }): void {
     if (it.id) {
       conn
         .prepare(
-          'UPDATE redeem_items SET name=?, description=?, cost=?, kind=?, enabled=?, sort=?, config=? WHERE id=?',
+          `UPDATE redeem_items SET name=?, description=?, cost=?, kind=?, enabled=?, sort=?, config=?,
+             fulfillment=COALESCE(?, fulfillment), per_user_limit=COALESCE(?, per_user_limit) WHERE id=?`,
         )
-        .run(it.name, it.description, it.cost, it.kind, it.enabled ? 1 : 0, it.sort, it.config ?? '{}', it.id)
+        .run(
+          it.name, it.description, it.cost, it.kind, it.enabled ? 1 : 0, it.sort, it.config ?? '{}',
+          it.fulfillment ?? null, it.perUserLimit ?? null, it.id,
+        )
     } else {
       conn
-        .prepare('INSERT INTO redeem_items (name, description, cost, kind, enabled, sort, config) VALUES (?,?,?,?,?,?,?)')
-        .run(it.name, it.description, it.cost, it.kind, it.enabled ? 1 : 0, it.sort, it.config ?? '{}')
+        .prepare(
+          `INSERT INTO redeem_items (name, description, cost, kind, enabled, sort, config, fulfillment, per_user_limit)
+           VALUES (?,?,?,?,?,?,?,?,?)`,
+        )
+        .run(
+          it.name, it.description, it.cost, it.kind, it.enabled ? 1 : 0, it.sort, it.config ?? '{}',
+          it.fulfillment ?? 'placeholder', it.perUserLimit ?? 0,
+        )
     }
   },
   deleteRedeemItem(id: number): void {
@@ -680,6 +698,139 @@ export const db = {
         'SELECT id, item_name AS itemName, cost, status, result, created_at AS createdAt FROM redemptions WHERE linuxdo_id=? ORDER BY created_at DESC',
       )
       .all(linuxdoId) as unknown as RedemptionRow[]
+  },
+
+  // ===== CDK 发码库存（P3-R1，§5.3）=====
+  // 批量导入 available 码，去重：同一 (item_id, code) 已存 → 跳过（依赖 UNIQUE(item_id, code) 原子去重）；
+  // 入参批次内重复也只算一次（seen 兜）。返回 { imported 本次真正入库数, skipped 跳过数 }。
+  // ⚠️ 安全（§8）：绝不日志 code；调用链任何环节不得把 code 写进应用日志。
+  importCdkCodes(itemId: number, codes: string[]): { imported: number; skipped: number } {
+    const now = Date.now()
+    const stmt = conn.prepare(
+      `INSERT INTO cdk_codes (item_id, code, status, created_at) VALUES (?,?,'available',?)
+       ON CONFLICT(item_id, code) DO NOTHING`,
+    )
+    let imported = 0
+    let skipped = 0
+    const seen = new Set<string>()
+    for (const code of codes) {
+      if (seen.has(code)) {
+        skipped++
+        continue
+      }
+      seen.add(code)
+      const r = stmt.run(itemId, code, now)
+      if (r.changes > 0) imported++
+      else skipped++
+    }
+    return { imported, skipped }
+  },
+  // 某项可用码数（store 售罄提示 + 测试用）。不返回任何 code 值。
+  availableCdkCount(itemId: number): number {
+    const r = conn
+      .prepare("SELECT COUNT(*) AS n FROM cdk_codes WHERE item_id=? AND status='available'")
+      .get(itemId) as unknown as { n: number }
+    return r?.n ?? 0
+  },
+  // 某项库存分布（available/issued/void 计数，管理/测试用）。不返回任何 code 值。
+  cdkStatsFor(itemId: number): { available: number; issued: number; void: number } {
+    const rows = conn
+      .prepare("SELECT status, COUNT(*) AS n FROM cdk_codes WHERE item_id=? GROUP BY status")
+      .all(itemId) as unknown as { status: string; n: number }[]
+    const out: { available: number; issued: number; void: number } = { available: 0, issued: 0, void: 0 }
+    for (const r of rows) if (r.status in out) (out as Record<string, number>)[r.status] = r.n
+    return out
+  },
+
+  // 兑换单事务（P3-R1，§5.5「同成功或同失败」）：单 BEGIN IMMEDIATE 包住
+  //   ① 幂等回放 → ② 查限购 → ③ CAS 占码 → ④ 扣分 → ⑤ 写兑换记录（回填码归属由占码那步一并完成）。
+  // 任一步不满足/失败 → 整体 ROLLBACK、绝不扣分。顺带修两个既有 bug：
+  //   bug①：旧版 spendPoints 与 createRedemption 非同事务（扣分成功但写记录抛错＝分丢无记录）——本事务同成同败。
+  //   bug②：redemptionId 改为**确定性幂等键**（调用方按 token/短窗算），既作 redemptions 主键又作
+  //         point_ledger 的 ref——重复点击/超时重试命中已存兑换即回放同一结果，UNIQUE(reason,ref) 兜第二道。
+  // 占码用 CAS（SELECT 一条 available → UPDATE ... WHERE id=? AND status='available'，仿 transition 范式）：
+  //   单机单 worker + BEGIN IMMEDIATE 已串行，CAS 为纪律与未来多实例兜底，保证并发不重复发同一码。
+  // 返回 result：cdk 类＝占用的码；placeholder 类＝调用方给的占位串。replay＝是否命中幂等回放。
+  performRedeem(args: {
+    linuxdoId: number
+    redemptionId: string
+    item: RedeemItem
+    placeholderResult: string
+  }): { ok: true; result: string; balance: number; replay: boolean } | { ok: false; error: string } {
+    const { linuxdoId, redemptionId, item } = args
+    const isCdk = item.fulfillment === 'cdk'
+    const now = Date.now()
+    conn.exec('BEGIN IMMEDIATE')
+    try {
+      // ① 幂等回放：同一 redemptionId 已兑过 → 返回原结果，不再占码/扣分（重复点击 / 超时重试兜底）
+      const existing = conn
+        .prepare('SELECT result FROM redemptions WHERE id=?')
+        .get(redemptionId) as unknown as { result: string } | undefined
+      if (existing) {
+        conn.exec('COMMIT')
+        return { ok: true, result: existing.result, balance: db.balance(linuxdoId), replay: true }
+      }
+
+      // ② 限购：本人对该项已成功兑换数 >= 上限（>0 才限）→ 拦截、不扣分
+      if (item.perUserLimit > 0) {
+        const c = conn
+          .prepare(
+            "SELECT COUNT(*) AS n FROM redemptions WHERE linuxdo_id=? AND item_id=? AND status='fulfilled'",
+          )
+          .get(linuxdoId, item.id) as unknown as { n: number }
+        if ((c?.n ?? 0) >= item.perUserLimit) {
+          conn.exec('ROLLBACK')
+          return { ok: false, error: '超过限购' }
+        }
+      }
+
+      // ③ 占库存（cdk 类）：CAS 占一个 available 码 → 无则已兑罄、不扣分。占码即回填 issued_to/redemption_id/issued_at
+      let result = args.placeholderResult
+      if (isCdk) {
+        const row = conn
+          .prepare("SELECT id, code FROM cdk_codes WHERE item_id=? AND status='available' ORDER BY id LIMIT 1")
+          .get(item.id) as unknown as { id: number; code: string } | undefined
+        if (!row) {
+          conn.exec('ROLLBACK')
+          return { ok: false, error: '已兑罄' }
+        }
+        const claimed = conn
+          .prepare(
+            "UPDATE cdk_codes SET status='issued', issued_to=?, redemption_id=?, issued_at=? WHERE id=? AND status='available'",
+          )
+          .run(linuxdoId, redemptionId, now, row.id)
+        if (claimed.changes === 0) {
+          // CAS 落空（该码已被并发占）——单机不该发生，兜底当已兑罄回滚
+          conn.exec('ROLLBACK')
+          return { ok: false, error: '已兑罄' }
+        }
+        result = row.code
+      }
+
+      // ④ 扣分：原子（余额 < cost 直接不入账），ref=redemptionId＝幂等键。失败＝积分不足、整体回滚
+      const spent = db.spendPoints(linuxdoId, item.cost, 'redeem', redemptionId)
+      if (!spent) {
+        conn.exec('ROLLBACK')
+        return { ok: false, error: '积分不足' }
+      }
+
+      // ⑤ 写兑换记录（主键=redemptionId＝幂等键）：result 存发出的码（cdk）或占位串（placeholder）
+      db.createRedemption({
+        id: redemptionId,
+        linuxdoId,
+        itemId: item.id,
+        itemName: item.name,
+        cost: item.cost,
+        status: 'fulfilled',
+        result,
+      })
+
+      conn.exec('COMMIT')
+      return { ok: true, result, balance: db.balance(linuxdoId), replay: false }
+    } catch (err) {
+      conn.exec('ROLLBACK')
+      throw err
+    }
   },
 
   // ===== OAuth 授权快照（P1b-4：按 state 持久化跨请求）=====
@@ -880,10 +1031,14 @@ export interface RedeemItem {
   name: string
   description: string
   cost: number
-  kind: string
+  kind: string // 展示分类（图标/文案）：permanent_quota/timed_quota/vip/invite_code/ldc
   enabled: number
   sort: number
   config: string
+  // 履约类型（P3-R1）：placeholder 占位文案 / cdk 库存发码。默认 placeholder（既有种子项保持占位）
+  fulfillment: string
+  // 每人限购件数（P3-R1）：0＝不限（默认）
+  perUserLimit: number
 }
 export interface RedemptionRow {
   id: string
