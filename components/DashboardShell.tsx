@@ -17,7 +17,7 @@ interface Contribution {
   provider: string
   plan: string
   method: 'oauth' | 'rt'
-  verifyStatus: 'submitted' | 'first_check' | 'observing' | 'granted' | 'failed' | 'needs_review'
+  verifyStatus: 'submitted' | 'first_check' | 'pooled' | 'stopped' | 'needs_review'
   points: number
   createdAt: number
 }
@@ -47,22 +47,18 @@ export default function DashboardShell({
     load()
   }, [load])
 
-  // 有待处理的号时，自动轮询刷新，让后台巡检的结果实时显现（无需手动刷新）
+  // 有首检中的号时自动快轮询，让后台首检结果实时显现（首检态几秒内出结果）。v4 下 pooled 态不由本页
+  // worker 变动（按日计量＝R2、失效巡检＝R3），故入池后无需慢轮询。
   useEffect(() => {
-    // 首检态（submitted/first_check）几秒内出结果 → 5s 快轮询；
-    // 考察中（observing）只在窗口 T 到期时才变（真实默认 24h），持续 5s 轮询会造成约 6.9 万请求/天/页
-    //   （codex xhigh review）→ 仅 observing 时降到 30s 慢轮询（MOCK 8s 窗口仍能在 30s 内刷新显现发分）。
     const hasFastChanging = list.some(
       (c) => c.verifyStatus === 'submitted' || c.verifyStatus === 'first_check',
     )
-    const hasObserving = list.some((c) => c.verifyStatus === 'observing')
-    if (!hasFastChanging && !hasObserving) return
-    const intervalMs = hasFastChanging ? 5000 : 30000
+    if (!hasFastChanging) return
     const t = setInterval(() => {
       load()
       setLbKey((k) => k + 1)
       setStoreKey((k) => k + 1)
-    }, intervalMs)
+    }, 5000)
     return () => clearInterval(t)
   }, [list, load])
 

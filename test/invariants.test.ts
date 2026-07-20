@@ -79,14 +79,14 @@ test('原子扣分：余额不足拒绝且不变；余额够只扣一次', () =>
   assert.equal(db.balance(uid), 10) // 只扣一次
 })
 
-// ④ 状态转移：仅当当前状态 ∈ from 才成功；不匹配不改状态（需求 §3.2 新 6 态）
+// ④ 状态转移：仅当当前状态 ∈ from 才成功；不匹配不改状态（需求 §3.2 v4 五态）
 test('状态转移：仅当当前状态∈from 才成功；不匹配不改状态', () => {
   const id = 'trans-1'
   db.insertUnique(
     makeContribution({ id, accountId: 'trans-acc', linuxdoId: 9004, verifyStatus: 'submitted' }),
   )
   // 当前 submitted，from=['first_check'] 不匹配 → 失败，状态不变
-  const noMatch = db.transition(id, ['first_check'], 'observing')
+  const noMatch = db.transition(id, ['first_check'], 'pooled')
   assert.equal(noMatch, false)
   const afterNoMatch = db.byUser(9004).find((c) => c.id === id)
   assert.ok(afterNoMatch)

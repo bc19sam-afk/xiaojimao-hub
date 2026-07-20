@@ -23,14 +23,13 @@ export interface Contribution {
   plan: string
   method: 'oauth' | 'rt'
   authFileName: string
-  // 需求 §3.2 六态：submitted 已提交 / first_check 首检中 / observing 考察中 /
-  // granted 已发分 / failed 已失败 / needs_review 待人工复核
+  // 需求 §3.2 五态（v4 按量计量，考察期取消）：submitted 已提交 / first_check 首检中 /
+  // pooled 在池计量中 / stopped 已停用 / needs_review 待人工复核
   verifyStatus:
     | 'submitted'
     | 'first_check'
-    | 'observing'
-    | 'granted'
-    | 'failed'
+    | 'pooled'
+    | 'stopped'
     | 'needs_review'
   points: number // 验证通过后发放的积分（0=未发/未通过）
   rewardStatus: 'waiting' | 'granted' | 'none'
@@ -292,11 +291,25 @@ export const db = {
     return r.changes > 0
   },
 
+  // 条件删除某贡献行——首检失败·退回专用（§2.4/§3.2）：号首检就 401/封号、压根没入池，删行以释放
+  // (provider, account_id) 唯一键，让用户修好后可重交。⚠️ 只用于「从未真正入池」的号；已入池号
+  // 一辈子锁唯一键、永不删（§2.4「入池后掉号不支持重交」）。
+  // CAS 式守卫（codex bot 于 PR #15 指出）：仅当行仍处 from 态才删，返回是否真删——防「过期巡检结果 /
+  // 并发实例」把刚转入 pooled 的号误退回（与 transition 同款 compare-and-set 模式）。
+  deleteContribution(id: string, from: string[]): boolean {
+    const ph = from.map(() => '?').join(',')
+    const r = conn
+      .prepare(`DELETE FROM contributions WHERE id = ? AND verify_status IN (${ph})`)
+      .run(id, ...from)
+    return r.changes > 0
+  },
+
+  // 排行榜按「已入池号数」排名（v4：granted 态取消，成功首检入池即计数；真正的按累计积分排名待 R2/R3）。
   leaderboard(limit = 20): { linuxdoId: number; username: string; count: number }[] {
     return conn
       .prepare(
         `SELECT linuxdo_id AS linuxdoId, username, COUNT(*) AS count
-         FROM contributions WHERE verify_status = 'granted'
+         FROM contributions WHERE verify_status = 'pooled'
          GROUP BY linuxdo_id ORDER BY count DESC, MIN(created_at) ASC LIMIT ?`,
       )
       .all(limit) as unknown as { linuxdoId: number; username: string; count: number }[]
@@ -307,7 +320,7 @@ export const db = {
     const mine = conn
       .prepare(
         `SELECT COUNT(*) AS count FROM contributions
-         WHERE verify_status = 'granted' AND linuxdo_id = ?`,
+         WHERE verify_status = 'pooled' AND linuxdo_id = ?`,
       )
       .get(linuxdoId) as unknown as { count: number }
     const count = mine?.count ?? 0
@@ -317,7 +330,7 @@ export const db = {
       .prepare(
         `SELECT COUNT(*) AS n FROM (
            SELECT linuxdo_id, COUNT(*) AS c FROM contributions
-           WHERE verify_status = 'granted' GROUP BY linuxdo_id HAVING c > ?
+           WHERE verify_status = 'pooled' GROUP BY linuxdo_id HAVING c > ?
          )`,
       )
       .get(count) as unknown as { n: number }
@@ -503,6 +516,9 @@ export const db = {
     conn.prepare('DELETE FROM oauth_snapshots WHERE created_at < ?').run(Date.now() - olderThanMs)
   },
 
+  // @deprecated v4（R1 拆考察期）：以下考察期观测事件 / 考察快照 / 故障顺延三组数据层函数，其消费方
+  // （processPending 的考察闭环）已随 v4「按量计量」拆除，processPending 不再调用它们。函数与底层表/列
+  // 一律保留（迁移不可逆、便于将来复用），暂无生产写入方；observation.test.ts 仍直接驱动验证数据层往返。
   // ===== 考察期观测事件（P2a-1）=====
   // 纯 CRUD，不含任何状态转移/发分/计时判断（那是 P2a-2/P2b）。
   // 本单只建数据层：暂无写入方——P2b/P2c 巡检时才调 addObservation；此处测试直接驱动。

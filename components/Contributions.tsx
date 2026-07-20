@@ -10,18 +10,17 @@ interface Contribution {
   provider: string
   plan: string
   method: 'oauth' | 'rt'
-  verifyStatus: 'submitted' | 'first_check' | 'observing' | 'granted' | 'failed' | 'needs_review'
+  verifyStatus: 'submitted' | 'first_check' | 'pooled' | 'stopped' | 'needs_review'
   points: number
   createdAt: number
 }
 
-// 需求 §3.2 六态中文
+// 需求 §3.2 五态（v4 按量计量，考察期取消）中文
 const VERIFY: Record<string, { label: string; cls: string }> = {
   submitted: { label: '已提交', cls: 'bg-amber-400/15 text-amber-300' },
   first_check: { label: '首检中', cls: 'bg-sky-400/15 text-sky-300' },
-  observing: { label: '考察中', cls: 'bg-indigo-400/15 text-indigo-300' },
-  granted: { label: '已发分', cls: 'bg-emerald-400/15 text-emerald-300' },
-  failed: { label: '已失败', cls: 'bg-rose-400/15 text-rose-300' },
+  pooled: { label: '在池计量', cls: 'bg-emerald-400/15 text-emerald-300' },
+  stopped: { label: '已停用', cls: 'bg-rose-400/15 text-rose-300' },
   needs_review: { label: '待人工复核', cls: 'bg-orange-400/15 text-orange-300' },
 }
 
@@ -116,13 +115,8 @@ export default function Contributions({
                       </span>
                     </td>
                     <td className="px-4 py-3">
-                      {c.verifyStatus === 'granted' && c.points > 0 ? (
-                        <span className="mono text-sm font-bold text-[var(--brand-bright)]">
-                          +{c.points}
-                        </span>
-                      ) : (
-                        <span className="text-xs text-neutral-600">—</span>
-                      )}
+                      {/* v4：积分按账户累计、按日结算，不挂在号行上；pooled 号不显示固定分（账户明细/每号累计展示留 R2/R3） */}
+                      <span className="text-xs text-neutral-600">—</span>
                     </td>
                   </tr>
                 )

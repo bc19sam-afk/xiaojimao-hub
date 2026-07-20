@@ -137,17 +137,10 @@ export async function ingestRT(user: SessionUser, rt: string): Promise<CollectRe
   return recordIngest(user, 'codex', result, 'rt')
 }
 
-// —— 考察期常量（§3.4 冻结快照用）——
-const RULE_VERSION = 'rules-v1' // 检测规则版本快照
-const OBSERVE_PRIORITY = 10 // 入池优先级快照占位（实际 setPriority 留 P2c）
-
-// 考察窗口 T（毫秒）：优先 app_config 可配（seedDefaults 已播种）；缺省 mock 8s 便于演示 / 真实 24h。
-// 非法/缺失/非正数一律降级为兜底默认。进考察那刻由 startObservation 冻结当时的 T。
-function observeWindowMs(): number {
-  const raw = db.getConfig('observe_window_ms')
-  const n = raw == null ? NaN : Number(raw)
-  return Number.isFinite(n) && n > 0 ? n : env.mock ? 8000 : 86_400_000
-}
+// @deprecated v4（R1 拆考察期）：observationKind / pauseIncrement 及其原消费方（考察闭环 settle /
+// 故障顺延 recordTick）已随 v4「按量计量」拆除，processPending 不再调用。两函数按任务要求保留（便于
+// 将来复用、少改动）；随消费方一并移除的是 RULE_VERSION / OBSERVE_PRIORITY / observeWindowMs（考察
+// 快照常量与助手，v4 无复用价值）。
 
 // —— §3.3 判定表：inspect 探测结果 → 考察观测事件类型（与 cpamp 建议动作对齐）——
 // cpamp 动作映射（P0-A）：保留→ok、禁用/限流→retry、重登→reauth、删除→reject。reauth 不入此函数
@@ -177,171 +170,103 @@ export function pauseIncrement(now: number, base: number, intervalMs: number): n
   return gap > intervalMs * 2 ? gap - intervalMs : 0
 }
 
-// —— 巡检 → 状态机（需求 §3.2 考察期闭环）——
+// —— 首检 → 入池（需求 §3.2 v4：考察期取消，首检通过即入池计量）——
 // worker 周期调用；手动也可触发。running 锁防单进程叠跑，跨实例幂等靠 DB。
-// 拉「进行中」三态：submitted 待首检 / first_check 首检重试中 / observing 考察中。
-//   首检通过 → 启用 + 冻结快照 + 进 observing；考察期每轮观测 + 到期发分/硬失败判死。
+// 只拉「首检两态」submitted 待首检 / first_check 首检重试中；pooled 号本单不处理（按日计量＝R2、
+// 失效巡检＝R3）。processPending 本单不发任何分（R1 只做首检入池）。
 let running = false
 
 export async function processPending(): Promise<{
   checked: number
-  activated: number
-  rejected: number
+  activated: number // 本轮入池数（对外仍叫 activated，保 worker/verify-now 调用方兼容）
+  rejected: number // 本轮首检失败·退回数（删行释放唯一键）
   skipped?: boolean
 }> {
   if (running) return { checked: 0, activated: 0, rejected: 0, skipped: true }
   running = true
   try {
-    const pending = db.byVerifyStatus(['submitted', 'first_check', 'observing'])
+    const pending = db.byVerifyStatus(['submitted', 'first_check'])
     if (pending.length === 0) return { checked: 0, activated: 0, rejected: 0 }
 
-    let granted = 0 // 本轮到期发分数（对外仍叫 activated，保调用方兼容）
-    let failed = 0 // 本轮判死数（无规则/硬失败/首检拒绝）
+    let pooled = 0 // 本轮入池数
+    let rejected = 0 // 本轮首检失败·退回数
 
-    // ① 首检通过 → 进考察：启用 + 冻结快照（窗口/分值/规则版本/优先级）+ transition observing。
-    //    无发分规则（不接受该类型）→ 判死。启用失败→保持原态下轮重试。
-    const enterObservation = async (c: (typeof pending)[number], plan: string): Promise<void> => {
-      const pts = db.pointsFor(c.provider, plan)
-      if (pts <= 0) {
-        try {
-          await cpa.deleteAuthFile(c.authFileName)
-        } catch {
-          /* 删除失败下轮重试 */
-        }
-        if (db.transition(c.id, ['submitted', 'first_check'], 'failed')) failed++
-        return
-      }
+    // 首检通过 → 入池：启用（setDisabled false）+ transition → pooled，此刻占用唯一键（§3.2）。
+    //   限额/额度暂满（decision=retry）不算失败 → 一并入池等恢复（§3.2「限额不算失败，先入池」）。
+    //   入池优先级 setPriority 接口层仍缺（留后续），本单只启用。启用失败→保持原态下轮重试。
+    //   ⚠️ v4 三家一视同仁：不再按 pointsFor<=0 淘汰——provider 在 codex/claude/grok 内即可入池，
+    //     按量折算规则（原 pointsFor）留 R2 重构。
+    const enterPool = async (c: (typeof pending)[number], plan: string): Promise<void> => {
       try {
-        await cpa.setDisabled(c.authFileName, false) // 首检通过→启用（查 HTTP 状态）
+        await cpa.setDisabled(c.authFileName, false) // 首检通过→启用
       } catch {
-        return // 启用失败：不进考察，保持原态下轮重试
+        return // 启用失败：不入池，保持原态下轮重试
       }
       if (plan !== c.plan) db.update(c.id, { plan })
-      // §3.4 冻结：CAS 守 observe_start_at IS NULL，进考察那刻冻结窗口T/分值/规则/优先级；
-      // 重入不重启计时、不被后台改配污染。快照冻结后再 transition，crash 重入仍用原快照。
-      db.startObservation(c.id, {
-        windowMs: observeWindowMs(),
-        points: pts,
-        ruleVersion: RULE_VERSION,
-        priority: OBSERVE_PRIORITY,
-      })
-      db.transition(c.id, ['submitted', 'first_check'], 'observing')
+      if (db.transition(c.id, ['submitted', 'first_check'], 'pooled')) pooled++
     }
 
-    // ② 考察驱动（对 observing 的号）：硬失败判死 / 到期发分 / 未到期保持。
-    //    发分用冻结的 snapshotPoints（不重查规则）；awardPoints 幂等，重入不重复发分。
-    const settle = async (c: (typeof pending)[number]): Promise<void> => {
-      if (db.hasHardFailure(c.id)) {
-        // 考察窗口内出现硬失败 → 判死，不发分（删号 best-effort）
-        try {
-          await cpa.deleteAuthFile(c.authFileName)
-        } catch {
-          /* 删除失败下轮重试 */
-        }
-        if (db.transition(c.id, ['observing'], 'failed')) failed++
+    // 首检失败·退回（§2.4/§3.2）：号 401/撤权/封号、压根没入池 → **先删 cpamp auth 文件、成功后才
+    //   CAS 删 contribution 行**（仅当仍处首检两态才删，释放唯一键让用户修好重交）。顺序关键
+    //   （codex xhigh 于 PR #15 指出）：若先删行、文件删失败，孤立文件会留在池里——用户重交同号时
+    //   授权前快照已含该文件名（同名覆盖认不出新落）→ findNew 挡住、修好的号反而交不进来。故文件
+    //   删失败＝本轮不退回、保留行（转 first_check），下轮重试删除；CAS 删行仍防误删已入池行。
+    const rejectBack = async (c: (typeof pending)[number]): Promise<void> => {
+      try {
+        await cpa.deleteAuthFile(c.authFileName)
+      } catch {
+        db.transition(c.id, ['submitted'], 'first_check') // 文件还在：保留行下轮重试，不释放唯一键
         return
       }
-      const snap = db.getObservationSnapshot(c.id)
-      if (snap.observeStartAt == null || snap.observeWindowMs == null) return // 防御：未冻结不结算
-      // 故障顺延（§3.2）：考察窗口 T 只计「可观测时段」——用「有效观测时长 = wall-clock − 累积暂停」判到期，
-      // 不可观测（停机/inspect 失败/未覆盖）时段不算进 T。暂停累积见 recordObserveTick；claude/grok 简化路径
-      // 从不记暂停（pausedMs 恒 0）→ 退化为原 wall-clock 判定，行为不变。
-      const pausedMs = db.getObserveTick(c.id).pausedMs
-      if (Date.now() - snap.observeStartAt - pausedMs < snap.observeWindowMs) return // 未到期：保持 observing
-      const pts = snap.snapshotPoints ?? 0 // 冻结值，不重查规则
-      db.awardPoints(c.linuxdoId, pts, 'contribution', c.id) // 幂等（UNIQUE(reason,ref)）
-      db.update(c.id, { points: pts, rewardStatus: 'granted' })
-      if (db.transition(c.id, ['observing'], 'granted')) granted++
+      if (db.deleteContribution(c.id, ['submitted', 'first_check'])) rejected++ // CAS：已入池则不删
     }
 
-    // ②' 故障顺延记账（§3.2）：本轮**成功观测**（healthy/soft/hard）时调用——算相对上次成功观测的暂停增量
-    //    （观测空洞＝停机/不可观测），累加进 observe_paused_ms 并把 last_observed_at 推到本次。首次成功观测
-    //    （last_observed_at 尚 null）以进考察时刻 observeStartAt 作空洞起点。unknown/reauth 轮不调（不更新
-    //    last_observed_at），故那段空洞会被下次成功观测算进暂停。
-    const recordTick = (c: (typeof pending)[number]): void => {
-      const snap = db.getObservationSnapshot(c.id)
-      if (snap.observeStartAt == null) return // 防御：未冻结（正常不会——observing 必有 observeStartAt）
-      const base = db.getObserveTick(c.id).lastObservedAt ?? snap.observeStartAt
-      const now = Date.now()
-      db.recordObserveTick(c.id, {
-        lastObservedAt: now,
-        addPausedMs: pauseIncrement(now, base, env.worker.intervalMs),
-      })
-    }
-
-    // —— codex：走 cpamp 巡检（能识别套餐 + 额度/失效）——
+    // —— codex：走 cpamp 巡检（能识别套餐 + 能登录/失效判定）——
     const codexPending = pending.filter((c) => c.provider === 'codex')
     if (codexPending.length > 0) {
-      // §3.2 未知不算失败：inspect() 整体抛错（CPA 5xx/网络/巡检侧故障）＝本轮整体不可观测。
-      // try/catch 包住——绝不把「不可观测」当硬失败：所有 codex observing 号记 unknown（不推进：不发分不
-      // 判死），这段空洞留待下次成功观测算进暂停；首检号本轮跳过、下轮再检。
+      // inspect() 整体抛错（CPA 5xx/网络/巡检侧故障）＝本轮不可观测：所有 codex 首检号本轮跳过、下轮再检，
+      // 绝不把「不可观测」当失败误退回。
       let probes: ProbeResult[] | null = null
       try {
         probes = await cpa.inspect()
       } catch {
         probes = null
       }
-      if (probes === null) {
-        for (const c of codexPending) {
-          if (c.verifyStatus === 'observing') db.addObservation(c.id, 'unknown', 'inspect-failed')
-        }
-      } else {
+      if (probes !== null) {
         const byId = new Map(probes.map((r) => [r.accountId, r]))
         for (const c of codexPending) {
           const r = byId.get(c.accountId)
-          if (c.verifyStatus === 'observing') {
-            // 本轮巡检未覆盖该 observing 号（刚入池/掉队）＝不可观测：记 unknown（不推进），空洞留待顺延。
-            // （P2a-2 此处是 continue 跳过；改记 unknown 供故障顺延把这段空洞算进暂停。）
-            if (!r) {
-              db.addObservation(c.id, 'unknown', 'not-covered')
-              continue
-            }
-            // reauth（OAuth 失效需重授权）直接转人工复核，不作为观测事件（保持 P2a-2 现状）。
-            if (r.decision === 'reauth') {
-              db.transition(c.id, ['observing'], 'needs_review')
-              continue
-            }
-            // 成功观测（healthy/soft/hard）：先记故障顺延账（算空洞→暂停），再记观测事件，再结算。
-            recordTick(c)
-            db.addObservation(c.id, observationKind(r), `inspect:${r.decision}`)
-            await settle(c)
-          } else {
-            // 首检（submitted/first_check）：未覆盖则本轮跳过；否则 decision 决定去向。
-            if (!r) continue
-            const plan = r.plan && r.plan !== 'unknown' ? r.plan : c.plan
-            if (r.decision === 'ok') {
-              await enterObservation(c, plan) // 首检通过→进考察
-            } else if (r.decision === 'reject') {
-              try {
-                await cpa.deleteAuthFile(c.authFileName)
-              } catch {
-                /* 同上 */
-              }
-              if (db.transition(c.id, ['submitted', 'first_check'], 'failed')) failed++
-            } else if (r.decision === 'reauth') {
-              db.transition(c.id, ['submitted', 'first_check'], 'needs_review')
-            } else {
-              // retry：临时（限流/额度满），保留隔离，转 first_check 下轮复检
-              db.transition(c.id, ['submitted'], 'first_check')
-            }
+          if (!r) continue // 本轮巡检未覆盖（刚落号/掉队）→ 跳过，下轮再检
+          const plan = r.plan && r.plan !== 'unknown' ? r.plan : c.plan
+          if (r.decision === 'ok' || (r.decision === 'retry' && SOFT_REASON.test(r.reason || ''))) {
+            // ok=能登录未封 → 入池。retry 只认「配额类」（reason 命中限额词表＝usage_limit/quota/
+            // rate_limit…）＝§3.2「限额不算失败，先入池等恢复」。⚠️ retry 不全是限额：mapInspection
+            // 对未分类错误/服务端异常/disable 也回 retry——这些没证实「能登录」，不能入池锁唯一键
+            // （codex xhigh 于 PR #15 指出），转 first_check 下轮再查（限额恢复/问题消失后 inspect
+            // 会转 ok 自然入池，只是晚点，不算失败）。
+            await enterPool(c, plan)
+          } else if (r.decision === 'retry') {
+            // 非配额 retry（未分类/服务端异常/disable）→ 留首检循环，下轮复查
+            db.transition(c.id, ['submitted'], 'first_check')
+          } else if (r.decision === 'reject') {
+            // 401/撤权/失效＝首检失败 → 退回（删文件 + 删行释放唯一键）
+            await rejectBack(c)
+          } else if (r.decision === 'reauth') {
+            // OAuth 失效需重授权 → 转人工复核
+            db.transition(c.id, ['submitted', 'first_check'], 'needs_review')
           }
         }
       }
     }
 
-    // —— claude / grok：cpamp 无巡检。OAuth 成功即视为有效号（活号才能授权），套餐无法识别。
-    //    首检直接进考察；考察期本单简化为直接 healthy（真实差异化复检留 P2c）。——
+    // —— claude / grok：cpamp 无深度巡检，OAuth 成功即视为能用（活号才能授权）→ 首检直接入池。——
+    //    保持老实现「能授权即有效」的简化；三家一视同仁，v4 无判死概念（能调用即计量、明确失效才停）。
     const otherPending = pending.filter((c) => c.provider !== 'codex')
     for (const c of otherPending) {
-      if (c.verifyStatus === 'observing') {
-        db.addObservation(c.id, 'healthy', 'assume-ok')
-        await settle(c)
-      } else {
-        await enterObservation(c, c.plan) // 首检通过→进考察
-      }
+      await enterPool(c, c.plan)
     }
 
-    return { checked: pending.length, activated: granted, rejected: failed }
+    return { checked: pending.length, activated: pooled, rejected }
   } finally {
     running = false
   }

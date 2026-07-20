@@ -295,6 +295,60 @@ export const migrations: Migration[] = [
       `)
     },
   },
+  {
+    version: 7,
+    // migration 007（P2-R1，⚠️ 破坏性，换引擎 v4 第一刀）：verify_status 值域从 P2a-2 的 6 态
+    // 收敛到需求 §3.2（v4）的 5 态。只 UPDATE 现有行的值、不改表结构（考察快照列 / 暂停列 / observations
+    // 表一律留库不删，迁移不可逆）。旧→新映射：
+    //   observing→pooled（考察中 → 在池计量）
+    //   granted  →pooled（v4「已发分」不再是终态：号持续按量计量，回到在池）
+    //   failed   →stopped（已失败 → 已停用）
+    //   submitted / first_check / needs_review 不变（故不 UPDATE）
+    // 破坏性＝改写既有数据的 verify_status 值域；表结构与行数均不变。
+    // 新值（pooled/stopped）与被改的旧值（observing/granted/failed）不相交，故映射顺序无关、重跑幂等
+    //   （二次跑旧值已不存在＝no-op）。迁移前后行数校验（仿 002/005）：纯 UPDATE 行数必守恒，兜底防意外。
+    up(db) {
+      const before = (
+        db.prepare('SELECT COUNT(*) AS n FROM contributions').get() as unknown as { n: number }
+      ).n
+      // failed 在老 6 态里混了两种来源，v4 语义不同（codex bot 于 PR #15 指出）：
+      //   ① 首检就被拒（从未进过考察/池，observe_start_at IS NULL）——v4 规则「首检失败不占唯一键、
+      //      可重交」→ 删行释放 (provider, account_id)；
+      //   ② 考察中硬失败判死（进过池，observe_start_at 非 null）——占过池 → stopped（锁唯一键）。
+      const releasedRow = db
+        .prepare(
+          "SELECT COUNT(*) AS n FROM contributions WHERE verify_status='failed' AND observe_start_at IS NULL",
+        )
+        .get() as unknown as { n: number }
+      const released = releasedRow.n
+      db.exec("DELETE FROM contributions WHERE verify_status='failed' AND observe_start_at IS NULL")
+      // observing 且已记 hard_fail 观测的行（v6 worker 判死中途崩溃残留，未走到 failed）＝已知死号，
+      // 不能映成 pooled（新 worker 不再扫 pooled 做健康判定，死号会永远挂着）→ 先转 stopped
+      // （codex xhigh 于 PR #15 指出）。
+      db.exec(`
+        UPDATE contributions SET verify_status='stopped'
+        WHERE verify_status='observing'
+          AND EXISTS (SELECT 1 FROM observations o
+                      WHERE o.contribution_id = contributions.id AND o.kind='hard_fail')
+      `)
+      const mapping: [string, string][] = [
+        ['observing', 'pooled'], // 剩余 observing 均无 hard_fail 记录
+        ['granted', 'pooled'],
+        ['failed', 'stopped'], // 剩余 failed 均进过池
+      ]
+      const stmt = db.prepare('UPDATE contributions SET verify_status=? WHERE verify_status=?')
+      for (const [from, to] of mapping) stmt.run(to, from)
+      const after = (
+        db.prepare('SELECT COUNT(*) AS n FROM contributions').get() as unknown as { n: number }
+      ).n
+      // 行数对账：唯一允许的减少 = 被释放的「首检失败未入池」行数
+      if (after !== before - released) {
+        throw new Error(
+          `[migrate 007] 迁移后行数不一致（迁移前 ${before}，释放 ${released}，迁移后 ${after}），已回滚。`,
+        )
+      }
+    },
+  },
 ]
 
 // 代码所知的最新 schema 版本（从 migrations 数组派生，勿手写）
