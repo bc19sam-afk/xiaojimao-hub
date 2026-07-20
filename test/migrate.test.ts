@@ -11,6 +11,7 @@ const EXPECTED_TABLES = [
   'point_ledger',
   'redemptions',
   'rejections',
+  'cdk_codes',
 ]
 
 function tableNames(db: DatabaseSync): Set<string> {
