@@ -295,6 +295,39 @@ export const migrations: Migration[] = [
       `)
     },
   },
+  {
+    version: 7,
+    // migration 007（P2-R1，⚠️ 破坏性，换引擎 v4 第一刀）：verify_status 值域从 P2a-2 的 6 态
+    // 收敛到需求 §3.2（v4）的 5 态。只 UPDATE 现有行的值、不改表结构（考察快照列 / 暂停列 / observations
+    // 表一律留库不删，迁移不可逆）。旧→新映射：
+    //   observing→pooled（考察中 → 在池计量）
+    //   granted  →pooled（v4「已发分」不再是终态：号持续按量计量，回到在池）
+    //   failed   →stopped（已失败 → 已停用）
+    //   submitted / first_check / needs_review 不变（故不 UPDATE）
+    // 破坏性＝改写既有数据的 verify_status 值域；表结构与行数均不变。
+    // 新值（pooled/stopped）与被改的旧值（observing/granted/failed）不相交，故映射顺序无关、重跑幂等
+    //   （二次跑旧值已不存在＝no-op）。迁移前后行数校验（仿 002/005）：纯 UPDATE 行数必守恒，兜底防意外。
+    up(db) {
+      const before = (
+        db.prepare('SELECT COUNT(*) AS n FROM contributions').get() as unknown as { n: number }
+      ).n
+      const mapping: [string, string][] = [
+        ['observing', 'pooled'],
+        ['granted', 'pooled'],
+        ['failed', 'stopped'],
+      ]
+      const stmt = db.prepare('UPDATE contributions SET verify_status=? WHERE verify_status=?')
+      for (const [from, to] of mapping) stmt.run(to, from)
+      const after = (
+        db.prepare('SELECT COUNT(*) AS n FROM contributions').get() as unknown as { n: number }
+      ).n
+      if (after !== before) {
+        throw new Error(
+          `[migrate 007] 迁移后行数不一致（迁移前 ${before}，迁移后 ${after}），已回滚。`,
+        )
+      }
+    },
+  },
 ]
 
 // 代码所知的最新 schema 版本（从 migrations 数组派生，勿手写）
