@@ -53,9 +53,11 @@ test('快照生命周期：set/get 往返、UPSERT 覆盖、delete 后为 null�
 // 快照清理：cleanupOAuthSnapshots 删过期、留新鲜
 test('快照清理：cleanupOAuthSnapshots 删过期、留新鲜', async () => {
   db.setOAuthSnapshot('old', ['x.json'])
-  await sleep(60) // 拉开 created_at，让 old 明显早于阈值
+  await sleep(200) // 拉开 created_at，让 old 远早于阈值
   db.setOAuthSnapshot('fresh', ['y.json'])
-  db.cleanupOAuthSnapshots(30) // 删 30ms 前的：old(~60ms 前)删、fresh(~0ms)留
+  // 删 100ms 前的：old(~200ms 前)删、fresh(~0ms)留。阈值放宽到 100ms（原 30ms 太紧）——fresh 到本行是
+  // 相邻同步两句、间隔本应微秒级，但 CI runner 负载/GC 停顿可使其 >30ms → fresh 被误判过期删掉（flaky）。
+  db.cleanupOAuthSnapshots(100)
   assert.equal(db.getOAuthSnapshot('old'), null)
   assert.deepEqual(db.getOAuthSnapshot('fresh'), ['y.json'])
 })
