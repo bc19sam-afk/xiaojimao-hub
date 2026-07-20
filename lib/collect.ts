@@ -206,15 +206,17 @@ export async function processPending(): Promise<{
       if (db.transition(c.id, ['submitted', 'first_check'], 'pooled')) pooled++
     }
 
-    // 首检失败·退回（§2.4/§3.2）：号 401/撤权/封号、压根没入池 → 删 cpamp auth 文件（best-effort）+
-    //   删 contribution 行（释放 (provider, account_id) 唯一键，用户修好可重交）。
+    // 首检失败·退回（§2.4/§3.2）：号 401/撤权/封号、压根没入池 → 先 CAS 删 contribution 行（仅当仍处
+    //   首检两态才删＝声明退回权，释放 (provider, account_id) 唯一键，用户修好可重交），删行成功才删
+    //   cpamp auth 文件（best-effort）。**先删行后删文件**：若行已被并发路径转入 pooled（过期巡检结果），
+    //   CAS 失败＝不退回、绝不误删已入池号的文件与归属（codex bot 于 PR #15 指出）。
     const rejectBack = async (c: (typeof pending)[number]): Promise<void> => {
+      if (!db.deleteContribution(c.id, ['submitted', 'first_check'])) return // 已非首检态（如已入池）→ 不退回
       try {
         await cpa.deleteAuthFile(c.authFileName)
       } catch {
-        /* 删除失败：行仍删（唯一键须释放），孤立文件由号池侧巡检兜底 */
+        /* 文件删除失败：唯一键已释放；孤立文件由号池侧巡检兜底 */
       }
-      db.deleteContribution(c.id)
       rejected++
     }
 

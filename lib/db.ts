@@ -291,11 +291,17 @@ export const db = {
     return r.changes > 0
   },
 
-  // 删除某贡献行——首检失败·退回专用（§2.4/§3.2）：号首检就 401/封号、压根没入池，删行以释放
+  // 条件删除某贡献行——首检失败·退回专用（§2.4/§3.2）：号首检就 401/封号、压根没入池，删行以释放
   // (provider, account_id) 唯一键，让用户修好后可重交。⚠️ 只用于「从未真正入池」的号；已入池号
   // 一辈子锁唯一键、永不删（§2.4「入池后掉号不支持重交」）。
-  deleteContribution(id: string): void {
-    conn.prepare('DELETE FROM contributions WHERE id = ?').run(id)
+  // CAS 式守卫（codex bot 于 PR #15 指出）：仅当行仍处 from 态才删，返回是否真删——防「过期巡检结果 /
+  // 并发实例」把刚转入 pooled 的号误退回（与 transition 同款 compare-and-set 模式）。
+  deleteContribution(id: string, from: string[]): boolean {
+    const ph = from.map(() => '?').join(',')
+    const r = conn
+      .prepare(`DELETE FROM contributions WHERE id = ? AND verify_status IN (${ph})`)
+      .run(id, ...from)
+    return r.changes > 0
   },
 
   // 排行榜按「已入池号数」排名（v4：granted 态取消，成功首检入池即计数；真正的按累计积分排名待 R2/R3）。

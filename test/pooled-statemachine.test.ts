@@ -42,8 +42,9 @@ const INSERT = `INSERT INTO contributions
     verify_status, points, reward_status, reward_text, reward_note, reward_code, created_at, updated_at)
    VALUES (?, ?, 'u', ?, 'e@example.com', 'codex', 'plus', 'oauth', 'f.json', ?, 0, 'none', '', '', NULL, 100, 100)`
 
-// ① migration 007：现役 6 态逐一映射到 v4 5 态、行数不丢、版本到最新（含 007）
-test('迁移007：6 态→5 态（observing/granted→pooled、failed→stopped、余不变）、行数不丢、版本到最新', () => {
+// ① migration 007：现役 6 态映射到 v4 5 态；failed 按来源分流（codex bot 于 PR #15 指出）——
+//    进过池（observe_start_at 非 null）→ stopped 锁唯一键；从未入池（NULL）→ 删行释放唯一键可重交
+test('迁移007：6 态→5 态；failed 分流（进过池→stopped / 未入池→删行释放）、版本到最新', () => {
   assert.ok(migrations.some((m) => m.version === 7), '应存在 migration 007')
   const d = makeDbAt(6) // stamped v6 → migrate 只跑 007
   const mapping: Record<string, string> = {
@@ -51,12 +52,15 @@ test('迁移007：6 态→5 态（observing/granted→pooled、failed→stopped�
     first_check: 'first_check',
     observing: 'pooled', // 考察中 → 在池计量
     granted: 'pooled', // 已发分不再是终态 → 回到在池
-    failed: 'stopped', // 已失败 → 已停用
     needs_review: 'needs_review',
   }
   const olds = Object.keys(mapping)
   const ins = d.prepare(INSERT)
   olds.forEach((s, i) => ins.run(`r${i}`, i + 1, `acc-${i}`, s))
+  // failed×2：进过池（observe_start_at 非 null）→ stopped；首检失败未入池（NULL）→ 删行释放
+  ins.run('f-pooled', 90, 'acc-f-pooled', 'failed')
+  d.prepare('UPDATE contributions SET observe_start_at=123 WHERE id=?').run('f-pooled')
+  ins.run('f-prepool', 91, 'acc-f-prepool', 'failed') // observe_start_at 留 NULL
   const before = count(d)
 
   const v = migrate(d)
@@ -68,8 +72,16 @@ test('迁移007：6 态→5 态（observing/granted→pooled、failed→stopped�
     }
     assert.equal(row.verify_status, mapping[s], `${s} 应迁为 ${mapping[s]}`)
   })
-  assert.equal(count(d), before) // 纯 UPDATE，行数守恒
-  assert.equal(count(d), olds.length)
+  // failed 分流断言
+  const fPooled = d.prepare('SELECT verify_status FROM contributions WHERE id=?').get('f-pooled') as {
+    verify_status: string
+  }
+  assert.equal(fPooled.verify_status, 'stopped') // 进过池 → stopped（锁唯一键）
+  const gone = d.prepare('SELECT COUNT(*) AS n FROM contributions WHERE id=?').get('f-prepool') as {
+    n: number
+  }
+  assert.equal(gone.n, 0) // 未入池的 failed 行被删＝唯一键释放
+  assert.equal(count(d), before - 1) // 行数只减「被释放」那一行
   const sv = d.prepare('SELECT version FROM schema_version').all() as unknown as { version: number }[]
   assert.equal(sv.length, 1)
   assert.equal(sv[0].version, LATEST_VERSION)
@@ -77,18 +89,20 @@ test('迁移007：6 态→5 态（observing/granted→pooled、failed→stopped�
 })
 
 // ② 全链（旧 7 态 → 005 → 007）：验证 005 与 007 组合后的终值（生产实际跑的链路）
-test('迁移链 005→007：active→pooled、rejected/duplicate→stopped、pending→submitted 等、行数不丢', () => {
+test('迁移链 005→007：active→pooled、pending→submitted 等；rejected/duplicate（未入池）→删行释放', () => {
   const d = makeDbAt(4) // stamped v4 → migrate 跑 005+006+007
-  const mapping: Record<string, string> = {
+  // 保留态（全链后仍在库）
+  const kept: Record<string, string> = {
     pending: 'submitted',
     verifying: 'first_check',
-    active: 'pooled', // active→(005)granted→(007)pooled
-    rejected: 'stopped', // rejected→(005)failed→(007)stopped
+    active: 'pooled', // active→(005)granted→(007)pooled（真发过分＝进过池；但 005 未回填 observe_start_at，
+    //                     007 只按 failed 分流，granted 不受影响，仍映射 pooled）
     quarantined: 'first_check', // quarantined→(005)first_check→(007 不变)
     reauth: 'needs_review',
-    duplicate: 'stopped', // duplicate→(005)failed→(007)stopped
   }
-  const olds = Object.keys(mapping)
+  // 释放态：rejected/duplicate→(005)failed 且 observe_start_at NULL（从未入池）→(007)删行释放唯一键
+  const released = ['rejected', 'duplicate']
+  const olds = [...Object.keys(kept), ...released]
   const ins = d.prepare(INSERT)
   olds.forEach((s, i) => ins.run(`c${i}`, i + 1, `chain-${i}`, s))
   const before = count(d)
@@ -96,13 +110,21 @@ test('迁移链 005→007：active→pooled、rejected/duplicate→stopped、pen
   const v = migrate(d)
   assert.equal(v, LATEST_VERSION)
 
-  olds.forEach((s, i) => {
+  Object.keys(kept).forEach((s) => {
+    const i = olds.indexOf(s)
     const row = d.prepare('SELECT verify_status FROM contributions WHERE id=?').get(`c${i}`) as {
       verify_status: string
     }
-    assert.equal(row.verify_status, mapping[s], `${s} 全链应迁为 ${mapping[s]}`)
+    assert.equal(row.verify_status, kept[s], `${s} 全链应迁为 ${kept[s]}`)
   })
-  assert.equal(count(d), before)
+  released.forEach((s) => {
+    const i = olds.indexOf(s)
+    const gone = d.prepare('SELECT COUNT(*) AS n FROM contributions WHERE id=?').get(`c${i}`) as {
+      n: number
+    }
+    assert.equal(gone.n, 0, `${s}（未入池 failed）应被删行释放唯一键`)
+  })
+  assert.equal(count(d), before - released.length) // 行数只减被释放的两行
   d.close()
 })
 
@@ -276,4 +298,27 @@ test('pooled 号不被再处理：多轮 processPending 仍 pooled、balance 0',
   assert.ok(c)
   assert.equal(c.verifyStatus, 'pooled')
   assert.equal(db.balance(uid), 0)
+})
+
+// ⑩ CAS 退回守卫（codex bot 于 PR #15 指出）：deleteContribution 仅当行仍处首检两态才删——
+//    过期巡检结果 / 并发路径不能把已入池（pooled）号误退回（删归属行+删文件）
+test('CAS 退回守卫：已入池（pooled）的号不被 deleteContribution 首检态删除', () => {
+  const uid = 6010
+  const id = 'cas-guard'
+  db.insertUnique(
+    makeContribution({ id, provider: 'codex', accountId: 'cas-guard-acc', authFileName: 'codex-cas.json', plan: 'plus', linuxdoId: uid, verifyStatus: 'pooled' }),
+  )
+  // 模拟「过期 reject 结果」路径的删除尝试：行已 pooled → CAS 拒绝、不删
+  const deleted = db.deleteContribution(id, ['submitted', 'first_check'])
+  assert.equal(deleted, false)
+  const still = db.byUser(uid).find((x) => x.id === id)
+  assert.ok(still)
+  assert.equal(still.verifyStatus, 'pooled') // 归属行完好
+
+  // 仍处首检态的行：CAS 删除成功（正常退回路径）
+  db.insertUnique(
+    makeContribution({ id: 'cas-guard-2', provider: 'codex', accountId: 'cas-guard-acc-2', authFileName: 'codex-cas2.json', plan: 'plus', linuxdoId: uid, verifyStatus: 'first_check' }),
+  )
+  assert.equal(db.deleteContribution('cas-guard-2', ['submitted', 'first_check']), true)
+  assert.equal(db.byUser(uid).find((x) => x.id === 'cas-guard-2'), undefined)
 })

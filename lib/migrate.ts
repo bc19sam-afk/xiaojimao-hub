@@ -311,19 +311,31 @@ export const migrations: Migration[] = [
       const before = (
         db.prepare('SELECT COUNT(*) AS n FROM contributions').get() as unknown as { n: number }
       ).n
+      // failed 在老 6 态里混了两种来源，v4 语义不同（codex bot 于 PR #15 指出）：
+      //   ① 首检就被拒（从未进过考察/池，observe_start_at IS NULL）——v4 规则「首检失败不占唯一键、
+      //      可重交」→ 删行释放 (provider, account_id)；
+      //   ② 考察中硬失败判死（进过池，observe_start_at 非 null）——占过池 → stopped（锁唯一键）。
+      const releasedRow = db
+        .prepare(
+          "SELECT COUNT(*) AS n FROM contributions WHERE verify_status='failed' AND observe_start_at IS NULL",
+        )
+        .get() as unknown as { n: number }
+      const released = releasedRow.n
+      db.exec("DELETE FROM contributions WHERE verify_status='failed' AND observe_start_at IS NULL")
       const mapping: [string, string][] = [
         ['observing', 'pooled'],
         ['granted', 'pooled'],
-        ['failed', 'stopped'],
+        ['failed', 'stopped'], // 剩余 failed 均进过池
       ]
       const stmt = db.prepare('UPDATE contributions SET verify_status=? WHERE verify_status=?')
       for (const [from, to] of mapping) stmt.run(to, from)
       const after = (
         db.prepare('SELECT COUNT(*) AS n FROM contributions').get() as unknown as { n: number }
       ).n
-      if (after !== before) {
+      // 行数对账：唯一允许的减少 = 被释放的「首检失败未入池」行数
+      if (after !== before - released) {
         throw new Error(
-          `[migrate 007] 迁移后行数不一致（迁移前 ${before}，迁移后 ${after}），已回滚。`,
+          `[migrate 007] 迁移后行数不一致（迁移前 ${before}，释放 ${released}，迁移后 ${after}），已回滚。`,
         )
       }
     },
