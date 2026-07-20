@@ -6,6 +6,7 @@ import Contributions from './Contributions'
 import Leaderboard from './Leaderboard'
 import StatCards from './StatCards'
 import RedeemStore from './RedeemStore'
+import PointsLedger from './PointsLedger'
 import { OpenAIMark } from './OpenAIMark'
 import StarField from './StarField'
 import NebulaBackground from './NebulaBackground'
@@ -19,7 +20,20 @@ interface Contribution {
   method: 'oauth' | 'rt'
   verifyStatus: 'submitted' | 'first_check' | 'pooled' | 'stopped' | 'needs_review'
   points: number
+  cumulativePoints?: number // v4：该号累计赚的分（§4/§6）
   createdAt: number
+}
+interface Rejection {
+  id: number
+  account: string
+  reason: string
+  createdAt: number
+}
+interface LedgerItem {
+  id: number
+  delta: number
+  createdAt: number
+  text: string
 }
 
 export default function DashboardShell({
@@ -28,6 +42,8 @@ export default function DashboardShell({
   user: { id: number; username: string; name?: string; trustLevel: number }
 }) {
   const [list, setList] = useState<Contribution[]>([])
+  const [rejections, setRejections] = useState<Rejection[]>([])
+  const [ledger, setLedger] = useState<LedgerItem[]>([])
   const [loading, setLoading] = useState(true)
   const [balance, setBalance] = useState(0)
   const [lbKey, setLbKey] = useState(0)
@@ -35,11 +51,17 @@ export default function DashboardShell({
 
   const load = useCallback(async () => {
     const [c, s] = await Promise.all([
-      fetch('/api/my-contributions', { cache: 'no-store' }).then((r) => (r.ok ? r.json() : [])),
-      fetch('/api/store', { cache: 'no-store' }).then((r) => (r.ok ? r.json() : { balance: 0 })),
+      fetch('/api/my-contributions', { cache: 'no-store' }).then((r) =>
+        r.ok ? r.json() : { contributions: [], rejections: [] },
+      ),
+      fetch('/api/store', { cache: 'no-store' }).then((r) =>
+        r.ok ? r.json() : { balance: 0, ledger: [] },
+      ),
     ])
-    setList(c)
+    setList(c.contributions ?? [])
+    setRejections(c.rejections ?? [])
     setBalance(s.balance ?? 0)
+    setLedger(s.ledger ?? [])
     setLoading(false)
   }, [])
 
@@ -111,6 +133,7 @@ export default function DashboardShell({
             <CollectPanel onDone={afterChange} />
             <Contributions
               list={list}
+              rejections={rejections}
               loading={loading}
               onReload={load}
               onVerified={afterChange}
@@ -118,6 +141,7 @@ export default function DashboardShell({
           </div>
           <div className="space-y-6">
             <RedeemStore refreshKey={storeKey} onRedeemed={afterChange} />
+            <PointsLedger ledger={ledger} />
             <Leaderboard refreshKey={lbKey} meId={user.id} />
             <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-6">
               <h3 className="mb-4 font-bold text-white">运作原理</h3>

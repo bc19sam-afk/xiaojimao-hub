@@ -386,6 +386,28 @@ export const migrations: Migration[] = [
       `)
     },
   },
+  {
+    version: 9,
+    // migration 009（P2-R3）：首检退回记录表。纯新增、向后兼容——仿 003/008，只 CREATE 新表，
+    // 旧代码不用此表也能跑。首检失败（reject）会删掉 contribution 行释放唯一键（§2.4），号随即从
+    // dashboard 消失、用户不知为何（§3.2「告知用户登录失败/被封」）。rejections 在删行前后各留一条
+    // 中性退回提示，dashboard 据此显示「你交的某号登录失败/被封，未收——修好可重交」。
+    //   reason 存**中性人话**（如「登录失败或已被封号」），绝不透传 CPA 报错原文（§8）；
+    //   account_id 落库仅供归属/排查，展示侧由 shortAccountLabel 掩码成 provider+短标识，不泄完整敏感号。
+    up(db) {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS rejections (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          linuxdo_id INTEGER NOT NULL,
+          provider   TEXT NOT NULL,
+          account_id TEXT NOT NULL,
+          reason     TEXT NOT NULL DEFAULT '',
+          created_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_rejections_user ON rejections(linuxdo_id);
+      `)
+    },
+  },
 ]
 
 // 代码所知的最新 schema 版本（从 migrations 数组派生，勿手写）

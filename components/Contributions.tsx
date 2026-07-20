@@ -1,7 +1,7 @@
 'use client'
 
 import { useState } from 'react'
-import { ArrowsClockwiseIcon, ShieldCheckIcon } from '@phosphor-icons/react'
+import { ArrowsClockwiseIcon, ShieldCheckIcon, WarningCircleIcon } from '@phosphor-icons/react'
 
 interface Contribution {
   id: string
@@ -12,25 +12,36 @@ interface Contribution {
   method: 'oauth' | 'rt'
   verifyStatus: 'submitted' | 'first_check' | 'pooled' | 'stopped' | 'needs_review'
   points: number
+  cumulativePoints?: number // v4：该号累计赚的分（daily_settlements 汇总，§4/§6）
   createdAt: number
 }
 
-// 需求 §3.2 五态（v4 按量计量，考察期取消）中文
+// 首检退回记录（§3.2）：账号已由服务端掩码成 provider+短标识
+interface Rejection {
+  id: number
+  account: string
+  reason: string
+  createdAt: number
+}
+
+// 需求 §3.2 五态（v4 按量计量，考察期取消）中文。§4/§3.5 用户视角措辞：pooled=在用、stopped=已失效。
 const VERIFY: Record<string, { label: string; cls: string }> = {
   submitted: { label: '已提交', cls: 'bg-amber-400/15 text-amber-300' },
   first_check: { label: '首检中', cls: 'bg-sky-400/15 text-sky-300' },
-  pooled: { label: '在池计量', cls: 'bg-emerald-400/15 text-emerald-300' },
-  stopped: { label: '已停用', cls: 'bg-rose-400/15 text-rose-300' },
+  pooled: { label: '在用', cls: 'bg-emerald-400/15 text-emerald-300' },
+  stopped: { label: '已失效', cls: 'bg-rose-400/15 text-rose-300' },
   needs_review: { label: '待人工复核', cls: 'bg-orange-400/15 text-orange-300' },
 }
 
 export default function Contributions({
   list,
+  rejections = [],
   loading,
   onReload,
   onVerified,
 }: {
   list: Contribution[]
+  rejections?: Rejection[]
   loading: boolean
   onReload: () => void
   onVerified: () => void
@@ -70,6 +81,24 @@ export default function Contributions({
         </div>
       </div>
 
+      {/* 首检退回提示（§3.2）：号被退回后从下表消失，这里告知「交了但没收、可修好重交」 */}
+      {rejections.length > 0 && (
+        <div className="mb-4 rounded-xl border border-rose-400/20 bg-rose-400/[0.06] p-3">
+          <div className="mb-1.5 flex items-center gap-1.5 text-xs font-semibold text-rose-300">
+            <WarningCircleIcon size={14} weight="fill" />
+            部分号未收下（修好可重新提交）
+          </div>
+          <ul className="space-y-1">
+            {rejections.map((r) => (
+              <li key={r.id} className="text-[11px] leading-relaxed text-rose-200/80">
+                <span className="mono text-rose-200">〔{r.account}〕</span>
+                {r.reason}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
       {loading ? (
         <div className="py-10 text-center text-sm text-neutral-500">加载中…</div>
       ) : list.length === 0 ? (
@@ -91,13 +120,14 @@ export default function Contributions({
               <tr className="border-b border-white/10 bg-[var(--ink-soft)] text-left text-xs text-neutral-500">
                 <th className="px-4 py-2.5 font-medium">账号</th>
                 <th className="px-4 py-2.5 font-medium">类型</th>
-                <th className="px-4 py-2.5 font-medium">验证状态</th>
-                <th className="px-4 py-2.5 font-medium">积分</th>
+                <th className="px-4 py-2.5 font-medium">状态</th>
+                <th className="px-4 py-2.5 font-medium">累计积分</th>
               </tr>
             </thead>
             <tbody>
               {list.map((c) => {
                 const v = VERIFY[c.verifyStatus] ?? VERIFY.submitted
+                const pts = c.cumulativePoints ?? 0
                 return (
                   <tr key={c.id} className="border-b border-white/5 last:border-0">
                     <td className="px-4 py-3">
@@ -115,8 +145,12 @@ export default function Contributions({
                       </span>
                     </td>
                     <td className="px-4 py-3">
-                      {/* v4：积分按账户累计、按日结算，不挂在号行上；pooled 号不显示固定分（账户明细/每号累计展示留 R2/R3） */}
-                      <span className="text-xs text-neutral-600">—</span>
+                      {/* v4：该号累计赚的分（daily_settlements 汇总）。0＝尚无已结算日 */}
+                      {pts > 0 ? (
+                        <span className="mono text-xs font-semibold text-[var(--brand-bright)]">{pts}</span>
+                      ) : (
+                        <span className="text-xs text-neutral-600">—</span>
+                      )}
                     </td>
                   </tr>
                 )
