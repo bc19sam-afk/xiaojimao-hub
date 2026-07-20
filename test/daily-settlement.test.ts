@@ -86,6 +86,15 @@ function makeContribution(over: Partial<Contribution>): Contribution {
   }
 }
 
+// 造号并落库；默认视为「入过池」（设 pooled_at＝结算资格判据，见 migration 010）——用 1（1970）
+// 保证所有测试 date 都在进池之后、不被 settle 的 pooled_at 下界挡。pooled:false 造「从没入池」的号。
+function seedC(over: Partial<Contribution>, opts: { pooled?: boolean } = {}): Contribution {
+  const c = makeContribution(over)
+  db.insertUnique(c)
+  if (opts.pooled ?? true) db.update(c.id, { pooledAt: 1 })
+  return c
+}
+
 // 桩掉 cpa.getDailyUsage（同一模块单例，settle.ts 看到的是同一对象）返回指定用量，跑完必还原——
 // 与 pooled-statemachine 的 withInspect 同款，让日期/次数确定可控。
 async function withUsage<T>(usage: DailyUsage[], fn: () => Promise<T>): Promise<T> {
@@ -149,7 +158,7 @@ test('折算 round：单价小数 → points=round(count×单价)', async () => 
   const id = 'round-c'
   const accountId = 'round-account'
   setRate('codex', 'roundplan', 0.5) // 分数单价
-  db.insertUnique(makeContribution({ id, provider: 'codex', accountId, plan: 'roundplan', linuxdoId: uid }))
+  seedC({ id, provider: 'codex', accountId, plan: 'roundplan', linuxdoId: uid })
   assert.equal(db.ratePerCall('codex', 'roundplan'), 0.5)
   // count=3 → round(3×0.5)=round(1.5)=2
   await withUsage([{ accountId, provider: 'codex', date: '2020-01-01', count: 3 }], () => settle.settleDailyUsage(undefined, { force: true }))
@@ -165,7 +174,7 @@ test('结算幂等：同号同日跑两次 → 一笔 settlement、余额只加�
   const uid = 7001
   const id = 'idem-c'
   const accountId = 'idem-account'
-  db.insertUnique(makeContribution({ id, provider: 'codex', accountId, plan: 'plus', linuxdoId: uid }))
+  seedC({ id, provider: 'codex', accountId, plan: 'plus', linuxdoId: uid })
   const usage: DailyUsage[] = [{ accountId, provider: 'codex', date: '2020-01-02', count: 10 }]
   const r1 = await withUsage(usage, () => settle.settleDailyUsage(undefined, { force: true }))
   const r2 = await withUsage(usage, () => settle.settleDailyUsage(undefined, { force: true }))
@@ -175,35 +184,36 @@ test('结算幂等：同号同日跑两次 → 一笔 settlement、余额只加�
   assert.equal(db.balance(uid), 10) // codex/plus=1 → 10×1=10，只加一次
 })
 
-// ④ 结算资格：pooled + stopped 结（stopped＝已停用号补结历史日欠薪——「号昨天有用量、今天停用」
-//    那笔已挣的不赖账，codex xhigh 于 PR #16 指出）；first_check/needs_review/submitted（从未入池）不结
-test('结算资格：stopped 补结历史日；first_check/needs_review/submitted 不结算', async () => {
+// ④ 结算资格＝**入过池**（pooled_at 非空），不看当前态（codex xhigh 于 PR #18）：入过池的 stopped/
+//    needs_review 补结历史欠薪；**从没入池**的号（含首检 reauth 直接转的 needs_review）绝不结算
+test('结算资格：入过池的 stopped/needs_review 补结；从没入池的（含 needs_review）不结', async () => {
+  // 从没入池（pooled:false → 无 pooled_at）：first_check / submitted / **首检直转的 needs_review**
   const noPay = [
     { st: 'first_check' as const, uid: 7012, acc: 'np-first' },
-    { st: 'needs_review' as const, uid: 7013, acc: 'np-review' },
     { st: 'submitted' as const, uid: 7014, acc: 'np-sub' },
+    { st: 'needs_review' as const, uid: 7015, acc: 'np-review-nopool' }, // 首检 reauth 直转、从没入池
   ]
   for (const s of noPay) {
-    db.insertUnique(
-      makeContribution({ id: 'id-' + s.acc, provider: 'grok', accountId: s.acc, plan: 'super', linuxdoId: s.uid, verifyStatus: s.st }),
-    )
+    seedC({ id: 'id-' + s.acc, provider: 'grok', accountId: s.acc, plan: 'super', linuxdoId: s.uid, verifyStatus: s.st }, { pooled: false })
   }
-  // stopped：昨天有用量、今天已停用 → 那笔历史日照样结算发分
-  db.insertUnique(
-    makeContribution({ id: 'id-np-stopped', provider: 'grok', accountId: 'np-stopped', plan: 'super', linuxdoId: 7011, verifyStatus: 'stopped' }),
-  )
+  // 入过池后转态（pooled:true → 有 pooled_at）：stopped（存活巡检失效）/ needs_review（巡检 reauth）→ 补结欠薪
+  seedC({ id: 'id-p-stopped', provider: 'grok', accountId: 'p-stopped', plan: 'super', linuxdoId: 7011, verifyStatus: 'stopped' })
+  seedC({ id: 'id-p-review', provider: 'grok', accountId: 'p-review', plan: 'super', linuxdoId: 7013, verifyStatus: 'needs_review' })
   const usage: DailyUsage[] = [
     ...noPay.map((s) => ({ accountId: s.acc, provider: 'grok' as const, date: '2020-01-03', count: 20 })),
-    { accountId: 'np-stopped', provider: 'grok', date: '2020-01-03', count: 20 },
+    { accountId: 'p-stopped', provider: 'grok', date: '2020-01-03', count: 20 },
+    { accountId: 'p-review', provider: 'grok', date: '2020-01-03', count: 20 },
   ]
   const r = await withUsage(usage, () => settle.settleDailyUsage(undefined, { force: true }))
-  assert.equal(r.settled, 1) // 只有 stopped 那笔结了
+  assert.equal(r.settled, 2) // 只有两个「入过池」的结了
   for (const s of noPay) {
-    assert.equal(db.settlementsFor('id-' + s.acc).length, 0, `${s.st} 不应结算`)
+    assert.equal(db.settlementsFor('id-' + s.acc).length, 0, `${s.st}（从没入池）不应结算`)
     assert.equal(db.balance(s.uid), 0)
   }
-  assert.equal(db.settlementsFor('id-np-stopped').length, 1, 'stopped 应补结历史日')
-  assert.ok(db.balance(7011) > 0, 'stopped 号主应拿到已挣积分')
+  assert.equal(db.settlementsFor('id-p-stopped').length, 1, '入过池的 stopped 应补结历史日')
+  assert.ok(db.balance(7011) > 0)
+  assert.equal(db.settlementsFor('id-p-review').length, 1, '入过池的 needs_review 应补结历史日')
+  assert.ok(db.balance(7013) > 0)
 })
 
 // ⑤ 多日：号有多个未结算日 → 各结一笔、各发分；已结算日不重结（新增日才结）
@@ -211,7 +221,7 @@ test('多日：多个未结算日各结一笔各发分；已结算日不重结',
   const uid = 7021
   const id = 'multi-c'
   const accountId = 'multi-account'
-  db.insertUnique(makeContribution({ id, provider: 'grok', accountId, plan: 'super', linuxdoId: uid })) // grok/*=1
+  seedC({ id, provider: 'grok', accountId, plan: 'super', linuxdoId: uid }) // grok/*=1
   const days: DailyUsage[] = [
     { accountId, provider: 'grok', date: '2020-02-01', count: 5 },
     { accountId, provider: 'grok', date: '2020-02-02', count: 7 },
@@ -237,7 +247,7 @@ test('只结算已过完自然日：昨天结算、今天与未来日不结', as
   const uid = 7031
   const id = 'today-c'
   const accountId = 'today-account'
-  db.insertUnique(makeContribution({ id, provider: 'codex', accountId, plan: 'plus', linuxdoId: uid }))
+  seedC({ id, provider: 'codex', accountId, plan: 'plus', linuxdoId: uid })
   const now = new Date(2026, 6, 20, 12).getTime() // 2026-07-20 12:00 本地 → today='2026-07-20'
   const usage: DailyUsage[] = [
     { accountId, provider: 'codex', date: '2026-07-19', count: 8 }, // 昨天 → 结
@@ -269,6 +279,9 @@ test('MOCK 端到端：交号 → 入池 → 按日结算 → 余额增加、set
   assert.ok(pooled)
   assert.equal(pooled.verifyStatus, 'pooled')
   assert.equal(db.balance(7041), 0) // 入池尚未结算
+  // 回拨 pooled_at 到 3 天前：模拟号早就在池（否则「今天入池」时 pooled_at=今天，会把「昨天」的用量
+  // 当作进池前用量按下界挡掉——那是正确语义，但本 e2e 要演示历史日发分，故让它早入池）。
+  db.update(cid, { pooledAt: Date.now() - 3 * 86_400_000 })
 
   // 真实 mock getDailyUsage：该号「昨天」+「今天」各一笔；结算只发昨天
   const today = ymd(Date.now())

@@ -55,11 +55,12 @@ export async function settleDailyUsage(
   try {
     const usage = await cpa.getDailyUsage()
 
-    // 结算资格（§3.2/§3.5）：pooled（在池计量）+ stopped（已停用——只结停用**前**产生的历史日用量，
-    // 「号昨天有用量、今天停用」那笔已挣的不赖账，codex xhigh 于 PR #16 指出）。first_check/
-    // needs_review/submitted（从未入池）不结。'\0' 作分隔符（不会出现在 provider/id 里）。
+    // 结算资格＝**入过池**的号（pooled_at 非空，见 db.eligibleForSettlement / migration 010）——不看当前
+    // verify_status：含 pooled（在池计量）+ stopped/needs_review（存活巡检转态后补结历史欠薪）。首检
+    // reauth 直接转 needs_review 的号**从没入池**（pooled_at null）不在此集，绝不错发（codex xhigh 于
+    // PR #18 指出：无脑按 needs_review 态判会给从没入池的号发分）。'\0' 作分隔符（不出现在 provider/id）。
     const byKey = new Map(
-      db.byVerifyStatus(['pooled', 'stopped']).map((c) => [c.provider + '\0' + c.accountId, c]),
+      db.eligibleForSettlement().map((c) => [c.provider + '\0' + c.accountId, c]),
     )
 
     let settled = 0
@@ -69,7 +70,10 @@ export async function settleDailyUsage(
       // 'YYYY-MM-DD' 按字典序即时间序，date < today 等价于 date 早于今天。
       if (u.date >= today) continue
       const c = byKey.get(u.provider + '\0' + u.accountId)
-      if (!c) continue // 无资格号 / 未知号 → 不结算
+      if (!c) continue // 无资格号（从没入池）/ 未知号 → 不结算
+      // 只结「进池那天起」的日：号入池前（pooled_at 之前）纵有用量也不属贡献计量（cpamp 侧可能是号主
+      // 自用/别家），加下界防误结转态后偶发的跨界数据（codex xhigh 于 PR #18 指出 post-transition 用量）。
+      if (c.pooledAt != null && u.date < dayStr(c.pooledAt)) continue
       if (db.hasSettled(c.id, u.date)) continue // 该日已结算 → 跳过（快速闸）
 
       const points = Math.round(u.count * db.ratePerCall(c.provider, c.plan))

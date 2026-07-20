@@ -44,6 +44,8 @@ export interface Contribution {
   snapshotPoints?: number // 分值快照（进考察时按当时规则算好、冻结）
   snapshotRuleVersion?: string // 检测规则版本快照
   snapshotPriority?: number // 入池优先级快照
+  // 首次进池时刻（P2-R3）：结算资格判据——非空＝入过池（该按量结算历史日）；null＝从没入池
+  pooledAt?: number
 }
 
 const DB_PATH = process.env.DB_PATH || path.join(process.cwd(), 'data', 'app.db')
@@ -167,6 +169,7 @@ interface Row {
   snapshot_points: number | null
   snapshot_rule_version: string | null
   snapshot_priority: number | null
+  pooled_at: number | null
 }
 
 function toContribution(r: Row): Contribution {
@@ -194,6 +197,7 @@ function toContribution(r: Row): Contribution {
     snapshotPoints: r.snapshot_points ?? undefined,
     snapshotRuleVersion: r.snapshot_rule_version ?? undefined,
     snapshotPriority: r.snapshot_priority ?? undefined,
+    pooledAt: r.pooled_at ?? undefined,
   }
 }
 
@@ -291,6 +295,18 @@ export const db = {
     return rows.map(toContribution)
   },
 
+  // 结算资格号（P2-R3，codex xhigh 于 PR #18 指出）：**入过池**的号（pooled_at 非空），不看当前
+  // verify_status——含 pooled（在池计量）+ stopped/needs_review（存活巡检转态后补结历史欠薪）。
+  // 从没入池的（首检 reauth→needs_review、submitted/first_check）pooled_at 为 null、不在此集，
+  // 绝不给从没入池的号错发分。
+  eligibleForSettlement(): Contribution[] {
+    return (
+      conn
+        .prepare('SELECT * FROM contributions WHERE pooled_at IS NOT NULL')
+        .all() as unknown as Row[]
+    ).map(toContribution)
+  },
+
   // 插入；(provider, account_id) 冲突则不插入并返回 duplicate=true（依赖复合 UNIQUE 约束，原子防重）
   insertUnique(c: Contribution): { duplicate: boolean } {
     const r = conn
@@ -326,6 +342,7 @@ export const db = {
       snapshotPoints: 'snapshot_points',
       snapshotRuleVersion: 'snapshot_rule_version',
       snapshotPriority: 'snapshot_priority',
+      pooledAt: 'pooled_at',
     }
     const sets: string[] = []
     const vals: unknown[] = []
@@ -691,6 +708,11 @@ export const db = {
         'INSERT INTO rejections (linuxdo_id, provider, account_id, reason, created_at) VALUES (?,?,?,?,?)',
       )
       .run(rec.linuxdoId, rec.provider, rec.accountId, rec.reason, Date.now())
+  },
+  // 清掉某 (provider, account_id) 的退回记录（P2-R3，codex xhigh 于 PR #18 指出）：号修好重交并成功
+  // 入库后调用——否则旧退回提示「部分号未收下」会一直挂在 dashboard、与已接受的号并存误导用户。
+  clearRejections(provider: string, accountId: string): void {
+    conn.prepare('DELETE FROM rejections WHERE provider=? AND account_id=?').run(provider, accountId)
   },
   // 某用户最近退回记录（dashboard 展示用），按时间倒序；limit 只取最近几条免刷屏
   rejectionsFor(linuxdoId: number, limit = 10): RejectionRow[] {

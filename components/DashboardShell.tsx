@@ -69,18 +69,23 @@ export default function DashboardShell({
     load()
   }, [load])
 
-  // 有首检中的号时自动快轮询，让后台首检结果实时显现（首检态几秒内出结果）。v4 下 pooled 态不由本页
-  // worker 变动（按日计量＝R2、失效巡检＝R3），故入池后无需慢轮询。
+  // 首检中的号 → 5s 快轮询（首检态几秒出结果）；有 pooled 号 → 30s 慢轮询——R3 的存活巡检会把
+  // pooled 背景转 stopped/needs_review、R2 按日结算也背景加分/改累计，不轮询则一直显示「在用」、
+  // 余额/明细停更直到手动刷新（GitHub bot 于 PR #18 指出）。快慢并存时取快（5s）。
   useEffect(() => {
     const hasFastChanging = list.some(
       (c) => c.verifyStatus === 'submitted' || c.verifyStatus === 'first_check',
     )
-    if (!hasFastChanging) return
-    const t = setInterval(() => {
-      load()
-      setLbKey((k) => k + 1)
-      setStoreKey((k) => k + 1)
-    }, 5000)
+    const hasPooled = list.some((c) => c.verifyStatus === 'pooled')
+    if (!hasFastChanging && !hasPooled) return
+    const t = setInterval(
+      () => {
+        load()
+        setLbKey((k) => k + 1)
+        setStoreKey((k) => k + 1)
+      },
+      hasFastChanging ? 5000 : 30_000,
+    )
     return () => clearInterval(t)
   }, [list, load])
 

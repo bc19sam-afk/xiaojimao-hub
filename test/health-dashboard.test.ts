@@ -193,7 +193,7 @@ test('巡检 codex reject（401/撤权/删除＝明确失效）→ pooled→stop
   const accountId = 'h-codex-reject-acc'
   db.insertUnique(makeContribution({ id, provider: 'codex', accountId, linuxdoId: 8201 }))
   await withCpa({ probes: [{ accountId, decision: 'reject', plan: 'plus', reason: 'unauthorized' }] }, () =>
-    collect.checkPooledHealth(),
+    collect.checkPooledHealth(undefined, { force: true }),
   )
   assert.equal(statusOf(id), 'stopped')
 })
@@ -203,7 +203,7 @@ test('巡检 codex retry（限额不算失败，§3.2）→ 保持 pooled', asyn
   const accountId = 'h-codex-retry-acc'
   db.insertUnique(makeContribution({ id, provider: 'codex', accountId, linuxdoId: 8202 }))
   await withCpa({ probes: [{ accountId, decision: 'retry', plan: 'plus', reason: 'usage_limit' }] }, () =>
-    collect.checkPooledHealth(),
+    collect.checkPooledHealth(undefined, { force: true }),
   )
   assert.equal(statusOf(id), 'pooled')
 })
@@ -213,7 +213,7 @@ test('巡检 codex reauth（需重授权）→ needs_review', async () => {
   const accountId = 'h-codex-reauth-acc'
   db.insertUnique(makeContribution({ id, provider: 'codex', accountId, linuxdoId: 8203 }))
   await withCpa({ probes: [{ accountId, decision: 'reauth', plan: 'plus', reason: 'relogin' }] }, () =>
-    collect.checkPooledHealth(),
+    collect.checkPooledHealth(undefined, { force: true }),
   )
   assert.equal(statusOf(id), 'needs_review')
 })
@@ -223,7 +223,7 @@ test('巡检 codex ok → 保持 pooled', async () => {
   const accountId = 'h-codex-ok-acc'
   db.insertUnique(makeContribution({ id, provider: 'codex', accountId, linuxdoId: 8204 }))
   await withCpa({ probes: [{ accountId, decision: 'ok', plan: 'plus', reason: 'ok' }] }, () =>
-    collect.checkPooledHealth(),
+    collect.checkPooledHealth(undefined, { force: true }),
   )
   assert.equal(statusOf(id), 'pooled')
 })
@@ -233,7 +233,7 @@ test('巡检 codex 未被 inspect 覆盖 → 保持 pooled（不误判死）', a
   db.insertUnique(makeContribution({ id, provider: 'codex', accountId: 'h-codex-uncovered-acc', linuxdoId: 8205 }))
   // probes 里没有本号 → 跳过
   await withCpa({ probes: [{ accountId: 'someone-else', decision: 'reject', plan: 'plus', reason: 'x' }] }, () =>
-    collect.checkPooledHealth(),
+    collect.checkPooledHealth(undefined, { force: true }),
   )
   assert.equal(statusOf(id), 'pooled')
 })
@@ -241,7 +241,7 @@ test('巡检 codex 未被 inspect 覆盖 → 保持 pooled（不误判死）', a
 test('巡检 inspect 整体抛错 → codex 号本轮全跳过、保持 pooled', async () => {
   const id = 'h-codex-inspectthrow'
   db.insertUnique(makeContribution({ id, provider: 'codex', accountId: 'h-codex-inspectthrow-acc', linuxdoId: 8206 }))
-  await withCpa({ probesThrow: true }, () => collect.checkPooledHealth())
+  await withCpa({ probesThrow: true }, () => collect.checkPooledHealth(undefined, { force: true }))
   assert.equal(statusOf(id), 'pooled')
 })
 
@@ -250,14 +250,14 @@ test('巡检 grok 文件仍在（含 disabled）→ 保持 pooled', async () => 
   const accountId = 'h-grok-present-acc'
   db.insertUnique(makeContribution({ id, provider: 'grok', accountId, plan: 'super', linuxdoId: 8207 }))
   const f = authFile('grok', accountId)
-  await withCpa({ files: [{ ...f, disabled: true }] }, () => collect.checkPooledHealth())
+  await withCpa({ files: [{ ...f, disabled: true }] }, () => collect.checkPooledHealth(undefined, { force: true }))
   assert.equal(statusOf(id), 'pooled') // disabled 也算在（管理员手动禁用/限额不算失败）
 })
 
 test('巡检 grok 文件不存在（被删/撤销）→ pooled→stopped', async () => {
   const id = 'h-grok-gone'
   db.insertUnique(makeContribution({ id, provider: 'grok', accountId: 'h-grok-gone-acc', plan: 'super', linuxdoId: 8208 }))
-  await withCpa({ files: [] }, () => collect.checkPooledHealth()) // 清单里没有本号
+  await withCpa({ files: [authFile('grok', 'h-grok-decoy-acc')] }, () => collect.checkPooledHealth(undefined, { force: true })) // 非空清单但不含本号（空清单会被 glitch 保护跳过）
   assert.equal(statusOf(id), 'stopped')
 })
 
@@ -267,7 +267,7 @@ test('巡检 claude 文件在 / 不在：分别保持 pooled / stopped', async (
   db.insertUnique(makeContribution({ id: keep, provider: 'claude', accountId: 'h-claude-keep-acc', plan: 'pro', linuxdoId: 8209 }))
   db.insertUnique(makeContribution({ id: gone, provider: 'claude', accountId: 'h-claude-gone-acc', plan: 'pro', linuxdoId: 8210 }))
   // 清单只含 keep 的号 → keep 保持、gone 停用
-  await withCpa({ files: [authFile('claude', 'h-claude-keep-acc')] }, () => collect.checkPooledHealth())
+  await withCpa({ files: [authFile('claude', 'h-claude-keep-acc')] }, () => collect.checkPooledHealth(undefined, { force: true }))
   assert.equal(statusOf(keep), 'pooled')
   assert.equal(statusOf(gone), 'stopped')
 })
@@ -275,7 +275,7 @@ test('巡检 claude 文件在 / 不在：分别保持 pooled / stopped', async (
 test('巡检 listAuthFiles 抛错 → claude/grok 本轮全跳过、保持 pooled', async () => {
   const id = 'h-grok-listthrow'
   db.insertUnique(makeContribution({ id, provider: 'grok', accountId: 'h-grok-listthrow-acc', plan: 'super', linuxdoId: 8211 }))
-  await withCpa({ filesThrow: true }, () => collect.checkPooledHealth())
+  await withCpa({ filesThrow: true }, () => collect.checkPooledHealth(undefined, { force: true }))
   assert.equal(statusOf(id), 'pooled')
 })
 
@@ -284,7 +284,7 @@ test('巡检只碰 pooled：首检态（first_check）不受影响', async () =>
   db.insertUnique(
     makeContribution({ id, provider: 'grok', accountId: 'h-fc-acc', plan: 'super', linuxdoId: 8212, verifyStatus: 'first_check' }),
   )
-  await withCpa({ files: [] }, () => collect.checkPooledHealth()) // 即便清单为空
+  await withCpa({ files: [authFile('grok', 'h-decoy2-acc')] }, () => collect.checkPooledHealth(undefined, { force: true })) // 非空清单
   assert.equal(statusOf(id), 'first_check') // 巡检不拉首检态，岿然不动
 })
 
@@ -361,8 +361,9 @@ test('stopped 后只结历史日：巡检停用→历史日照结（R2 欠薪不
   const id = 'stop-settle'
   const accountId = 'stop-settle-acc'
   db.insertUnique(makeContribution({ id, provider: 'grok', accountId, plan: 'super', linuxdoId: uid })) // grok/*=1
-  // 巡检判失效 → stopped
-  await withCpa({ files: [] }, () => collect.checkPooledHealth())
+  db.update(id, { pooledAt: new Date(2026, 6, 10).getTime() }) // 早就入池（早于下面 7-19 用量），结算资格
+  // 巡检判失效 → stopped（非空清单但不含本号；空清单会被 glitch 保护跳过）
+  await withCpa({ files: [authFile('grok', 'stop-decoy-acc')] }, () => collect.checkPooledHealth(undefined, { force: true }))
   assert.equal(statusOf(id), 'stopped')
   const balBefore = db.balance(uid)
   const now = new Date(2026, 6, 20, 12).getTime() // today = 2026-07-20
@@ -377,4 +378,33 @@ test('stopped 后只结历史日：巡检停用→历史日照结（R2 欠薪不
     settle.settleDailyUsage(now, { force: true }),
   )
   assert.equal(db.settlementsFor(id).length, 1, '今天不结，settlement 仍只 1 笔')
+})
+
+// —— codex xhigh 于 PR #18 的补充修复 ——
+
+// 空清单保护：listAuthFiles 返回 []（cpamp glitch）→ 绝不把 pooled claude/grok 判失效（防误停整池）
+test('空清单保护：listAuthFiles 空 → pooled claude/grok 保持（不误停整池）', async () => {
+  const id = 'h-empty-guard'
+  db.insertUnique(makeContribution({ id, provider: 'grok', accountId: 'h-empty-acc', plan: 'super', linuxdoId: 8250 }))
+  await withCpa({ files: [] }, () => collect.checkPooledHealth(undefined, { force: true }))
+  assert.equal(statusOf(id), 'pooled') // 空清单视为不可观测、跳过，绝不停用
+})
+
+// 存活巡检节流：默认（非 force）同窗口内第二次调用 skip，不重复全量 inspect（防 8s tick 满负荷）
+test('存活巡检节流：5 分钟窗口内第二次 checkPooledHealth 跳过', async () => {
+  const base = new Date(2027, 0, 1, 12).getTime() // 远离其它测试设的 lastHealthAt
+  const r1 = await withCpa({ probes: [] }, () => collect.checkPooledHealth(base)) // 距上次 >5min → 跑
+  assert.ok(!r1.skipped)
+  const r2 = await withCpa({ probes: [] }, () => collect.checkPooledHealth(base + 60_000)) // <5min → skip
+  assert.equal(r2.skipped, true)
+  const r3 = await withCpa({ probes: [] }, () => collect.checkPooledHealth(base + 6 * 60_000)) // >5min → 再跑
+  assert.ok(!r3.skipped)
+})
+
+// 清退回往返：recordRejection 记 → rejectionsFor 可读 → clearRejections（重交成功时调）清除
+test('清退回往返：recordRejection → rejectionsFor → clearRejections 清除', () => {
+  db.recordRejection({ linuxdoId: 8270, provider: 'codex', accountId: 'rc-acc', reason: '登录失败或已被封号，未入池' })
+  assert.equal(db.rejectionsFor(8270).length, 1)
+  db.clearRejections('codex', 'rc-acc') // recordIngest 重交成功时调用同款
+  assert.equal(db.rejectionsFor(8270).length, 0)
 })

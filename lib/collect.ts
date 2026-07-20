@@ -46,6 +46,8 @@ function recordIngest(
   }
   const { duplicate } = db.insertUnique(contribution)
   if (duplicate) return { ok: false, error: '这个号交过了，不能再交' }
+  // 修好重交成功入库 → 清掉该号旧退回记录，dashboard 的「未收下」提示随之消失（codex xhigh 于 PR #18）
+  db.clearRejections(provider, contribution.accountId)
   return { ok: true, contribution }
 }
 
@@ -203,7 +205,10 @@ export async function processPending(): Promise<{
         return // 启用失败：不入池，保持原态下轮重试
       }
       if (plan !== c.plan) db.update(c.id, { plan })
-      if (db.transition(c.id, ['submitted', 'first_check'], 'pooled')) pooled++
+      if (db.transition(c.id, ['submitted', 'first_check'], 'pooled')) {
+        db.update(c.id, { pooledAt: Date.now() }) // 记首次进池时刻＝结算资格判据（migration 010）
+        pooled++
+      }
     }
 
     // 首检失败·退回（§2.4/§3.2）：号 401/撤权/封号、压根没入池 → **先删 cpamp auth 文件、成功后才
@@ -294,15 +299,24 @@ export async function processPending(): Promise<{
 //     listAuthFiles 抛错 → 本轮全跳过（同不误判死）。
 // stopped 后 settleDailyUsage 只结历史日（R2 行为不变，「昨天有量今天停用」的欠薪照补，不受影响）。
 let healthRunning = false
+// 存活巡检节流（codex xhigh 于 PR #18 指出）：默认 worker tick=8s，每轮都全量 inspect()（codex 巡检可
+// 轮询达 30s）＝持续满负荷。巡检该分钟级、比结算勤即可；此处限至少隔 5 分钟跑一次（now/force 供测试）。
+const HEALTH_INTERVAL_MS = 5 * 60_000
+let lastHealthAt = 0
 
-export async function checkPooledHealth(): Promise<{
+export async function checkPooledHealth(
+  now: number = Date.now(),
+  opts: { force?: boolean } = {},
+): Promise<{
   checked: number // 本轮巡检的 pooled 号数
   stopped: number // 本轮判失效停用数
   skipped?: boolean
 }> {
   if (healthRunning) return { checked: 0, stopped: 0, skipped: true }
+  if (!opts.force && now - lastHealthAt < HEALTH_INTERVAL_MS) return { checked: 0, stopped: 0, skipped: true }
   healthRunning = true
   try {
+    lastHealthAt = now
     const pooled = db.byVerifyStatus(['pooled'])
     if (pooled.length === 0) return { checked: 0, stopped: 0 }
     let stopped = 0
@@ -342,7 +356,11 @@ export async function checkPooledHealth(): Promise<{
       } catch {
         files = null // 拉不到号池清单：本轮跳过，绝不误判死
       }
-      if (files !== null) {
+      // ⚠️ 空清单保护（codex xhigh 于 PR #18 指出）：real client 把缺失 files 字段归一为 []，一次 200
+      // 空响应（如 {}）会让下面把**整个** claude/grok 池判失效停用（stopped 无恢复路径 + 锁唯一键）。
+      // 空清单更可能是 cpamp glitch（正巡检的这些号至少该在池里）→ 视为不可观测、本轮跳过、不停用。
+      // 真「号池全空」极罕见，宁可漏停也不错停整池。（连续多轮确认缺失可留后续单细化。）
+      if (files !== null && files.length > 0) {
         // 现存号身份集（provider+accountId）：只认能识别 provider 且有稳定 id 的文件。'\0' 作分隔符
         // （不会出现在 provider/id 里），与 settle.ts 同款按 (provider, accountId) 划界。
         const present = new Set(
