@@ -37,6 +37,19 @@ cpamp 自带：`request-retry=3`、`quota-exceeded` 处理选项、`transient-er
 - cpamp 支持**服务端定时巡检 + 历史记录**（固定间隔/每天定点，下个 worker 周期生效）；我们 worker 自轮询 inspect 也行（`cpa.ts` 已在做），定时巡检为备选。官方「定时巡检任务系统」(`feat/codex-inspection-tasks`) 未正式发布。
 - 源：`seakee/CPA-Manager-Plus` `apps/docs/manual/codex-inspection.md`；`poterpan/cpa-codex-inspection-bridge`。
 
+## cpamp 用量 API（v4 按量计量的数据源，2026-07-20 直连真实 cpamp 实探）
+**关键结论：`/v0/management/usage` 存在且能到「单号」维度——v4「按号每日调用量结算」的数据源确认落地、够用。**
+- `GET /v0/management/usage`（HTTP 200）返回**原始请求事件流**：`{ total_requests, success_count, failure_count, total_tokens, apis }`；`apis[端点].models[模型].details[]`，**每条 detail = 一次请求**，含：
+  - `account_snapshot` / `auth_file_snapshot` / `auth_index` —— **账号身份**（能精确归到哪个号）
+  - `auth_provider_snapshot` —— provider
+  - `auth_label_snapshot` —— **来源标记**（我们打的 hub 标记也在 → 能只算贡献号）
+  - `timestamp` —— 请求时刻（→ 按日聚合）
+- **R2 计量口径**：worker 拉 usage → 按 `account_snapshot`/`auth_file` 分组、按 `timestamp` 落自然日、**数 details 条数 = 该号当日调用次数** → 折算积分。
+- `GET /v0/management/usage/summary` = 按 **API 端点/模型** 的全局汇总（无账号维度），**不用于按号计量**。
+- 全量 ~19MB（原始事件）。R2 worker 每日拉取聚合即可；**是否支持 `?按日期/按账号` 查询参数缩小**留 R2 对接细化（即使不支持、全量拉聚合也可行）。
+- 前提：需 cpamp 开启「CPA 用量发布」（Manager Server 采集）——本机实测该端点已有数据、即已开启。
+- 探测边界（诚实）：只读 GET 探端点与字段结构，真实号 account/timestamp 未落文档；查询参数、数据保留期留 R2 对接时定。
+
 ## 待落地 / 待样本（不阻塞 P0-B）
 1. **priority 写入方式**：**cpamp 确认支持给单号设优先级**（用户 2026-07-15 确认）；走哪个 API/字段留 P2c 对接时定。
 2. **禁用原因区分**：需一个失效/被禁号样本，验证 `disabled`/`status`/`status_message` 组合能否区分「手动禁用」vs 失效/限流。
