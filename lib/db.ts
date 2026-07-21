@@ -1100,6 +1100,57 @@ export const db = {
       lastObservedAt: r?.last_observed_at ?? null,
     }
   },
+
+  // ===== 审计留痕（P4-R1，§7.3）=====
+  // 记一条操作留痕：操作人 actor / 时间 / 动作 / 目标 / 旧值 / 新值。old/new 为**已脱敏摘要**（由 lib/audit.ts
+  // 构造，绝不含 CDK 码/密钥等敏感原文，§8）；undefined → 落 null。actor 取结构最小型（不 import lib/admin，
+  // 免 db 反向依赖 next/headers；admin.Actor 结构兼容）。与主操作紧邻调用（非同事务）：单机单 worker 下
+  // 主写与本写各自 auto-commit、先后紧邻；本 INSERT 无唯一约束不会失败，异常一律上抛不吞（审计不静默丢）。
+  recordAudit(
+    actor: { type: string; id?: number; label: string },
+    entry: { action: string; target: string; old?: unknown; new?: unknown },
+  ): void {
+    conn
+      .prepare(
+        `INSERT INTO audit_log (actor_type, actor_id, actor_label, action, target, old_value, new_value, created_at)
+         VALUES (?,?,?,?,?,?,?,?)`,
+      )
+      .run(
+        actor.type,
+        actor.id ?? null,
+        actor.label,
+        entry.action,
+        entry.target,
+        entry.old === undefined ? null : JSON.stringify(entry.old),
+        entry.new === undefined ? null : JSON.stringify(entry.new),
+        Date.now(),
+      )
+  },
+  // 审计查看（倒序分页，最新在前）：limit 钳 [1,200]、offset 钳 ≥0 防脏输入。old/new 本就是脱敏摘要，不泄敏感值。
+  // 按 id DESC（自增＝插入序＝时间序，比 created_at 更稳、无同毫秒并列歧义）。
+  listAudit(limit = 50, offset = 0): AuditRow[] {
+    const lim = Math.min(200, Math.max(1, Math.floor(Number(limit) || 50)))
+    const off = Math.max(0, Math.floor(Number(offset) || 0))
+    return conn
+      .prepare(
+        `SELECT id, actor_type AS actorType, actor_id AS actorId, actor_label AS actorLabel,
+                action, target, old_value AS oldValue, new_value AS newValue, created_at AS createdAt
+         FROM audit_log ORDER BY id DESC LIMIT ? OFFSET ?`,
+      )
+      .all(lim, off) as unknown as AuditRow[]
+  },
+}
+
+export interface AuditRow {
+  id: number
+  actorType: string
+  actorId: number | null
+  actorLabel: string
+  action: string
+  target: string
+  oldValue: string | null // JSON 摘要字符串（脱敏后）或 null
+  newValue: string | null
+  createdAt: number
 }
 
 export interface PointRule {

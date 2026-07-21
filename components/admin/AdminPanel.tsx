@@ -22,6 +22,23 @@ interface RedeemItem {
   fulfillment?: string
   perUserLimit?: number
 }
+// 审计日志一行（P4-R1，§7.3）：old/new 为已脱敏 JSON 摘要串（绝不含码/密钥），查看侧原样展示不泄敏感值
+interface AuditRow {
+  id: number
+  actorType: string
+  actorId: number | null
+  actorLabel: string
+  action: string
+  target: string
+  oldValue: string | null
+  newValue: string | null
+  createdAt: number
+}
+interface CdkStats {
+  available: number
+  issued: number
+  void: number
+}
 
 const KINDS = [
   { v: 'timed_quota', t: '限时额度' },
@@ -42,6 +59,8 @@ const field =
 export default function AdminPanel() {
   const [rules, setRules] = useState<PointRule[]>([])
   const [items, setItems] = useState<RedeemItem[]>([])
+  const [quota, setQuota] = useState('') // LDC 每日额度（受控输入，字符串）
+  const [audit, setAudit] = useState<AuditRow[]>([])
   const [msg, setMsg] = useState('')
 
   const load = useCallback(async () => {
@@ -49,13 +68,46 @@ export default function AdminPanel() {
     setRules(d.pointRules ?? [])
     setItems(d.redeemItems ?? [])
   }, [])
+  const loadQuota = useCallback(async () => {
+    const d = await fetch('/api/admin/ldc-quota', { cache: 'no-store' }).then((r) => r.json())
+    if (d.ok) setQuota(String(d.quota))
+  }, [])
+  const loadAudit = useCallback(async () => {
+    const d = await fetch('/api/admin/audit?limit=50', { cache: 'no-store' }).then((r) => r.json())
+    if (d.ok) setAudit(d.audit ?? [])
+  }, [])
   useEffect(() => {
     load()
-  }, [load])
+    loadQuota()
+    loadAudit()
+  }, [load, loadQuota, loadAudit])
 
   const flash = (t: string) => {
     setMsg(t)
     setTimeout(() => setMsg(''), 1500)
+  }
+
+  async function saveQuota() {
+    if (quota.trim() === '') {
+      flash('额度须为非负整数')
+      return
+    }
+    const n = Number(quota)
+    if (!Number.isSafeInteger(n) || n < 0) {
+      flash('额度须为非负整数')
+      return
+    }
+    const res = await fetch('/api/admin/ldc-quota', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ quota: n }),
+    })
+    const d = await res.json()
+    if (res.ok) {
+      setQuota(String(d.quota))
+      flash('已保存')
+      loadAudit()
+    } else flash(d.error || '失败')
   }
 
   async function saveRule(r: Partial<PointRule>) {
@@ -143,8 +195,182 @@ export default function AdminPanel() {
             <ItemRow onSave={saveItem} isNew />
           </div>
         </section>
+
+        {/* CDK 库存导入（P4-R1）：选项 + 贴码 + 面额 → 导入；只回计数/库存，绝不回显已导入的码 */}
+        <section className="mt-8 rounded-2xl border border-white/10 bg-white/[0.02] p-5">
+          <h2 className="mb-1 font-bold text-white">CDK 库存导入</h2>
+          <p className="mb-4 text-xs text-neutral-500">
+            给「CDK 发码」履约的兑换项预导入码（一行一码 / 逗号 / 空白分隔，跨批自动去重）。
+            <span className="text-amber-300/80">LDC 商品必填正整数面额（一批同面额）。</span>
+            安全起见，导入后只显示计数与库存，<b>不回显任何码</b>。
+          </p>
+          <CdkImport items={items} onDone={loadAudit} flash={flash} />
+        </section>
+
+        {/* LDC 每日额度（P4-R1）：读改 app_config['ldc_daily_quota']，缺省 2000 */}
+        <section className="mt-8 rounded-2xl border border-white/10 bg-white/[0.02] p-5">
+          <h2 className="mb-1 font-bold text-white">LDC 每日额度</h2>
+          <p className="mb-4 text-xs text-neutral-500">
+            当日已发 LDC 面额之和的上限（按服务器本地自然日重置）。0＝当日停发。非负整数。
+          </p>
+          <div className="flex items-center gap-2">
+            <input
+              className={field + ' w-40'}
+              type="number"
+              min={0}
+              value={quota}
+              onChange={(e) => setQuota(e.target.value)}
+              placeholder="2000"
+            />
+            <button
+              onClick={saveQuota}
+              className="rounded-lg bg-[var(--brand)]/20 px-3 py-1.5 text-xs font-medium text-[var(--brand-bright)] hover:bg-[var(--brand)]/30"
+            >
+              保存
+            </button>
+          </div>
+        </section>
+
+        {/* 审计日志（P4-R1，§7.3）：只读倒序。old/new 为脱敏摘要，查看不泄敏感值 */}
+        <section className="mt-8 rounded-2xl border border-white/10 bg-white/[0.02] p-5">
+          <div className="mb-1 flex items-center justify-between">
+            <h2 className="font-bold text-white">审计日志</h2>
+            <button
+              onClick={loadAudit}
+              className="rounded-lg border border-white/10 bg-white/5 px-2.5 py-1 text-xs hover:bg-white/10"
+            >
+              刷新
+            </button>
+          </div>
+          <p className="mb-4 text-xs text-neutral-500">
+            配置写操作留痕（操作人 / 时间 / 动作 / 目标 / 旧→新）。最新 50 条，倒序。
+          </p>
+          <div className="space-y-1.5">
+            <div className="grid grid-cols-[130px_130px_1.2fr_1.4fr_2fr] gap-2 text-[11px] text-neutral-500">
+              <span>时间</span><span>操作人</span><span>动作</span><span>目标</span><span>旧 → 新</span>
+            </div>
+            {audit.length === 0 && <p className="py-2 text-xs text-neutral-600">暂无留痕</p>}
+            {audit.map((a) => (
+              <div
+                key={a.id}
+                className="grid grid-cols-[130px_130px_1.2fr_1.4fr_2fr] items-start gap-2 border-t border-white/5 py-1.5 text-[11px] text-neutral-300"
+              >
+                <span className="text-neutral-500">{new Date(a.createdAt).toLocaleString('zh-CN')}</span>
+                <span title={a.actorType}>
+                  {a.actorLabel}
+                  {a.actorId != null && <span className="text-neutral-500"> #{a.actorId}</span>}
+                </span>
+                <span className="font-mono text-emerald-300/80">{a.action}</span>
+                <span className="break-all text-neutral-400">{a.target}</span>
+                <span className="break-all text-neutral-400">
+                  <span className="text-rose-300/70">{a.oldValue ?? '—'}</span>
+                  <span className="text-neutral-600"> → </span>
+                  <span className="text-emerald-300/70">{a.newValue ?? '—'}</span>
+                </span>
+              </div>
+            ))}
+          </div>
+        </section>
       </div>
     </main>
+  )
+}
+
+// CDK 库存导入（P4-R1）：选兑换项 + 贴码 + 面额 → POST /api/admin/cdk。选项变更即拉库存概览（GET）。
+// ⚠️ 全程绝不接收/展示码本身（§8）：请求发出的是码文本，响应只回 { imported, skipped, available } 计数。
+function CdkImport({
+  items,
+  onDone,
+  flash,
+}: {
+  items: RedeemItem[]
+  onDone: () => void
+  flash: (t: string) => void
+}) {
+  const [itemId, setItemId] = useState(0)
+  const [codes, setCodes] = useState('')
+  const [faceValue, setFaceValue] = useState('')
+  const [stats, setStats] = useState<CdkStats | null>(null)
+
+  const selected = items.find((i) => i.id === itemId)
+  const isLdc = selected?.kind === 'ldc'
+
+  const loadStats = useCallback(async (id: number) => {
+    const d = await fetch('/api/admin/cdk?itemId=' + id, { cache: 'no-store' }).then((r) => r.json())
+    setStats(d.ok ? d.stats : null)
+  }, [])
+  useEffect(() => {
+    if (itemId > 0) loadStats(itemId)
+    else setStats(null)
+  }, [itemId, loadStats])
+
+  async function doImport() {
+    if (itemId <= 0) {
+      flash('请选择兑换项')
+      return
+    }
+    if (codes.trim() === '') {
+      flash('请粘贴要导入的码')
+      return
+    }
+    const body: { itemId: number; codes: string; faceValue?: number } = { itemId, codes }
+    // LDC 商品必带正整数面额；非 LDC 若填了也一并传（API 会忽略）。空则不带（交 API 校验/落 null）。
+    if (faceValue.trim() !== '') body.faceValue = Number(faceValue)
+    const res = await fetch('/api/admin/cdk', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+    const d = await res.json()
+    if (res.ok) {
+      flash(`导入 ${d.imported}、跳过 ${d.skipped}，当前可用 ${d.available}`)
+      setCodes('')
+      loadStats(itemId)
+      onDone()
+    } else flash(d.error || '导入失败')
+  }
+
+  return (
+    <div className="space-y-3">
+      <div className="flex flex-wrap items-center gap-2">
+        <select className={field} value={itemId} onChange={(e) => setItemId(Number(e.target.value))}>
+          <option value={0}>选择兑换项…</option>
+          {items.map((i) => (
+            <option key={i.id} value={i.id}>
+              #{i.id} {i.name}
+              {i.kind === 'ldc' ? '（LDC）' : ''}
+              {i.fulfillment === 'cdk' ? '' : '（非发码项）'}
+            </option>
+          ))}
+        </select>
+        <input
+          className={field + ' w-32'}
+          type="number"
+          min={1}
+          value={faceValue}
+          onChange={(e) => setFaceValue(e.target.value)}
+          placeholder={isLdc ? '面额*（正整数）' : '面额（LDC 用）'}
+        />
+        <button
+          onClick={doImport}
+          className="rounded-lg bg-[var(--brand)]/20 px-3 py-1.5 text-xs font-medium text-[var(--brand-bright)] hover:bg-[var(--brand)]/30"
+        >
+          导入
+        </button>
+        {stats && (
+          <span className="text-xs text-neutral-500">
+            库存：可用 <b className="text-emerald-300">{stats.available}</b> / 已发 {stats.issued} / 作废{' '}
+            {stats.void}
+          </span>
+        )}
+      </div>
+      <textarea
+        className={field + ' h-28 w-full font-mono'}
+        value={codes}
+        onChange={(e) => setCodes(e.target.value)}
+        placeholder="一行一码，或用逗号 / 空格分隔"
+      />
+    </div>
   )
 }
 

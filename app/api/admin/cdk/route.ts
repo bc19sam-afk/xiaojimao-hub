@@ -1,7 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { isAdmin } from '@/lib/admin'
+import { getAdminActor } from '@/lib/admin'
 import { db } from '@/lib/db'
 import { parseCdkCodes } from '@/lib/redeem'
+import { auditCdkImport } from '@/lib/audit'
 
 // CDK 批量导入（P3-R1，§5.3；P3-R2 加批级面额）：后台预导入码到某兑换项。完整导入 UI 留 P4，本轮为最小 API。
 //   body: { itemId, codes: string | string[], faceValue? }  —— codes 支持「一行一码 / 逗号 / 空白分隔」文本或数组。
@@ -11,7 +12,8 @@ import { parseCdkCodes } from '@/lib/redeem'
 //     非 LDC 商品的面额一律忽略、恒落 null（不受额度约束，保持 R1 行为）。
 //   ⚠️ 安全（§8）：绝不把 code / 面额值写进响应之外的日志；只回 { imported, skipped, available } 计数。
 export async function POST(req: NextRequest) {
-  if (!(await isAdmin())) return NextResponse.json({ error: '无权限' }, { status: 403 })
+  const actor = await getAdminActor()
+  if (!actor) return NextResponse.json({ error: '无权限' }, { status: 403 })
   const b = await req.json().catch(() => ({}))
   const itemId = Number(b.itemId)
   if (!itemId) return NextResponse.json({ error: '缺 itemId' }, { status: 400 })
@@ -32,13 +34,21 @@ export async function POST(req: NextRequest) {
     faceValue = fv
   }
 
+  const availableBefore = db.availableCdkCount(itemId)
   const { imported, skipped } = db.importCdkCodes(itemId, codes, faceValue)
-  return NextResponse.json({ ok: true, imported, skipped, available: db.availableCdkCount(itemId) })
+  const availableAfter = db.availableCdkCount(itemId)
+  // 审计（§8 脱敏铁律）：只记「导入 N / 跳过 M（面额 F）+ 库存 before→after」计数摘要——auditCdkImport 签名
+  // 压根不收 codes，结构上不可能把码写进 audit_log。
+  db.recordAudit(
+    actor,
+    auditCdkImport({ itemId, itemName: item.name, faceValue, imported, skipped, availableBefore, availableAfter }),
+  )
+  return NextResponse.json({ ok: true, imported, skipped, available: availableAfter })
 }
 
 // 某项库存概览（导入后回看，不返回任何 code 值）
 export async function GET(req: NextRequest) {
-  if (!(await isAdmin())) return NextResponse.json({ error: '无权限' }, { status: 403 })
+  if (!(await getAdminActor())) return NextResponse.json({ error: '无权限' }, { status: 403 })
   const itemId = Number(new URL(req.url).searchParams.get('itemId'))
   if (!itemId) return NextResponse.json({ error: '缺 itemId' }, { status: 400 })
   return NextResponse.json({ ok: true, stats: db.cdkStatsFor(itemId) })

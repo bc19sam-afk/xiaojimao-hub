@@ -459,6 +459,35 @@ export const migrations: Migration[] = [
       db.exec("ALTER TABLE redeem_items ADD COLUMN fulfillment TEXT NOT NULL DEFAULT 'placeholder'")
     },
   },
+  {
+    version: 12,
+    // migration 012（P4-R1）：审计留痕数据地基（§7.3）。纯新增、向后兼容——仿 003/008/009/011 只 CREATE
+    // 新表，旧代码不用此表也能跑。装「改折算规则/结算参数/优先级/商品/库存/CDK/LDC额度 → 记操作人/时间/旧值/新值」。
+    //   actor_type  操作人入口：'password'（管理密码会话，匿名通用标识）/ 'linuxdo'（linux.do 管理员，记真实身份）
+    //   actor_id    linux.do 数字 id（password 会话为 null）
+    //   actor_label 展示名：'管理员(密码会话)' / linux.do 用户名
+    //   action      动作类型（如 'point_rule.upsert' / 'cdk.import' / 'ldc_quota.set'）
+    //   target      作用对象人话标识（如 'codex/plus' / 'item#12(名称)'）
+    //   old_value / new_value  旧/新值 JSON 摘要（可空：无旧值/无新值为 null）。
+    // ⚠️ 脱敏铁律（§8）：old/new 绝不记敏感原文——CDK 导入只记「导入 N 个码（面额 F）」计数摘要、绝不记码本身；
+    //   RT/管理密钥一律不入表。索引按 created_at 便于「审计查看」倒序分页。
+    up(db) {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS audit_log (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          actor_type  TEXT NOT NULL,
+          actor_id    INTEGER,
+          actor_label TEXT NOT NULL,
+          action      TEXT NOT NULL,
+          target      TEXT NOT NULL DEFAULT '',
+          old_value   TEXT,
+          new_value   TEXT,
+          created_at  INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_log(created_at);
+      `)
+    },
+  },
 ]
 
 // 代码所知的最新 schema 版本（从 migrations 数组派生，勿手写）
