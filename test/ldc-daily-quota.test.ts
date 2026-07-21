@@ -209,7 +209,32 @@ test('非 LDC CDK 不受额度约束：quota=0 仍正常发码', () => {
   assert.equal(db.availableCdkCount(it.id), 0)
 })
 
-// ⑧ 额度取值钳非负整数：脏值/负数经 set 归零、取整
+// ⑧ ldcExhaustedToday（store「今日已抢完」布尔驱动）：额度够发下一张→false、不够→true；
+//    无可用码→false（普通「已兑罄」另一路）；非 LDC / 无面额码→false（不受额度约束）
+test('ldcExhaustedToday：额度不够发下一张→true，够/无码/无面额→false', () => {
+  db.setLdcQuota(100)
+  const uid = 9007
+  const it = createItem({ name: 'ldc-exhaust', cost: 1, kind: 'ldc', fulfillment: 'cdk' })
+  db.importCdkCodes(it.id, ['X1', 'X2'], 60) // 面额 60
+  const now = dayNoon(9)
+  // 未发码：issuedToday 0 + 下一张 60 = 60 ≤ 100 → 未抢完
+  assert.equal(db.ldcExhaustedToday(it.id, now), false)
+  grant(uid, 100)
+  const r = redeemMod.redeem(uid, it.id, { token: 'x1', now })
+  assert.ok(r.ok)
+  // 已发 60，下一张 60 → 120 > 100 → 今日已抢完
+  assert.equal(db.ldcExhaustedToday(it.id, now), true)
+  // 无可用码：普通售罄，非「今日已抢完」（false）
+  const nocode = createItem({ name: 'ldc-nocode', cost: 1, kind: 'ldc', fulfillment: 'cdk' })
+  assert.equal(db.ldcExhaustedToday(nocode.id, now), false)
+  // 无面额码（非 LDC 导入）：不受额度约束，即便 quota=0 也 false
+  db.setLdcQuota(0)
+  const plain = createItem({ name: 'plain-exhaust', cost: 1, kind: 'timed_quota', fulfillment: 'cdk' })
+  db.importCdkCodes(plain.id, ['Y1'])
+  assert.equal(db.ldcExhaustedToday(plain.id, now), false)
+})
+
+// ⑨ 额度取值钳非负整数：脏值/负数经 set 归零、取整
 test('额度取值：setLdcQuota 钳非负整数', () => {
   db.setLdcQuota(-5)
   assert.equal(db.getLdcQuota(), 0, '负数钳为 0')
