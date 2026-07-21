@@ -19,14 +19,22 @@ export async function GET() {
     text: describeLedgerEntry(e, (cid) => acctById.get(cid)),
   }))
   // cdk 类项按可用码数标 soldOut（§5.4 售罄提示）——只外发布尔，不泄库存数/码值（§8）。
-  const items = db.listRedeemItems(true).map((it) => ({
-    id: it.id,
-    name: it.name,
-    description: it.description,
-    cost: it.cost,
-    kind: it.kind,
-    soldOut: it.fulfillment === 'cdk' && db.availableCdkCount(it.id) === 0,
-  }))
+  // LDC 项（kind='ldc'）另标 soldOutToday「今日已抢完」（P3-R2 §4）：尚有可用码但今日 LDC 额度已不够发下一张码。
+  // 只外发布尔、不泄剩余额度精确值（§8）。soldOut 优先（永久售罄）；两者皆 false 才可兑。
+  const now = Date.now()
+  const items = db.listRedeemItems(true).map((it) => {
+    const isCdk = it.fulfillment === 'cdk'
+    const soldOut = isCdk && db.availableCdkCount(it.id) === 0
+    return {
+      id: it.id,
+      name: it.name,
+      description: it.description,
+      cost: it.cost,
+      kind: it.kind,
+      soldOut,
+      soldOutToday: isCdk && it.kind === 'ldc' && !soldOut && db.ldcExhaustedToday(it.id, now),
+    }
+  })
   return NextResponse.json({
     balance: db.balance(user.id),
     items,

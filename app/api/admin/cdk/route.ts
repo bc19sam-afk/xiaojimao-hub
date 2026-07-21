@@ -3,10 +3,13 @@ import { isAdmin } from '@/lib/admin'
 import { db } from '@/lib/db'
 import { parseCdkCodes } from '@/lib/redeem'
 
-// CDK 批量导入（P3-R1，§5.3）：后台预导入码到某兑换项。完整导入 UI 留 P4，本轮为最小 API。
-//   body: { itemId, codes: string | string[] }  —— codes 支持「一行一码 / 逗号 / 空白分隔」文本或数组。
+// CDK 批量导入（P3-R1，§5.3；P3-R2 加批级面额）：后台预导入码到某兑换项。完整导入 UI 留 P4，本轮为最小 API。
+//   body: { itemId, codes: string | string[], faceValue? }  —— codes 支持「一行一码 / 逗号 / 空白分隔」文本或数组。
 //   去重：parseCdkCodes 批内去重 + db.importCdkCodes 按 (item_id, code) 唯一键跨批去重。
-//   ⚠️ 安全（§8）：绝不把 code 写进响应/日志；只回 { imported, skipped, available } 计数。
+//   面额策略（P3-R2 §1）：LDC 商品（kind='ldc'）导入**必须带正整数面额 faceValue**（一批同面额，不同面额分批导），
+//     缺失/非正整数一律 400 拒绝——否则码无面额会绕过每日额度约束（ldcIssuedToday 只统计带面额的码）；
+//     非 LDC 商品的面额一律忽略、恒落 null（不受额度约束，保持 R1 行为）。
+//   ⚠️ 安全（§8）：绝不把 code / 面额值写进响应之外的日志；只回 { imported, skipped, available } 计数。
 export async function POST(req: NextRequest) {
   if (!(await isAdmin())) return NextResponse.json({ error: '无权限' }, { status: 403 })
   const b = await req.json().catch(() => ({}))
@@ -18,7 +21,16 @@ export async function POST(req: NextRequest) {
   const codes = parseCdkCodes(b.codes ?? [])
   if (codes.length === 0) return NextResponse.json({ error: '无有效码' }, { status: 400 })
 
-  const { imported, skipped } = db.importCdkCodes(itemId, codes)
+  // LDC 商品必带正整数面额；非 LDC 恒 null（忽略任何传入面额）。
+  let faceValue: number | null = null
+  if (item.kind === 'ldc') {
+    const fv = Math.floor(Number(b.faceValue))
+    if (!Number.isFinite(fv) || fv <= 0)
+      return NextResponse.json({ error: 'LDC 商品导入须提供正整数面额 faceValue' }, { status: 400 })
+    faceValue = fv
+  }
+
+  const { imported, skipped } = db.importCdkCodes(itemId, codes, faceValue)
   return NextResponse.json({ ok: true, imported, skipped, available: db.availableCdkCount(itemId) })
 }
 

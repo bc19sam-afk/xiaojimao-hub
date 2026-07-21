@@ -10,6 +10,7 @@ interface Item {
   cost: number
   kind: string
   soldOut?: boolean
+  soldOutToday?: boolean // LDC 每日额度用尽（P3-R2）：尚有码但今日额度不够发下一张
 }
 interface Redemption {
   id: string
@@ -101,7 +102,7 @@ export default function RedeemStore({ refreshKey, onRedeemed }: { refreshKey: nu
         <div className="space-y-2">
           {items.map((it) => {
             const affordable = balance >= it.cost
-            const canBuy = affordable && !it.soldOut
+            const canBuy = affordable && !it.soldOut && !it.soldOutToday
             return (
               <div
                 key={it.id}
@@ -122,7 +123,13 @@ export default function RedeemStore({ refreshKey, onRedeemed }: { refreshKey: nu
                       : 'cursor-not-allowed bg-white/5 text-neutral-500'
                   } disabled:opacity-60`}
                 >
-                  {it.soldOut ? '已兑罄' : busy === it.id ? '兑换中…' : `${it.cost} 分`}
+                  {it.soldOut
+                    ? '已兑罄'
+                    : it.soldOutToday
+                      ? '今日已抢完'
+                      : busy === it.id
+                        ? '兑换中…'
+                        : `${it.cost} 分`}
                 </button>
               </div>
             )
