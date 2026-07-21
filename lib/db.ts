@@ -1196,7 +1196,10 @@ export const db = {
   // 按 id DESC（自增＝插入序＝时间序，比 created_at 更稳、无同毫秒并列歧义）。
   listAudit(limit = 50, offset = 0): AuditRow[] {
     const lim = Math.min(200, Math.max(1, Math.floor(Number(limit) || 50)))
-    const off = Math.max(0, Math.floor(Number(offset) || 0))
+    // offset 归一（codex 复审 P3）：非有限值（尤其 +Infinity——Number('Infinity')=Infinity 是真值、会绕过
+    // `||0`，Math.floor 后原样穿到 node:sqlite 的 OFFSET 绑定抛错＝脏输入变 500）一律回落 0。limit 侧 Math.min(200,…) 天然封顶不受影响。
+    const nOff = Number(offset)
+    const off = Number.isFinite(nOff) ? Math.max(0, Math.floor(nOff)) : 0
     return conn
       .prepare(
         `SELECT id, actor_type AS actorType, actor_id AS actorId, actor_label AS actorLabel,
@@ -1215,7 +1218,10 @@ export const db = {
   // ⚠️ 只 SELECT 展示列——不含 email / reward_code（管理列表无需，最小暴露）。
   listContributionsAdmin(limit = 50, offset = 0): AdminContributionRow[] {
     const lim = Math.min(200, Math.max(1, Math.floor(Number(limit) || 50)))
-    const off = Math.max(0, Math.floor(Number(offset) || 0))
+    // offset 归一（codex 复审 P3）：非有限值（尤其 +Infinity——Number('Infinity')=Infinity 是真值、会绕过
+    // `||0`，Math.floor 后原样穿到 node:sqlite 的 OFFSET 绑定抛错＝脏输入变 500）一律回落 0。limit 侧 Math.min(200,…) 天然封顶不受影响。
+    const nOff = Number(offset)
+    const off = Number.isFinite(nOff) ? Math.max(0, Math.floor(nOff)) : 0
     const rows = conn
       .prepare(
         `SELECT id, linuxdo_id AS linuxdoId, username, provider, plan, account_id AS accountId,
@@ -1230,7 +1236,10 @@ export const db = {
   // 纯结算行理论都有对应号（join 取得到），取不到则 username 空串、linuxdoId null 兜底。
   listSettlementsAdmin(limit = 50, offset = 0): AdminSettlementRow[] {
     const lim = Math.min(200, Math.max(1, Math.floor(Number(limit) || 50)))
-    const off = Math.max(0, Math.floor(Number(offset) || 0))
+    // offset 归一（codex 复审 P3）：非有限值（尤其 +Infinity——Number('Infinity')=Infinity 是真值、会绕过
+    // `||0`，Math.floor 后原样穿到 node:sqlite 的 OFFSET 绑定抛错＝脏输入变 500）一律回落 0。limit 侧 Math.min(200,…) 天然封顶不受影响。
+    const nOff = Number(offset)
+    const off = Number.isFinite(nOff) ? Math.max(0, Math.floor(nOff)) : 0
     return conn
       .prepare(
         `SELECT s.id, s.contribution_id AS contributionId, c.linuxdo_id AS linuxdoId,
@@ -1249,7 +1258,10 @@ export const db = {
   //   管理侧全局兑换记录只回状态/商品/花费/时间/归属人。
   listRedemptionsAdmin(limit = 50, offset = 0): AdminRedemptionRow[] {
     const lim = Math.min(200, Math.max(1, Math.floor(Number(limit) || 50)))
-    const off = Math.max(0, Math.floor(Number(offset) || 0))
+    // offset 归一（codex 复审 P3）：非有限值（尤其 +Infinity——Number('Infinity')=Infinity 是真值、会绕过
+    // `||0`，Math.floor 后原样穿到 node:sqlite 的 OFFSET 绑定抛错＝脏输入变 500）一律回落 0。limit 侧 Math.min(200,…) 天然封顶不受影响。
+    const nOff = Number(offset)
+    const off = Number.isFinite(nOff) ? Math.max(0, Math.floor(nOff)) : 0
     return conn
       .prepare(
         `SELECT r.id, r.linuxdo_id AS linuxdoId,
@@ -1266,9 +1278,28 @@ export const db = {
   // §7.4「不得绕过同号同日只结算一次」——重试不触发结算、终止不删已有结算/账本。CAS from=['needs_review']
   // 亦防并发/状态已变时误操作（对非 needs_review 号调用返 false 不改）。
 
-  // 重试：转回首检队列，processPending 下轮重新首检（残缺号可能仍拿不到 ID、reauth 号若已重授权则可过）。
+  // 重试：按 pooled_at 分叉去向（codex 复审 P1）。needs_review 有两类，不能一律回首检：
+  //   ① 从没入池（首检 reauth / 残缺号，pooled_at IS NULL）→ 回首检队列 'submitted'，processPending 下轮
+  //      重新首检（残缺号可能仍拿不到 ID、reauth 号若已重授权则可过）。此类若 cpa reject，processPending
+  //      deleteContribution 删行释放唯一键本就是 §2.4 设计（从没入池的号允许修好重交），安全。
+  //   ② 入过池（巡检 checkPooledHealth 把 pooled→needs_review，pooled_at 非空）→ **直接回池 'pooled'**，绝不回首检：
+  //      a) 回首检 → processPending 入池经 transitionToPool 用新时间**覆写 pooled_at**（:406 单条 UPDATE 无
+  //         COALESCE）→ settleDailyUsage 下界 `u.date <= dayStr(pooledAt)` 后移 → 重试日之前未结的历史欠薪
+  //         **永久跳过**（migration 010「入过池补结欠薪」被冲垮）。
+  //      b) 回首检若 cpa reject → processPending deleteContribution **删行释放唯一键** → 违反 §2.4「成功入池的
+  //         号一辈子只交一次、失效也不重交」。
+  //      直接 transition→'pooled'：pooled_at 原值不动（transition 只改 verify_status）＝结算下界不移、欠薪照补；
+  //      不进首检管道＝不可能触发删行；号若实际仍坏，checkPooledHealth 下轮巡检再转出去（pooled 态常规守护者，
+  //      语义自洽）。
+  // 读后 CAS 无竞态：pooled_at 只由 transitionToPool（from=submitted/first_check）写，本行处 needs_review 期间
+  //   不可能被写；verify_status 由下面 transition 的 CAS 自身守（仅当仍 needs_review 才转）。返回是否真转。
   retryReview(id: string): boolean {
-    return db.transition(id, ['needs_review'], 'submitted')
+    const r = conn.prepare('SELECT pooled_at FROM contributions WHERE id=?').get(id) as unknown as
+      | { pooled_at: number | null }
+      | undefined
+    if (!r) return false
+    const to = r.pooled_at != null ? 'pooled' : 'submitted'
+    return db.transition(id, ['needs_review'], to)
   },
   // 终止：标记放弃、退出人工队列、保留行与审计痕迹。选 stopped 不删行：needs_review 从没入池
   // （pooled_at 为 null）→ 转 stopped 后不进 eligibleForSettlement（该集按 pooled_at IS NOT NULL 过滤、

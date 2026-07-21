@@ -4,6 +4,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import type { Contribution } from '../lib/db.ts'
+import type { DailyUsage } from '../lib/cpa.ts'
 
 // ============================================================================
 // P4-R3 数据查看 + 人工复核处理（§6.146 / §7.4）：
@@ -17,6 +18,8 @@ import type { Contribution } from '../lib/db.ts'
 
 let db: typeof import('../lib/db.ts').db
 let audit: typeof import('../lib/audit.ts')
+let settle: typeof import('../lib/settle.ts')
+let cpa: typeof import('../lib/cpa.ts').cpa
 let tmpDir: string
 
 before(async () => {
@@ -26,11 +29,24 @@ before(async () => {
   process.env.MOCK_CPA_PATH = path.join(tmpDir, 'mock-cpa.json')
   ;({ db } = await import('../lib/db.ts'))
   audit = await import('../lib/audit.ts')
+  settle = await import('../lib/settle.ts')
+  ;({ cpa } = await import('../lib/cpa.ts'))
 })
 
 after(() => {
   fs.rmSync(tmpDir, { recursive: true, force: true })
 })
+
+// 桩掉 cpa.getDailyUsage（同一模块单例，settle.ts 看到同一对象）返回指定用量，跑完必还原——仿 config-p4r2
+async function withUsage<T>(usage: DailyUsage[], fn: () => Promise<T>): Promise<T> {
+  const orig = cpa.getDailyUsage
+  cpa.getDailyUsage = async () => usage
+  try {
+    return await fn()
+  } finally {
+    cpa.getDailyUsage = orig
+  }
+}
 
 // 造号并落库。id/accountId 默认唯一（seq 递增），可被 over 覆盖；email/rewardCode 带敏感值供脱敏测试。
 let seq = 0
@@ -173,9 +189,11 @@ test('D1 retryReview：needs_review→submitted + 幂等不碰结算/账本', ()
   const b0 = db.balance(uid)
   const l0 = db.ledgerFor(uid).length
   assert.equal(b0, 4)
-  // 动作：真转
+  // 动作：真转。此号从没入池（pooled_at null＝category①）→ 回首检 'submitted'
   assert.equal(db.retryReview(c.id), true, '真转')
-  assert.equal(db.all().find((x) => x.id === c.id)!.verifyStatus, 'submitted', '→ submitted')
+  const after = db.all().find((x) => x.id === c.id)!
+  assert.equal(after.verifyStatus, 'submitted', '从没入池 → submitted')
+  assert.equal(after.pooledAt, undefined, '从没入池：pooled_at 仍 null（category①）')
   // 🔴 幂等铁律：settlements / balance / ledger 前后不变
   assert.deepEqual(db.settlementsFor(c.id).map((s) => [s.date, s.points]), s0, 'settlements 不变')
   assert.equal(db.balance(uid), b0, 'balance 不变')
@@ -229,30 +247,92 @@ test('F1 钳制：负 limit→1、负 offset→0、超大 limit→≤200', () =>
 
 // ---------------------------- E：审计 ----------------------------
 
-// E1 auditContributionReview 构造器：retry/terminate 的 action/target/old/new
-test('E1 auditContributionReview：action/target/old/new', () => {
+// E1 auditContributionReview 构造器：toStatus 决定 new（去向真实）；retry→submitted/pooled、terminate→stopped
+test('E1 auditContributionReview：toStatus 决定 new（三去向）', () => {
   const c = { provider: 'codex', accountId: 'acct_abc' }
-  const retry = audit.auditContributionReview('contribution.retry', c)
-  assert.equal(retry.action, 'contribution.retry')
-  assert.equal(retry.target, 'codex/acct_abc', 'target=provider/accountId')
-  assert.deepEqual(retry.old, { verifyStatus: 'needs_review' })
-  assert.deepEqual(retry.new, { verifyStatus: 'submitted' })
-  const term = audit.auditContributionReview('contribution.terminate', c)
+  // 从没入池 retry → submitted
+  const rSub = audit.auditContributionReview('contribution.retry', c, 'submitted')
+  assert.equal(rSub.action, 'contribution.retry')
+  assert.equal(rSub.target, 'codex/acct_abc', 'target=provider/accountId')
+  assert.deepEqual(rSub.old, { verifyStatus: 'needs_review' })
+  assert.deepEqual(rSub.new, { verifyStatus: 'submitted' })
+  // 入过池 retry → pooled（去向必与真实一致，codex 复审 P1）
+  const rPool = audit.auditContributionReview('contribution.retry', c, 'pooled')
+  assert.deepEqual(rPool.new, { verifyStatus: 'pooled' }, '入过池 retry 审计 new=pooled')
+  // terminate → stopped
+  const term = audit.auditContributionReview('contribution.terminate', c, 'stopped')
   assert.equal(term.action, 'contribution.terminate')
   assert.equal(term.target, 'codex/acct_abc')
   assert.deepEqual(term.old, { verifyStatus: 'needs_review' })
   assert.deepEqual(term.new, { verifyStatus: 'stopped' })
 })
 
-// E2 端到端：recordAudit(auditContributionReview) → listAudit 读回（留痕一条，old/new 正确）
-test('E2 审计留痕端到端：contribution.retry recordAudit → listAudit', () => {
+// E2 端到端（category①）：从没入池 retry→submitted，recordAudit → listAudit 读回 new=submitted
+test('E2 审计留痕端到端：从没入池 retry → listAudit new=submitted', () => {
   const actor = { type: 'linuxdo', id: 5, label: 'admin5' }
   const c = mkContribution({ accountId: 'AUD', provider: 'grok', verifyStatus: 'needs_review' })
-  db.retryReview(c.id)
-  db.recordAudit(actor, audit.auditContributionReview('contribution.retry', c))
+  assert.equal(db.retryReview(c.id), true)
+  const toStatus = c.pooledAt != null ? 'pooled' : 'submitted' // 路由同款口径：pooled_at null → submitted
+  db.recordAudit(actor, audit.auditContributionReview('contribution.retry', c, toStatus))
   const row = db.listAudit(50, 0).find((r) => r.action === 'contribution.retry' && r.target === `grok/${c.accountId}`)
   assert.ok(row, '应有 contribution.retry 留痕')
   assert.equal(row!.actorId, 5)
   assert.deepEqual(JSON.parse(row!.oldValue as string), { verifyStatus: 'needs_review' })
   assert.deepEqual(JSON.parse(row!.newValue as string), { verifyStatus: 'submitted' })
+})
+
+// ---------------------------- G：codex 复审 3 条回归 ----------------------------
+
+// G1 入过池 retry 直接回池（pooled_at 不动）+ 历史欠薪照补（codex 复审 P1，problem a）
+test('G1 入过池 retry → pooled（pooled_at 不动）+ 欠薪照补', async () => {
+  const uid = 7600
+  const accountId = 'REPOOL'
+  const poolDay = new Date(2026, 5, 10, 12).getTime() // 2026-06-10 12:00 本地＝原入池日
+  const c = mkContribution({ id: 'nr-repool', linuxdoId: uid, accountId, provider: 'grok', plan: 'super', verifyStatus: 'pooled', createdAt: poolDay })
+  db.update(c.id, { pooledAt: poolDay })
+  // 模拟巡检 checkPooledHealth reauth：pooled → needs_review（pooled_at 仍非空＝category②）
+  assert.equal(db.transition(c.id, ['pooled'], 'needs_review'), true)
+  assert.equal(db.all().find((x) => x.id === c.id)!.pooledAt, poolDay, '转前 pooled_at＝原入池日')
+  // retry：入过池 → 直接回池，绝不 submitted；pooled_at 原值不动
+  assert.equal(db.retryReview(c.id), true, '真转')
+  const after = db.all().find((x) => x.id === c.id)!
+  assert.equal(after.verifyStatus, 'pooled', '入过池 → 直接回池（非 submitted，不进首检管道＝不删行/不覆写 pooled_at）')
+  assert.equal(after.pooledAt, poolDay, 'pooled_at 原值不动（结算下界不移、欠薪不丢）')
+  // 欠薪照补：一笔「原入池日之后、今天之前」的用量 → settle 该历史日结上（bug 下会被后移的 pooled_at 永久跳过）
+  db.upsertUsageRate({ provider: 'grok', plan: 'super', pointsPerCall: 2, enabled: true, label: '' })
+  const usage: DailyUsage[] = [{ accountId, provider: 'grok', date: '2026-06-12', count: 4 }]
+  const settleNow = new Date(2026, 5, 15, 12).getTime() // 2026-06-15 12:00（过 grace 窗）
+  await withUsage(usage, () => settle.settleDailyUsage(settleNow, { force: true }))
+  const s = db.settlementsFor(c.id).find((x) => x.date === '2026-06-12')
+  assert.ok(s, '入池日之后的历史欠薪日结上了')
+  assert.equal(s!.points, 8, '4 次 × 2 = 8 补发')
+  assert.equal(db.balance(uid), 8, '欠薪发到号主')
+})
+
+// G3 审计去向真实：入过池 retry 的审计 new={verifyStatus:'pooled'}（codex 复审 P1，路由 toStatus 口径）
+test('G3 审计去向：入过池 retry → 审计 new=pooled', () => {
+  const actor = { type: 'linuxdo', id: 6, label: 'admin6' }
+  const poolDay = new Date(2026, 4, 20, 12).getTime()
+  const c = mkContribution({ accountId: 'AUDPOOL', provider: 'codex', plan: 'plus', verifyStatus: 'pooled', createdAt: poolDay })
+  db.update(c.id, { pooledAt: poolDay })
+  db.transition(c.id, ['pooled'], 'needs_review')
+  // 路由同款口径：c 在 CAS 前取，按 pooled_at 定 toStatus
+  const snap = db.all().find((x) => x.id === c.id)!
+  assert.equal(db.retryReview(c.id), true)
+  const toStatus = snap.pooledAt != null ? 'pooled' : 'submitted'
+  db.recordAudit(actor, audit.auditContributionReview('contribution.retry', snap, toStatus))
+  const row = db.listAudit(50, 0).find((r) => r.action === 'contribution.retry' && r.target === 'codex/AUDPOOL')
+  assert.ok(row, '应有留痕')
+  assert.deepEqual(JSON.parse(row!.newValue as string), { verifyStatus: 'pooled' }, '入过池 retry 审计 new=pooled（与真实去向一致）')
+})
+
+// G4 offset=Infinity 不打穿钳制（四查询器含 listAudit 不抛、按 0 处理）（codex 复审 P3）
+test('G4 offset=Infinity 不抛、按 0 处理（四查询器含 listAudit）', () => {
+  // 修前：Number('Infinity')=Infinity 绕过 `||0`、Math.floor(Infinity)=Infinity 穿到 OFFSET 绑定抛错＝500
+  const c = db.listContributionsAdmin(5, Infinity)
+  assert.ok(Array.isArray(c), '贡献：offset=Infinity 不抛')
+  assert.deepEqual(c.map((r) => r.id), db.listContributionsAdmin(5, 0).map((r) => r.id), '按 0 处理＝返回最新页')
+  assert.ok(Array.isArray(db.listSettlementsAdmin(5, Infinity)), '结算：不抛')
+  assert.ok(Array.isArray(db.listRedemptionsAdmin(5, Infinity)), '兑换：不抛')
+  assert.ok(Array.isArray(db.listAudit(5, Infinity)), '审计（R1 同款一并修）：不抛')
 })

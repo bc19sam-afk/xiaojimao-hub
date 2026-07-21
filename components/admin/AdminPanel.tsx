@@ -306,7 +306,8 @@ export default function AdminPanel() {
     flash('已删除')
   }
 
-  // 人工复核处理（P4-R3，§7.4）：重试（→ 首检队列）/ 终止（→ 停用）。成功后刷新队列 + 审计。
+  // 人工复核处理（P4-R3，§7.4）：重试（按是否入过池分叉：未入过→回首检 / 入过→直接回池）/ 终止（→ 停用）。
+  // 成功后刷新队列 + 审计 + **贡献记录表**（codex 复审 P3：否则贡献表仍显示旧 needs_review 直到手动刷新）。
   // 后端 CAS 返回 { ok:false, error:'状态已变' }（HTTP 200）时按失败提示，不改队列。
   async function doReview(id: string, action: 'retry' | 'terminate') {
     const res = await fetch('/api/admin/review', {
@@ -317,8 +318,9 @@ export default function AdminPanel() {
     const d = await res.json()
     if (res.ok && d.ok) {
       setReview(d.review ?? [])
-      flash(action === 'retry' ? '已转回首检' : '已终止')
+      flash(action === 'retry' ? '已重试' : '已终止')
       loadAudit()
+      loadContributions()
     } else flash(d.error || '失败')
   }
 
@@ -541,7 +543,8 @@ export default function AdminPanel() {
             </button>
           </div>
           <p className="mb-4 text-xs text-neutral-500">
-            卡在 <code>needs_review</code> 的号（残缺号 / 首检需重授权）。<b>重试</b>转回首检队列重新首检；
+            卡在 <code>needs_review</code> 的号（残缺号 / 首检或巡检需重授权）。<b>重试</b>按是否入过池分叉：
+            未入过池→转回首检队列重查；已入过池→直接回池、交由巡检复核（不重走首检，保住历史结算与唯一键）。
             <b>终止</b>放弃并停用（保留记录、不影响已有结算）。
           </p>
           <div className="space-y-1.5">
