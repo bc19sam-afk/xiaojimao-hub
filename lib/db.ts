@@ -427,37 +427,54 @@ export const db = {
     return r.changes > 0
   },
 
-  // 排行榜按「已入池号数」排名（v4：granted 态取消，成功首检入池即计数；真正的按累计积分排名待 R2/R3）。
-  leaderboard(limit = 20): { linuxdoId: number; username: string; count: number }[] {
+  // 排行榜按「累计获得积分」排名（§6，P5-R1）：累计获得 = SUM(正 delta)——发分为正（结算 awardPoints）、
+  // 兑换/扣减为负（spendPoints）；花费的负 delta 不进求和 ⇒ 花掉不掉名次。不写死 reason（凡 delta>0 皆算获得，
+  // 兼容未来其它发分来源）。username 取该用户任一贡献号（point_ledger 只有 linuxdo_id）、无贡献号空串兜。
+  // 没获得过分的不上榜（纯扣减用户 points=0 由 HAVING 排除）。全序＝points DESC, 首次入账 MIN(created_at) ASC,
+  // 同刻再按 MIN(id) ASC（point_ledger.id AUTOINCREMENT＝入账序、跨用户严格唯一，故全序无并列、位置确定）。
+  // myRank 用**同一全序**数名次，故榜单位置与底部「当前名次」恒一致（codex xhigh P2）。
+  leaderboard(limit = 20): { linuxdoId: number; username: string; points: number }[] {
     return conn
       .prepare(
-        `SELECT linuxdo_id AS linuxdoId, username, COUNT(*) AS count
-         FROM contributions WHERE verify_status = 'pooled'
-         GROUP BY linuxdo_id ORDER BY count DESC, MIN(created_at) ASC LIMIT ?`,
+        `SELECT l.linuxdo_id AS linuxdoId,
+                COALESCE((SELECT username FROM contributions WHERE linuxdo_id = l.linuxdo_id LIMIT 1), '') AS username,
+                SUM(CASE WHEN l.delta > 0 THEN l.delta ELSE 0 END) AS points
+         FROM point_ledger l
+         GROUP BY l.linuxdo_id
+         HAVING points > 0
+         ORDER BY points DESC, MIN(l.created_at) ASC, MIN(l.id) ASC
+         LIMIT ?`,
       )
-      .all(limit) as unknown as { linuxdoId: number; username: string; count: number }[]
+      .all(limit) as unknown as { linuxdoId: number; username: string; points: number }[]
   },
 
-  // 我的排名与入池数（用于榜单外也能看到自己的名次）
-  myRank(linuxdoId: number): { rank: number; count: number } {
+  // 我的排名与累计获得积分（用于榜单外也能看到自己的名次）。名次＝与 leaderboard **同一全序**（points DESC,
+  // firstAt=MIN(created_at) ASC, firstId=MIN(id) ASC）下排在我前面的人数 +1——故底部「当前名次」与榜单位置恒一致。
+  // 修 codex xhigh P2：旧版只数「累计获得严格多于我的人数」，同分被 tie-break 挤出前 20 者会误标名次 1（榜内同分者
+  // 却隐含占 1..20 位，自相矛盾）。三键与 leaderboard ORDER BY 逐字对应，且 firstId 跨用户唯一 ⇒ 全序无并列。
+  myRank(linuxdoId: number): { rank: number; points: number } {
     const mine = conn
       .prepare(
-        `SELECT COUNT(*) AS count FROM contributions
-         WHERE verify_status = 'pooled' AND linuxdo_id = ?`,
+        `SELECT SUM(CASE WHEN delta > 0 THEN delta ELSE 0 END) AS p,
+                MIN(created_at) AS firstAt, MIN(id) AS firstId
+         FROM point_ledger WHERE linuxdo_id = ?`,
       )
-      .get(linuxdoId) as unknown as { count: number }
-    const count = mine?.count ?? 0
-    if (count === 0) return { rank: 0, count: 0 }
-    // 排名 = 入池数比我多的人数 + 1
+      .get(linuxdoId) as unknown as { p: number | null; firstAt: number | null; firstId: number | null }
+    // SUM 无行时返回 null（无 ledger 行）→ ?? 0；全负 delta 时 CASE 逐行取 0、SUM=0（非 null）。没获得过分不排名。
+    const points = mine?.p ?? 0
+    if (points === 0) return { rank: 0, points: 0 }
+    // 排在我前面的人数（同全序三键）：p 更高，或 p 相同但首次入账更早（firstAt 更小，或同刻 firstId 更小）。
+    // points>0 ⇒ 我有 ledger 行 ⇒ firstAt/firstId 非空。参数依序：myP, myP, myFirstAt, myFirstAt, myFirstId。
     const ahead = conn
       .prepare(
         `SELECT COUNT(*) AS n FROM (
-           SELECT linuxdo_id, COUNT(*) AS c FROM contributions
-           WHERE verify_status = 'pooled' GROUP BY linuxdo_id HAVING c > ?
-         )`,
+           SELECT linuxdo_id, SUM(CASE WHEN delta > 0 THEN delta ELSE 0 END) AS p,
+                  MIN(created_at) AS firstAt, MIN(id) AS firstId
+           FROM point_ledger GROUP BY linuxdo_id HAVING p > 0
+         ) WHERE p > ? OR (p = ? AND (firstAt < ? OR (firstAt = ? AND firstId < ?)))`,
       )
-      .get(count) as unknown as { n: number }
-    return { rank: (ahead?.n ?? 0) + 1, count }
+      .get(points, points, mine!.firstAt, mine!.firstAt, mine!.firstId) as unknown as { n: number }
+    return { rank: (ahead?.n ?? 0) + 1, points }
   },
 
   // ===== 配置：全局键值（app_config）=====
