@@ -42,6 +42,13 @@ export default function RedeemStore({ refreshKey, onRedeemed }: { refreshKey: nu
   useEffect(() => {
     load()
   }, [load, refreshKey])
+  // 有「今日已抢完」的 LDC 项时慢轮询：额度按服务器自然日重置，挂着页面跨过午夜按钮才能自动恢复可兑
+  // （codex 于 PR #20 复审 P2：静态置灰不刷新就永远灰着）。60s 一拍足够（重置粒度是天）；无此类项不轮询。
+  useEffect(() => {
+    if (!items.some((it) => it.soldOutToday)) return
+    const t = setInterval(load, 60_000)
+    return () => clearInterval(t)
+  }, [items, load])
 
   async function redeem(item: Item) {
     setBusy(item.id)

@@ -12,9 +12,11 @@ export async function GET() {
 export async function PUT(req: NextRequest) {
   if (!(await isAdmin())) return NextResponse.json({ error: '无权限' }, { status: 403 })
   const b = await req.json().catch(() => ({}))
-  const n = Number(b.quota)
-  if (b.quota == null || !Number.isFinite(n) || n < 0)
-    return NextResponse.json({ error: 'quota 须为非负数' }, { status: 400 })
+  // 只认 number 类型的非负安全整数（codex 于 PR #20 复审 P2）：Number() 宽转会把 true/''/[2000] 静默变成
+  // 1/0/2000、小数被截断——脏请求可能把当日额度意外改小甚至关停（quota=0＝停发），故直接 400 拒绝。
+  const n = b.quota
+  if (typeof n !== 'number' || !Number.isSafeInteger(n) || n < 0)
+    return NextResponse.json({ error: 'quota 须为非负整数' }, { status: 400 })
   db.setLdcQuota(n)
   return NextResponse.json({ ok: true, quota: db.getLdcQuota() })
 }

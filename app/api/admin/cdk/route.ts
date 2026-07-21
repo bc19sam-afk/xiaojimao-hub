@@ -21,11 +21,13 @@ export async function POST(req: NextRequest) {
   const codes = parseCdkCodes(b.codes ?? [])
   if (codes.length === 0) return NextResponse.json({ error: '无有效码' }, { status: 400 })
 
-  // LDC 商品必带正整数面额；非 LDC 恒 null（忽略任何传入面额）。
+  // LDC 商品必带正整数面额；非 LDC 恒 null（忽略任何传入面额）。严格校验（codex 于 PR #20 复审 P2）：
+  // 只认 number 类型的正整数——Number() 宽转会把 true/[100]/'100' 都变成数、小数被 floor 静默截断，
+  // 超过 MAX_SAFE_INTEGER 的值落库后 node:sqlite 读取还会抛 ERR_OUT_OF_RANGE 把商店接口打成持续 500。
   let faceValue: number | null = null
   if (item.kind === 'ldc') {
-    const fv = Math.floor(Number(b.faceValue))
-    if (!Number.isFinite(fv) || fv <= 0)
+    const fv = b.faceValue
+    if (typeof fv !== 'number' || !Number.isSafeInteger(fv) || fv <= 0)
       return NextResponse.json({ error: 'LDC 商品导入须提供正整数面额 faceValue' }, { status: 400 })
     faceValue = fv
   }

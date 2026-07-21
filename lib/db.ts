@@ -779,17 +779,18 @@ export const db = {
   setLdcQuota(quota: number): void {
     db.setConfig(LDC_DAILY_QUOTA_KEY, String(Math.max(0, Math.floor(Number(quota) || 0))))
   },
-  // 今日（服务器本地自然日）已发 LDC 面额之和：**全局跨所有 kind='ldc' 商品**（限的是 LDC 币每日流出总量，
-  // 非单商品）。判据＝cdk_codes.status='issued' 且 issued_at 落在今日 且关联项 kind='ldc' 且码带面额。
-  // now 注入以可测（跨日边界确定性）。用与 performRedeem 同一 conn，故事务内调用能读到未提交的本次占码。
+  // 今日（服务器本地自然日）已发 LDC 面额之和：**全局**（限的是 LDC 币每日流出总量，非单商品）。
+  // 判据＝cdk_codes.status='issued' 且 issued_at 落在今日 且 face_value 非空——**face_value 非空本身即
+  // 「LDC 面额码」的自足标志**（导入口强制：LDC 商品必带正整数面额、非 LDC 恒 null），故不 JOIN 商品表、
+  // 不看当前 kind：否则当日发码后改商品 kind / 删商品会让已发码退出统计＝额度被重新释放、可超发
+  // （codex 于 PR #20 复审指出）。now 注入以可测；与 performRedeem 同一 conn，事务内调用读得到本次占码。
   ldcIssuedToday(now: number): number {
     const { start, end } = localDayBounds(now)
     const r = conn
       .prepare(
-        `SELECT COALESCE(SUM(c.face_value), 0) AS total
-         FROM cdk_codes c JOIN redeem_items i ON i.id = c.item_id
-         WHERE c.status='issued' AND c.issued_at >= ? AND c.issued_at < ?
-           AND i.kind='ldc' AND c.face_value IS NOT NULL`,
+        `SELECT COALESCE(SUM(face_value), 0) AS total
+         FROM cdk_codes
+         WHERE status='issued' AND issued_at >= ? AND issued_at < ? AND face_value IS NOT NULL`,
       )
       .get(start, end) as unknown as { total: number }
     return r?.total ?? 0
@@ -870,16 +871,23 @@ export const db = {
         }
         result = row.code
 
-        // ③.5 LDC 每日限量（P3-R2，§2）：本码已占（issued_at=now），故已计入下方「今日已发 LDC 面额之和」。
-        //   当项为 LDC（kind='ldc'）且本码带面额时：全局跨所有 LDC 商品的当日已发面额之和（含本码）> 每日额度
-        //   → 整体 ROLLBACK、返回「今日已抢完」、不扣分（占码随事务回滚复原、库存不减）。边界语义 ≤：恰好等于
-        //   额度可发（严格 > 才拦）。幂等回放在①已 return、不到此处，故同 token 重放天然不双计额度。
-        //   非 LDC 码 / 无面额码不进此判（不受额度约束）。判定塞进本事务＝并发下当日发码量绝不超额（防超发）。
-        if (item.kind === 'ldc' && row.face_value != null) {
+        // ③.5 LDC 每日限量（P3-R2，§2）：本码已占（issued_at=now），故已计入「今日已发面额之和」。
+        //   **面额驱动、与展示分类解耦**（§5.2 kind 只是展示分类；codex 于 PR #20 复审指出按 kind 判可被
+        //   「发码后改 kind」绕过或释放额度）：凡占到**带面额**的码一律受全局每日额度约束——含本码的当日
+        //   已发面额之和 > 额度 → 整体 ROLLBACK、「今日已抢完」、不扣分（占码随事务回滚复原）。边界 ≤：
+        //   恰好等于额度可发（严格 > 才拦）。幂等回放在①已 return，同 token 重放天然不双计额度。
+        //   判定与统计（ldcIssuedToday）同口径同事务＝并发下绝不超额。
+        if (row.face_value != null) {
           if (db.ldcIssuedToday(now) > db.getLdcQuota()) {
             conn.exec('ROLLBACK')
             return { ok: false, error: '今日已抢完' }
           }
+        } else if (item.kind === 'ldc') {
+          // LDC 商品占到**无面额**码＝配置异常——只能来自「先给非 LDC 商品导码、后改 kind='ldc'」的错序
+          // 操作（导入口对 LDC 强制正整数面额）。发出既绕过每日额度、用户又拿到无面额的废码——宁拦不发
+          // （codex 于 PR #20 复审 P1）。管理员补救：作废该批无面额码、按面额重导。
+          conn.exec('ROLLBACK')
+          return { ok: false, error: '商品配置异常，暂不可兑' }
         }
       }
 

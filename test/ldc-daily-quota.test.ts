@@ -241,3 +241,42 @@ test('额度取值：setLdcQuota 钳非负整数', () => {
   db.setLdcQuota(123.9)
   assert.equal(db.getLdcQuota(), 123, '取整')
 })
+
+// ⑩ 额度统计与展示分类解耦（codex 于 PR #20 复审 P1）：当日发码后把商品 kind 改掉/删掉，已发面额
+//    仍计入今日额度（统计只看 face_value 非空，不 JOIN 当前商品表）——额度绝不因改配置被重新释放。
+test('改 kind/删商品不释放当日额度：已发面额仍计入、后续照拦', () => {
+  const uid = 9310
+  const now = dayNoon(20)
+  db.setLdcQuota(100)
+  const it = createItem({ name: 'ldc-rekind', cost: 1, kind: 'ldc', fulfillment: 'cdk' })
+  db.importCdkCodes(it.id, ['RK-1', 'RK-2'], 100)
+  grant(uid, 10)
+  assert.equal(redeemMod.redeem(uid, it.id, { token: 'rk1', now }).ok, true) // 发 100＝额度打满
+  // 改展示分类（kind 只是展示分类，§5.2）——统计不受影响
+  db.upsertRedeemItem({ id: it.id, name: it.name, description: '', cost: it.cost, kind: 'vip', enabled: true, sort: 0 })
+  assert.equal(db.ldcIssuedToday(now), 100, '改 kind 后已发面额仍计入今日额度')
+  // 另一 LDC 商品此刻仍被全局额度拦住
+  const it2 = createItem({ name: 'ldc-rekind-2', cost: 1, kind: 'ldc', fulfillment: 'cdk' })
+  db.importCdkCodes(it2.id, ['RK2-1'], 1)
+  const r = redeemMod.redeem(uid, it2.id, { token: 'rk2', now })
+  assert.equal(r.ok, false)
+  if (!r.ok) assert.equal(r.error, '今日已抢完')
+})
+
+// ⑪ LDC 商品占到无面额码＝配置异常（先给非 LDC 导码、后改 kind='ldc' 的错序）：宁拦不发——
+//    既不给用户发无面额废码，也不让它绕过每日额度（codex 于 PR #20 复审 P1）。事务整体回滚不扣分。
+test('LDC 商品无面额码：拦截「商品配置异常」、不扣分不占码', () => {
+  const uid = 9320
+  const now = dayNoon(21)
+  db.setLdcQuota(2000)
+  const it = createItem({ name: 'plain-then-ldc', cost: 1, kind: 'timed_quota', fulfillment: 'cdk' })
+  db.importCdkCodes(it.id, ['NF-1']) // 非 LDC 导码：face_value=null
+  db.upsertRedeemItem({ id: it.id, name: it.name, description: '', cost: it.cost, kind: 'ldc', enabled: true, sort: 0 }) // 错序改成 LDC
+  grant(uid, 10)
+  const before = db.balance(uid)
+  const r = redeemMod.redeem(uid, it.id, { token: 'nf1', now })
+  assert.equal(r.ok, false)
+  if (!r.ok) assert.equal(r.error, '商品配置异常，暂不可兑')
+  assert.equal(db.balance(uid), before, '不扣分')
+  assert.equal(db.availableCdkCount(it.id), 1, '码未占（回滚复原）')
+})
