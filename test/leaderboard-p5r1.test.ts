@@ -116,3 +116,25 @@ test('L5 同分 tie-break：首次入账早者靠前（MIN created_at ASC）', a
   assert.equal(list[ii].points, 50)
   assert.ok(ih < ii, '同累计获得下、首次入账早的 H 靠前')
 })
+
+// L6 同分名次一致性（核心回归，codex xhigh P2）：myRank 与 leaderboard 同全序 ⇒ 名次恒等于榜单位置 +1。
+// 旧 bug：myRank 只数「严格多于我的人数」，同分被 tie-break 挤出前 20 者会误标名次 1（榜内同分者却占 1..20 位）。
+test('L6 同分名次一致性：myRank.rank 恒等于榜单位置 +1', async () => {
+  // 造 3 个新 uid 同累计获得 60，入账间隔 10ms 令 firstAt 严格递增（tie-break 走 firstAt、不落到 id 键）
+  db.awardPoints(6601, 60, 'usage', 'l6-a')
+  await sleep(10)
+  db.awardPoints(6602, 60, 'usage', 'l6-b')
+  await sleep(10)
+  db.awardPoints(6603, 60, 'usage', 'l6-c')
+  const list = db.leaderboard(100)
+  // 三个同分者在榜单各占确定位置，名次＝位置+1（而非同标 1）
+  for (const uid of [6601, 6602, 6603]) {
+    const idx = list.findIndex((e) => e.linuxdoId === uid)
+    assert.ok(idx >= 0, `uid ${uid} 应上榜`)
+    assert.equal(db.myRank(uid).rank, idx + 1, `uid ${uid}：myRank 名次应＝榜单位置 ${idx + 1}`)
+  }
+  // 更强不变式：榜单上每一个用户（含 L1–L5 既有 uid，防口径回归），myRank.rank 恒等于其位置 +1
+  list.forEach((e, i) => {
+    assert.equal(db.myRank(e.linuxdoId).rank, i + 1, `榜单位置 ${i}（uid ${e.linuxdoId}）名次应＝${i + 1}`)
+  })
+})
