@@ -427,37 +427,46 @@ export const db = {
     return r.changes > 0
   },
 
-  // 排行榜按「已入池号数」排名（v4：granted 态取消，成功首检入池即计数；真正的按累计积分排名待 R2/R3）。
-  leaderboard(limit = 20): { linuxdoId: number; username: string; count: number }[] {
+  // 排行榜按「累计获得积分」排名（§6，P5-R1）：累计获得 = SUM(正 delta)——发分为正（结算 awardPoints）、
+  // 兑换/扣减为负（spendPoints）；花费的负 delta 不进求和 ⇒ 花掉不掉名次。不写死 reason（凡 delta>0 皆算获得，
+  // 兼容未来其它发分来源）。username 取该用户任一贡献号（point_ledger 只有 linuxdo_id）、无贡献号空串兜。
+  // 没获得过分的不上榜（纯扣减用户 points=0 由 HAVING 排除）；同分先到先得（首次入账早者靠前）。
+  leaderboard(limit = 20): { linuxdoId: number; username: string; points: number }[] {
     return conn
       .prepare(
-        `SELECT linuxdo_id AS linuxdoId, username, COUNT(*) AS count
-         FROM contributions WHERE verify_status = 'pooled'
-         GROUP BY linuxdo_id ORDER BY count DESC, MIN(created_at) ASC LIMIT ?`,
+        `SELECT l.linuxdo_id AS linuxdoId,
+                COALESCE((SELECT username FROM contributions WHERE linuxdo_id = l.linuxdo_id LIMIT 1), '') AS username,
+                SUM(CASE WHEN l.delta > 0 THEN l.delta ELSE 0 END) AS points
+         FROM point_ledger l
+         GROUP BY l.linuxdo_id
+         HAVING points > 0
+         ORDER BY points DESC, MIN(l.created_at) ASC
+         LIMIT ?`,
       )
-      .all(limit) as unknown as { linuxdoId: number; username: string; count: number }[]
+      .all(limit) as unknown as { linuxdoId: number; username: string; points: number }[]
   },
 
-  // 我的排名与入池数（用于榜单外也能看到自己的名次）
-  myRank(linuxdoId: number): { rank: number; count: number } {
+  // 我的排名与累计获得积分（用于榜单外也能看到自己的名次）。口径同 leaderboard（SUM 正 delta）。
+  myRank(linuxdoId: number): { rank: number; points: number } {
     const mine = conn
       .prepare(
-        `SELECT COUNT(*) AS count FROM contributions
-         WHERE verify_status = 'pooled' AND linuxdo_id = ?`,
+        `SELECT SUM(CASE WHEN delta > 0 THEN delta ELSE 0 END) AS points
+         FROM point_ledger WHERE linuxdo_id = ?`,
       )
-      .get(linuxdoId) as unknown as { count: number }
-    const count = mine?.count ?? 0
-    if (count === 0) return { rank: 0, count: 0 }
-    // 排名 = 入池数比我多的人数 + 1
+      .get(linuxdoId) as unknown as { points: number | null }
+    // SUM 无行时返回 null（该用户无 ledger 行）→ ?? 0；全负 delta 时 CASE 逐行取 0、SUM=0（非 null）
+    const points = mine?.points ?? 0
+    if (points === 0) return { rank: 0, points: 0 }
+    // 排名 = 累计获得严格多于我的人数 + 1
     const ahead = conn
       .prepare(
         `SELECT COUNT(*) AS n FROM (
-           SELECT linuxdo_id, COUNT(*) AS c FROM contributions
-           WHERE verify_status = 'pooled' GROUP BY linuxdo_id HAVING c > ?
+           SELECT linuxdo_id, SUM(CASE WHEN delta > 0 THEN delta ELSE 0 END) AS p
+           FROM point_ledger GROUP BY linuxdo_id HAVING p > ?
          )`,
       )
-      .get(count) as unknown as { n: number }
-    return { rank: (ahead?.n ?? 0) + 1, count }
+      .get(points) as unknown as { n: number }
+    return { rank: (ahead?.n ?? 0) + 1, points }
   },
 
   // ===== 配置：全局键值（app_config）=====

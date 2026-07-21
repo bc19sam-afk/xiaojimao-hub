@@ -6,12 +6,12 @@ import { TrophyIcon, MedalIcon } from '@phosphor-icons/react'
 interface Entry {
   linuxdoId: number
   username: string
-  count: number
+  points: number
 }
 interface Me {
   linuxdoId: number
   rank: number
-  count: number
+  points: number
 }
 
 // 前三名金银铜，其余数字
@@ -34,7 +34,7 @@ export default function Leaderboard({ refreshKey, meId }: { refreshKey: number; 
 
   // 我在不在前 20 名里
   const meInList = list.some((e) => e.linuxdoId === meId)
-  const showMeRow = me && me.count > 0 && !meInList
+  const showMeRow = me && me.points > 0 && !meInList
 
   return (
     <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-6">
@@ -76,7 +76,7 @@ export default function Leaderboard({ refreshKey, meId }: { refreshKey: number; 
                     {isMe && <span className="ml-1.5 text-[10px] text-[var(--brand-bright)]">你</span>}
                   </span>
                 </div>
-                <span className="mono text-sm font-bold text-[var(--brand-bright)]">{e.count}</span>
+                <span className="mono text-sm font-bold text-[var(--brand-bright)]">{e.points} 分</span>
               </li>
             )
           })}
@@ -94,7 +94,7 @@ export default function Leaderboard({ refreshKey, meId }: { refreshKey: number; 
                     你<span className="ml-1.5 text-[10px] text-[var(--brand-bright)]">当前名次</span>
                   </span>
                 </div>
-                <span className="mono text-sm font-bold text-[var(--brand-bright)]">{me.count}</span>
+                <span className="mono text-sm font-bold text-[var(--brand-bright)]">{me.points} 分</span>
               </li>
             </>
           )}

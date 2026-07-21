@@ -297,9 +297,9 @@ test('MOCK 端到端：交号 → 入池 → 按日结算 → 余额增加、set
   assert.equal(s[0].points, expected)
   assert.equal(s[0].date, y.date)
 
-  // 排行榜 / 名次反映（pooled 计数）
+  // 排行榜 / 名次反映（P5-R1 累计获得积分口径：该号已结算发分 expected>0，故上榜、名次积分≥1）
   assert.ok(db.leaderboard(50).some((e) => e.linuxdoId === 7041), '排行榜应含该贡献者')
-  assert.ok(db.myRank(7041).count >= 1)
+  assert.ok(db.myRank(7041).points >= 1)
 
   // 幂等重跑：余额岿然不动、settlement 仍一笔
   await settle.settleDailyUsage(undefined, { force: true })
