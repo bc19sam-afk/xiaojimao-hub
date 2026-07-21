@@ -464,6 +464,41 @@ export const db = {
       .run(key, value, Date.now())
   },
 
+  // ===== 配置：信任等级门槛 & 限身份开关（P4-R2，§1）=====
+  // 两控件：门槛数值 min_trust_level + 是否启用门槛 trust_gate_enabled（关＝登录即可、不限信任等级）。
+  // 门槛只在登录回调判（callback route），调整不影响已登录会话（保留至过期）。
+  getMinTrustLevel(): number {
+    // 缺省回落 env.linuxdo.minTrustLevel（保留 ENV MIN_TRUST_LEVEL 作向后兼容默认）；脏值/负值同回落。
+    const raw = db.getConfig('min_trust_level')
+    if (raw == null) return env.linuxdo.minTrustLevel
+    const n = Math.floor(Number(raw))
+    return Number.isFinite(n) && n >= 0 ? n : env.linuxdo.minTrustLevel
+  },
+  setMinTrustLevel(n: number): void {
+    db.setConfig('min_trust_level', String(Math.max(0, Math.floor(Number(n) || 0))))
+  },
+  // 是否启用信任门槛：缺省 true（仅显式 '0' 才关＝登录即可、不限等级）。
+  isTrustGateEnabled(): boolean {
+    return db.getConfig('trust_gate_enabled') !== '0'
+  },
+  setTrustGateEnabled(on: boolean): void {
+    db.setConfig('trust_gate_enabled', on ? '1' : '0')
+  },
+
+  // ===== 配置：结算参数（结算时刻，P4-R2，§3.3）=====
+  // 结算时刻＝午夜后延迟分钟数（日切延迟）：settle_grace_minutes × 60000，缺省 10 分钟、钳 [0,1439]（一天内）。
+  // 时区随服务器不可配（§3.3 明确）。lib/settle.ts 每轮读，缺省仍 10min ⇒ 现有 daily-settlement 测试不破。
+  getSettleGraceMs(): number {
+    const raw = db.getConfig('settle_grace_minutes')
+    if (raw == null) return 10 * 60_000
+    const n = Math.floor(Number(raw))
+    if (!Number.isFinite(n) || n < 0) return 10 * 60_000 // 脏值/负值回落缺省
+    return Math.min(1439, n) * 60_000 // 上钳 1439 分钟（一天内）
+  },
+  setSettleGraceMinutes(n: number): void {
+    db.setConfig('settle_grace_minutes', String(Math.max(0, Math.min(1439, Math.floor(Number(n) || 0)))))
+  },
+
   // ===== 配置：发分规则 =====
   listPointRules(): PointRule[] {
     return conn
@@ -606,6 +641,25 @@ export const db = {
       .prepare("SELECT points_per_call FROM usage_rates WHERE provider=? AND plan='*' AND enabled=1")
       .get(p) as unknown as { points_per_call: number } | undefined
     return wild?.points_per_call ?? 0
+  },
+
+  // ===== 配置：折算规则 usage_rates（P4-R2，§3.4）=====
+  // 仿 point_rules CRUD，唯一差异：列名 points_per_call（REAL、可小数），字段名 pointsPerCall。ratePerCall（上）为读取器。
+  listUsageRates(): UsageRate[] {
+    return conn
+      .prepare('SELECT id, provider, plan, points_per_call AS pointsPerCall, enabled, label FROM usage_rates ORDER BY provider, points_per_call DESC')
+      .all() as unknown as UsageRate[]
+  },
+  upsertUsageRate(r: { id?: number; provider: string; plan: string; pointsPerCall: number; enabled: boolean; label: string }): void {
+    conn
+      .prepare(
+        `INSERT INTO usage_rates (provider, plan, points_per_call, enabled, label) VALUES (?,?,?,?,?)
+         ON CONFLICT(provider, plan) DO UPDATE SET points_per_call=excluded.points_per_call, enabled=excluded.enabled, label=excluded.label`,
+      )
+      .run(r.provider.toLowerCase(), r.plan.toLowerCase(), r.pointsPerCall, r.enabled ? 1 : 0, r.label)
+  },
+  deleteUsageRate(id: number): void {
+    conn.prepare('DELETE FROM usage_rates WHERE id=?').run(id)
   },
 
   // 记一笔当日结算：INSERT，(contribution_id, date) 冲突则 DO NOTHING（按日结算幂等）。返回是否本次真正落库。
@@ -1158,6 +1212,14 @@ export interface PointRule {
   provider: string
   plan: string
   points: number
+  enabled: number
+  label: string
+}
+export interface UsageRate {
+  id: number
+  provider: string
+  plan: string
+  pointsPerCall: number // usage_rates.points_per_call（REAL，可小数）
   enabled: number
   label: string
 }
