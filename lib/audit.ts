@@ -172,3 +172,19 @@ export function auditSettleParam(oldMinutes: number, newMinutes: number): AuditE
     new: newMinutes,
   }
 }
+
+// ---- 人工复核处理（P4-R3，§7.4）----
+// 人工重试/终止 needs_review 号（卡住任务的人工出口）。target=provider/accountId——account_id 非敏感、
+// 非码/RT/密钥，可记，便于审计追溯到具体号。old/new 只记 verifyStatus 迁移（needs_review → submitted|stopped）。
+// 两动作都不碰 daily_settlements / point_ledger（§7.4 幂等：重试不结算、终止不删账本）。
+export function auditContributionReview(
+  action: 'contribution.retry' | 'contribution.terminate',
+  c: { provider: string; accountId: string },
+): AuditEntry {
+  return {
+    action,
+    target: `${c.provider}/${c.accountId}`,
+    old: { verifyStatus: 'needs_review' },
+    new: { verifyStatus: action === 'contribution.retry' ? 'submitted' : 'stopped' },
+  }
+}

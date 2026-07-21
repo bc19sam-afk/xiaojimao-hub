@@ -48,6 +48,50 @@ interface CdkStats {
   issued: number
   void: number
 }
+// ===== 数据查看（P4-R3，§6.146）：管理侧全局分页只读 =====
+interface ContributionRow {
+  id: string
+  linuxdoId: number
+  username: string
+  provider: string
+  plan: string
+  accountId: string
+  verifyStatus: string
+  points: number
+  createdAt: number
+}
+interface SettlementRow {
+  id: number
+  contributionId: string
+  linuxdoId: number | null
+  username: string
+  date: string
+  provider: string
+  accountId: string
+  callCount: number
+  points: number
+  settledAt: number
+}
+// 兑换记录一行：后端已脱敏，绝不含 result（CDK 码原文，§8）
+interface RedemptionRow {
+  id: string
+  linuxdoId: number
+  username: string
+  itemName: string
+  cost: number
+  status: string
+  createdAt: number
+}
+// 待人工复核队列一行（needs_review，§7.4）
+interface ReviewRow {
+  id: string
+  linuxdoId: number
+  username: string
+  provider: string
+  accountId: string
+  createdAt: number
+  updatedAt: number
+}
 
 const KINDS = [
   { v: 'timed_quota', t: '限时额度' },
@@ -74,6 +118,11 @@ export default function AdminPanel() {
   const [minTrust, setMinTrust] = useState('') // 信任门槛数值（受控输入，字符串）
   const [graceMinutes, setGraceMinutes] = useState('') // 结算时刻：午夜后分钟（受控输入，字符串）
   const [audit, setAudit] = useState<AuditRow[]>([])
+  // 数据查看 + 人工复核（P4-R3）
+  const [contributions, setContributions] = useState<ContributionRow[]>([])
+  const [settlements, setSettlements] = useState<SettlementRow[]>([])
+  const [redemptions, setRedemptions] = useState<RedemptionRow[]>([])
+  const [review, setReview] = useState<ReviewRow[]>([])
   const [msg, setMsg] = useState('')
 
   const load = useCallback(async () => {
@@ -104,6 +153,23 @@ export default function AdminPanel() {
     const d = await fetch('/api/admin/audit?limit=50', { cache: 'no-store' }).then((r) => r.json())
     if (d.ok) setAudit(d.audit ?? [])
   }, [])
+  // 数据查看三块：各拉一页（limit=50）。§8——兑换记录后端已脱敏，不含 result
+  const loadContributions = useCallback(async () => {
+    const d = await fetch('/api/admin/contributions?limit=50', { cache: 'no-store' }).then((r) => r.json())
+    if (d.ok) setContributions(d.contributions ?? [])
+  }, [])
+  const loadSettlements = useCallback(async () => {
+    const d = await fetch('/api/admin/settlements?limit=50', { cache: 'no-store' }).then((r) => r.json())
+    if (d.ok) setSettlements(d.settlements ?? [])
+  }, [])
+  const loadRedemptions = useCallback(async () => {
+    const d = await fetch('/api/admin/redemptions?limit=50', { cache: 'no-store' }).then((r) => r.json())
+    if (d.ok) setRedemptions(d.redemptions ?? [])
+  }, [])
+  const loadReview = useCallback(async () => {
+    const d = await fetch('/api/admin/review', { cache: 'no-store' }).then((r) => r.json())
+    if (d.ok) setReview(d.review ?? [])
+  }, [])
   useEffect(() => {
     load()
     loadRates()
@@ -111,7 +177,14 @@ export default function AdminPanel() {
     loadGate()
     loadSettle()
     loadAudit()
-  }, [load, loadRates, loadQuota, loadGate, loadSettle, loadAudit])
+    loadContributions()
+    loadSettlements()
+    loadRedemptions()
+    loadReview()
+  }, [
+    load, loadRates, loadQuota, loadGate, loadSettle, loadAudit,
+    loadContributions, loadSettlements, loadRedemptions, loadReview,
+  ])
 
   const flash = (t: string) => {
     setMsg(t)
@@ -231,6 +304,22 @@ export default function AdminPanel() {
     const d = await fetch('/api/admin/redeem-items?id=' + id, { method: 'DELETE' }).then((r) => r.json())
     setItems(d.redeemItems)
     flash('已删除')
+  }
+
+  // 人工复核处理（P4-R3，§7.4）：重试（→ 首检队列）/ 终止（→ 停用）。成功后刷新队列 + 审计。
+  // 后端 CAS 返回 { ok:false, error:'状态已变' }（HTTP 200）时按失败提示，不改队列。
+  async function doReview(id: string, action: 'retry' | 'terminate') {
+    const res = await fetch('/api/admin/review', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id, action }),
+    })
+    const d = await res.json()
+    if (res.ok && d.ok) {
+      setReview(d.review ?? [])
+      flash(action === 'retry' ? '已转回首检' : '已终止')
+      loadAudit()
+    } else flash(d.error || '失败')
   }
 
   return (
@@ -435,6 +524,156 @@ export default function AdminPanel() {
                   <span className="text-neutral-600"> → </span>
                   <span className="text-emerald-300/70">{a.newValue ?? '—'}</span>
                 </span>
+              </div>
+            ))}
+          </div>
+        </section>
+
+        {/* 待人工复核（P4-R3，§7.4）：needs_review 号的人工出口。重试→转回首检队列；终止→停用（不删行、不碰结算表） */}
+        <section className="mt-8 rounded-2xl border border-white/10 bg-white/[0.02] p-5">
+          <div className="mb-1 flex items-center justify-between">
+            <h2 className="font-bold text-white">待人工复核</h2>
+            <button
+              onClick={loadReview}
+              className="rounded-lg border border-white/10 bg-white/5 px-2.5 py-1 text-xs hover:bg-white/10"
+            >
+              刷新
+            </button>
+          </div>
+          <p className="mb-4 text-xs text-neutral-500">
+            卡在 <code>needs_review</code> 的号（残缺号 / 首检需重授权）。<b>重试</b>转回首检队列重新首检；
+            <b>终止</b>放弃并停用（保留记录、不影响已有结算）。
+          </p>
+          <div className="space-y-1.5">
+            <div className="grid grid-cols-[130px_110px_80px_1fr_auto] gap-2 text-[11px] text-neutral-500">
+              <span>提交时间</span><span>用户</span><span>provider</span><span>account</span><span>操作</span>
+            </div>
+            {review.length === 0 && <p className="py-2 text-xs text-neutral-600">暂无待复核</p>}
+            {review.map((r) => (
+              <div
+                key={r.id}
+                className="grid grid-cols-[130px_110px_80px_1fr_auto] items-center gap-2 border-t border-white/5 py-1.5 text-[11px] text-neutral-300"
+              >
+                <span className="text-neutral-500">{new Date(r.createdAt).toLocaleString('zh-CN')}</span>
+                <span>{r.username || <span className="text-neutral-500">#{r.linuxdoId}</span>}</span>
+                <span className="text-neutral-400">{r.provider}</span>
+                <span className="break-all text-neutral-400">{r.accountId}</span>
+                <div className="flex gap-1">
+                  <button
+                    onClick={() => doReview(r.id, 'retry')}
+                    className="rounded-lg bg-[var(--brand)]/20 px-2.5 py-1 text-xs font-medium text-[var(--brand-bright)] hover:bg-[var(--brand)]/30"
+                  >
+                    重试
+                  </button>
+                  <button
+                    onClick={() => doReview(r.id, 'terminate')}
+                    className="rounded-lg bg-rose-500/10 px-2.5 py-1 text-xs text-rose-300 hover:bg-rose-500/20"
+                  >
+                    终止
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </section>
+
+        {/* 贡献记录（P4-R3，§6.146）：全局倒序只读。脱敏——不含 email/reward_code。积分＝该号累计发分 */}
+        <section className="mt-8 rounded-2xl border border-white/10 bg-white/[0.02] p-5">
+          <div className="mb-1 flex items-center justify-between">
+            <h2 className="font-bold text-white">贡献记录</h2>
+            <button
+              onClick={loadContributions}
+              className="rounded-lg border border-white/10 bg-white/5 px-2.5 py-1 text-xs hover:bg-white/10"
+            >
+              刷新
+            </button>
+          </div>
+          <p className="mb-4 text-xs text-neutral-500">用户贡献的账号（最新 50 条，倒序）。积分＝该号累计发分。</p>
+          <div className="space-y-1.5">
+            <div className="grid grid-cols-[120px_100px_70px_60px_80px_1fr_56px] gap-2 text-[11px] text-neutral-500">
+              <span>时间</span><span>用户</span><span>provider</span><span>套餐</span><span>状态</span><span>account</span><span>积分</span>
+            </div>
+            {contributions.length === 0 && <p className="py-2 text-xs text-neutral-600">暂无贡献</p>}
+            {contributions.map((c) => (
+              <div
+                key={c.id}
+                className="grid grid-cols-[120px_100px_70px_60px_80px_1fr_56px] items-center gap-2 border-t border-white/5 py-1.5 text-[11px] text-neutral-300"
+              >
+                <span className="text-neutral-500">{new Date(c.createdAt).toLocaleString('zh-CN')}</span>
+                <span>{c.username || <span className="text-neutral-500">#{c.linuxdoId}</span>}</span>
+                <span className="text-neutral-400">{c.provider}</span>
+                <span className="text-neutral-400">{c.plan}</span>
+                <span className="font-mono text-neutral-400">{c.verifyStatus}</span>
+                <span className="break-all text-neutral-400">{c.accountId}</span>
+                <span className="text-emerald-300/80">{c.points}</span>
+              </div>
+            ))}
+          </div>
+        </section>
+
+        {/* 每日结算记录（P4-R3，§6.146）：全局倒序只读。用户/归属由 LEFT JOIN 取 */}
+        <section className="mt-8 rounded-2xl border border-white/10 bg-white/[0.02] p-5">
+          <div className="mb-1 flex items-center justify-between">
+            <h2 className="font-bold text-white">每日结算记录</h2>
+            <button
+              onClick={loadSettlements}
+              className="rounded-lg border border-white/10 bg-white/5 px-2.5 py-1 text-xs hover:bg-white/10"
+            >
+              刷新
+            </button>
+          </div>
+          <p className="mb-4 text-xs text-neutral-500">按日折算的结算流水（最新 50 条，倒序）。积分＝round(次数 × 单价)。</p>
+          <div className="space-y-1.5">
+            <div className="grid grid-cols-[100px_100px_70px_1fr_56px_56px_130px] gap-2 text-[11px] text-neutral-500">
+              <span>日期</span><span>用户</span><span>provider</span><span>account</span><span>次数</span><span>积分</span><span>结算时刻</span>
+            </div>
+            {settlements.length === 0 && <p className="py-2 text-xs text-neutral-600">暂无结算</p>}
+            {settlements.map((s) => (
+              <div
+                key={s.id}
+                className="grid grid-cols-[100px_100px_70px_1fr_56px_56px_130px] items-center gap-2 border-t border-white/5 py-1.5 text-[11px] text-neutral-300"
+              >
+                <span className="text-neutral-400">{s.date}</span>
+                <span>{s.username || <span className="text-neutral-500">#{s.linuxdoId ?? '—'}</span>}</span>
+                <span className="text-neutral-400">{s.provider}</span>
+                <span className="break-all text-neutral-400">{s.accountId}</span>
+                <span className="text-neutral-400">{s.callCount}</span>
+                <span className="text-emerald-300/80">{s.points}</span>
+                <span className="text-neutral-500">{new Date(s.settledAt).toLocaleString('zh-CN')}</span>
+              </div>
+            ))}
+          </div>
+        </section>
+
+        {/* 兑换记录（P4-R3，§6.146）：全局倒序只读。🔴 §8——后端已脱敏，绝不含 result（CDK 码），故无「码」列 */}
+        <section className="mt-8 rounded-2xl border border-white/10 bg-white/[0.02] p-5">
+          <div className="mb-1 flex items-center justify-between">
+            <h2 className="font-bold text-white">兑换记录</h2>
+            <button
+              onClick={loadRedemptions}
+              className="rounded-lg border border-white/10 bg-white/5 px-2.5 py-1 text-xs hover:bg-white/10"
+            >
+              刷新
+            </button>
+          </div>
+          <p className="mb-4 text-xs text-neutral-500">
+            用户兑换流水（最新 50 条，倒序）。安全起见<b>不显示兑换码</b>（码仅号主本人可在前台找回）。
+          </p>
+          <div className="space-y-1.5">
+            <div className="grid grid-cols-[130px_110px_1fr_64px_90px] gap-2 text-[11px] text-neutral-500">
+              <span>时间</span><span>用户</span><span>商品</span><span>花费</span><span>状态</span>
+            </div>
+            {redemptions.length === 0 && <p className="py-2 text-xs text-neutral-600">暂无兑换</p>}
+            {redemptions.map((r) => (
+              <div
+                key={r.id}
+                className="grid grid-cols-[130px_110px_1fr_64px_90px] items-center gap-2 border-t border-white/5 py-1.5 text-[11px] text-neutral-300"
+              >
+                <span className="text-neutral-500">{new Date(r.createdAt).toLocaleString('zh-CN')}</span>
+                <span>{r.username || <span className="text-neutral-500">#{r.linuxdoId}</span>}</span>
+                <span className="break-all text-neutral-400">{r.itemName}</span>
+                <span className="text-neutral-400">{r.cost}</span>
+                <span className="font-mono text-neutral-400">{r.status}</span>
               </div>
             ))}
           </div>
