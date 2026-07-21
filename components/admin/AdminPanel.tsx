@@ -28,6 +28,7 @@ const KINDS = [
   { v: 'permanent_quota', t: '永久额度' },
   { v: 'vip', t: '订阅VIP' },
   { v: 'invite_code', t: '邀请码' },
+  { v: 'ldc', t: 'LDC' }, // P3-R2：合伙人 linux.do 币，配 CDK 发码 + 每日限量（码带面额）
 ]
 // 履约类型：placeholder 占位文案 / cdk 发码（后台先给该项导入 CDK 码，兑换时事务内占一个码发出）
 const FULFILLMENTS = [

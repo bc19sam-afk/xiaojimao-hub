@@ -265,6 +265,24 @@ function toDailySettlement(r: DsRow): DailySettlement {
   }
 }
 
+// ===== LDC 每日限量（P3-R2）=====
+// LDC＝合伙人的 linux.do 币。完全复用 R1 的 CDK 发码履约，只多两件事：码带面额（cdk_codes.face_value）、
+// 每日限量（当日已发 LDC 面额之和 ≤ 每日额度，按服务器本地自然日重置）。额度存 app_config KV、缺省 2000。
+const LDC_DAILY_QUOTA_KEY = 'ldc_daily_quota'
+const LDC_DAILY_QUOTA_DEFAULT = 2000
+
+// 毫秒 → 所在自然日的 [今日 0 点, 明日 0 点) 毫秒半开区间（服务器本地时区）。与 lib/settle.ts / lib/cpa.ts
+// 的 dayStr（'YYYY-MM-DD' 日键）是**同一「服务器本地自然日」口径**，只是形式不同：额度判定要判「issued_at
+// 落在今日」＝时间戳落在此区间，需要的是毫秒边界而非日键串，故取此形，非另立第三种日期口径。用本地 getter
+// （setHours/setDate 走本地时区）与 dayStr 一致；setDate(+1) 取次日 0 点＝跨月/年/夏令时都安全（按日历日进位）。
+function localDayBounds(ms: number): { start: number; end: number } {
+  const d = new Date(ms)
+  d.setHours(0, 0, 0, 0)
+  const start = d.getTime()
+  d.setDate(d.getDate() + 1)
+  return { start, end: d.getTime() }
+}
+
 export const db = {
   all(): Contribution[] {
     return (conn.prepare('SELECT * FROM contributions').all() as unknown as Row[]).map(toContribution)
@@ -704,10 +722,17 @@ export const db = {
   // 批量导入 available 码，去重：同一 (item_id, code) 已存 → 跳过（依赖 UNIQUE(item_id, code) 原子去重）；
   // 入参批次内重复也只算一次（seen 兜）。返回 { imported 本次真正入库数, skipped 跳过数 }。
   // ⚠️ 安全（§8）：绝不日志 code；调用链任何环节不得把 code 写进应用日志。
-  importCdkCodes(itemId: number, codes: string[]): { imported: number; skipped: number } {
+  importCdkCodes(
+    itemId: number,
+    codes: string[],
+    faceValue: number | null = null,
+  ): { imported: number; skipped: number } {
     const now = Date.now()
+    // 批级面额（P3-R2）：一批同面额。LDC 商品的码带正整数面额（每日额度判定用）；非 LDC 传 null（面额恒空、
+    // 不受额度约束）。面额策略（LDC 必带、非 LDC 恒 null）由 admin CDK 导入 API 按 item.kind 定，此处只落库取整。
+    const fv = faceValue == null ? null : Math.floor(faceValue)
     const stmt = conn.prepare(
-      `INSERT INTO cdk_codes (item_id, code, status, created_at) VALUES (?,?,'available',?)
+      `INSERT INTO cdk_codes (item_id, code, status, face_value, created_at) VALUES (?,?,'available',?,?)
        ON CONFLICT(item_id, code) DO NOTHING`,
     )
     let imported = 0
@@ -719,7 +744,7 @@ export const db = {
         continue
       }
       seen.add(code)
-      const r = stmt.run(itemId, code, now)
+      const r = stmt.run(itemId, code, fv, now)
       if (r.changes > 0) imported++
       else skipped++
     }
@@ -742,6 +767,45 @@ export const db = {
     return out
   },
 
+  // ===== LDC 每日限量（P3-R2，§8）=====
+  // 每日额度：app_config['ldc_daily_quota']，缺省 2000。取值钳非负整数（脏值/缺失一律回落缺省，
+  // getLdcQuota 侧也防一道——即便有人绕过 setLdcQuota 直写脏值，判定仍安全）。
+  getLdcQuota(): number {
+    const raw = db.getConfig(LDC_DAILY_QUOTA_KEY)
+    if (raw == null) return LDC_DAILY_QUOTA_DEFAULT
+    const n = Math.floor(Number(raw))
+    return Number.isFinite(n) && n >= 0 ? n : LDC_DAILY_QUOTA_DEFAULT
+  },
+  setLdcQuota(quota: number): void {
+    db.setConfig(LDC_DAILY_QUOTA_KEY, String(Math.max(0, Math.floor(Number(quota) || 0))))
+  },
+  // 今日（服务器本地自然日）已发 LDC 面额之和：**全局**（限的是 LDC 币每日流出总量，非单商品）。
+  // 判据＝cdk_codes.status='issued' 且 issued_at 落在今日 且 face_value 非空——**face_value 非空本身即
+  // 「LDC 面额码」的自足标志**（导入口强制：LDC 商品必带正整数面额、非 LDC 恒 null），故不 JOIN 商品表、
+  // 不看当前 kind：否则当日发码后改商品 kind / 删商品会让已发码退出统计＝额度被重新释放、可超发
+  // （codex 于 PR #20 复审指出）。now 注入以可测；与 performRedeem 同一 conn，事务内调用读得到本次占码。
+  ldcIssuedToday(now: number): number {
+    const { start, end } = localDayBounds(now)
+    const r = conn
+      .prepare(
+        `SELECT COALESCE(SUM(face_value), 0) AS total
+         FROM cdk_codes
+         WHERE status='issued' AND issued_at >= ? AND issued_at < ? AND face_value IS NOT NULL`,
+      )
+      .get(start, end) as unknown as { total: number }
+    return r?.total ?? 0
+  },
+  // store 展示用「今日已抢完」布尔（§8 只回布尔、不外泄剩余额度精确值）：该项有可用码但今日 LDC 额度已不够
+  // 发它下一张待发码（issuedToday + 下一张面额 > 额度）。无可用码 / 下一张码无面额 → false（前者是普通
+  // 「已兑罄」另一路判，后者不受额度约束）。真正的拦截在 performRedeem 事务内，此处仅前端提示、非权威。
+  ldcExhaustedToday(itemId: number, now: number): boolean {
+    const next = conn
+      .prepare("SELECT face_value FROM cdk_codes WHERE item_id=? AND status='available' ORDER BY id LIMIT 1")
+      .get(itemId) as unknown as { face_value: number | null } | undefined
+    if (!next || next.face_value == null) return false
+    return db.ldcIssuedToday(now) + next.face_value > db.getLdcQuota()
+  },
+
   // 兑换单事务（P3-R1，§5.5「同成功或同失败」）：单 BEGIN IMMEDIATE 包住
   //   ① 幂等回放 → ② 查限购 → ③ CAS 占码 → ④ 扣分 → ⑤ 写兑换记录（回填码归属由占码那步一并完成）。
   // 任一步不满足/失败 → 整体 ROLLBACK、绝不扣分。顺带修两个既有 bug：
@@ -756,10 +820,11 @@ export const db = {
     redemptionId: string
     item: RedeemItem
     placeholderResult: string
+    now?: number // 注入以可测（issued_at 落库时刻 + LDC 当日额度边界）；生产不传＝真实时钟
   }): { ok: true; result: string; balance: number; replay: boolean } | { ok: false; error: string } {
     const { linuxdoId, redemptionId, item } = args
     const isCdk = item.fulfillment === 'cdk'
-    const now = Date.now()
+    const now = args.now ?? Date.now()
     conn.exec('BEGIN IMMEDIATE')
     try {
       // ① 幂等回放：同一 redemptionId 已兑过 → 返回原结果，不再占码/扣分（重复点击 / 超时重试兜底）
@@ -788,8 +853,8 @@ export const db = {
       let result = args.placeholderResult
       if (isCdk) {
         const row = conn
-          .prepare("SELECT id, code FROM cdk_codes WHERE item_id=? AND status='available' ORDER BY id LIMIT 1")
-          .get(item.id) as unknown as { id: number; code: string } | undefined
+          .prepare("SELECT id, code, face_value FROM cdk_codes WHERE item_id=? AND status='available' ORDER BY id LIMIT 1")
+          .get(item.id) as unknown as { id: number; code: string; face_value: number | null } | undefined
         if (!row) {
           conn.exec('ROLLBACK')
           return { ok: false, error: '已兑罄' }
@@ -805,6 +870,25 @@ export const db = {
           return { ok: false, error: '已兑罄' }
         }
         result = row.code
+
+        // ③.5 LDC 每日限量（P3-R2，§2）：本码已占（issued_at=now），故已计入「今日已发面额之和」。
+        //   **面额驱动、与展示分类解耦**（§5.2 kind 只是展示分类；codex 于 PR #20 复审指出按 kind 判可被
+        //   「发码后改 kind」绕过或释放额度）：凡占到**带面额**的码一律受全局每日额度约束——含本码的当日
+        //   已发面额之和 > 额度 → 整体 ROLLBACK、「今日已抢完」、不扣分（占码随事务回滚复原）。边界 ≤：
+        //   恰好等于额度可发（严格 > 才拦）。幂等回放在①已 return，同 token 重放天然不双计额度。
+        //   判定与统计（ldcIssuedToday）同口径同事务＝并发下绝不超额。
+        if (row.face_value != null) {
+          if (db.ldcIssuedToday(now) > db.getLdcQuota()) {
+            conn.exec('ROLLBACK')
+            return { ok: false, error: '今日已抢完' }
+          }
+        } else if (item.kind === 'ldc') {
+          // LDC 商品占到**无面额**码＝配置异常——只能来自「先给非 LDC 商品导码、后改 kind='ldc'」的错序
+          // 操作（导入口对 LDC 强制正整数面额）。发出既绕过每日额度、用户又拿到无面额的废码——宁拦不发
+          // （codex 于 PR #20 复审 P1）。管理员补救：作废该批无面额码、按面额重导。
+          conn.exec('ROLLBACK')
+          return { ok: false, error: '商品配置异常，暂不可兑' }
+        }
       }
 
       // ④ 扣分：原子（余额 < cost 直接不入账），ref=redemptionId＝幂等键。失败＝积分不足、整体回滚

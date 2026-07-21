@@ -67,7 +67,8 @@ export function redeem(
   // cdk 类结果＝事务内占用的码（此处传空占位）；placeholder 类先算好占位串带进事务写记录。
   const placeholderResult = item.fulfillment === 'cdk' ? '' : fulfillPlaceholder(item.kind)
 
-  const res = db.performRedeem({ linuxdoId, redemptionId, item, placeholderResult })
+  // now 透传进事务：作 issued_at 落库时刻 + LDC 当日额度边界判定基准（跨日重置的可测点）。
+  const res = db.performRedeem({ linuxdoId, redemptionId, item, placeholderResult, now })
   if (!res.ok) return res
   return { ok: true, result: res.result, balance: res.balance }
 }
