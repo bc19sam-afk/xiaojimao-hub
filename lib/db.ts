@@ -1196,7 +1196,10 @@ export const db = {
   // 按 id DESC（自增＝插入序＝时间序，比 created_at 更稳、无同毫秒并列歧义）。
   listAudit(limit = 50, offset = 0): AuditRow[] {
     const lim = Math.min(200, Math.max(1, Math.floor(Number(limit) || 50)))
-    const off = Math.max(0, Math.floor(Number(offset) || 0))
+    // offset 归一（codex 复审 P3）：非有限值（尤其 +Infinity——Number('Infinity')=Infinity 是真值、会绕过
+    // `||0`，Math.floor 后原样穿到 node:sqlite 的 OFFSET 绑定抛错＝脏输入变 500）一律回落 0。limit 侧 Math.min(200,…) 天然封顶不受影响。
+    const nOff = Number(offset)
+    const off = Number.isFinite(nOff) ? Math.max(0, Math.floor(nOff)) : 0
     return conn
       .prepare(
         `SELECT id, actor_type AS actorType, actor_id AS actorId, actor_label AS actorLabel,
@@ -1204,6 +1207,105 @@ export const db = {
          FROM audit_log ORDER BY id DESC LIMIT ? OFFSET ?`,
       )
       .all(lim, off) as unknown as AuditRow[]
+  },
+
+  // ===== 管理侧全局分页只读（P4-R3，§6.146）=====
+  // 现有 byUser/settlementsFor/listRedemptions 全是用户侧；此三个是**管理侧全局**分页只读（倒序、limit/offset
+  // 钳制仿 listAudit）。§8 脱敏红线：贡献记录不返回 email/reward_code；兑换记录绝不返回 result（CDK 码原文）。
+  // 三者均 SELECT 明确列（非 SELECT *），从结构上杜绝敏感列外泄。
+
+  // 贡献记录：全局倒序（created_at DESC，id 次序稳定）。points＝该号累计发分（页内每行调 contributionPoints）。
+  // ⚠️ 只 SELECT 展示列——不含 email / reward_code（管理列表无需，最小暴露）。
+  listContributionsAdmin(limit = 50, offset = 0): AdminContributionRow[] {
+    const lim = Math.min(200, Math.max(1, Math.floor(Number(limit) || 50)))
+    // offset 归一（codex 复审 P3）：非有限值（尤其 +Infinity——Number('Infinity')=Infinity 是真值、会绕过
+    // `||0`，Math.floor 后原样穿到 node:sqlite 的 OFFSET 绑定抛错＝脏输入变 500）一律回落 0。limit 侧 Math.min(200,…) 天然封顶不受影响。
+    const nOff = Number(offset)
+    const off = Number.isFinite(nOff) ? Math.max(0, Math.floor(nOff)) : 0
+    const rows = conn
+      .prepare(
+        `SELECT id, linuxdo_id AS linuxdoId, username, provider, plan, account_id AS accountId,
+                verify_status AS verifyStatus, created_at AS createdAt
+         FROM contributions ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?`,
+      )
+      .all(lim, off) as unknown as Omit<AdminContributionRow, 'points'>[]
+    return rows.map((r) => ({ ...r, points: db.contributionPoints(r.id) }))
+  },
+
+  // 每日用量结算记录：全局倒序（id DESC＝自增插入序）。LEFT JOIN contributions 取 username/linuxdo_id；
+  // 纯结算行理论都有对应号（join 取得到），取不到则 username 空串、linuxdoId null 兜底。
+  listSettlementsAdmin(limit = 50, offset = 0): AdminSettlementRow[] {
+    const lim = Math.min(200, Math.max(1, Math.floor(Number(limit) || 50)))
+    // offset 归一（codex 复审 P3）：非有限值（尤其 +Infinity——Number('Infinity')=Infinity 是真值、会绕过
+    // `||0`，Math.floor 后原样穿到 node:sqlite 的 OFFSET 绑定抛错＝脏输入变 500）一律回落 0。limit 侧 Math.min(200,…) 天然封顶不受影响。
+    const nOff = Number(offset)
+    const off = Number.isFinite(nOff) ? Math.max(0, Math.floor(nOff)) : 0
+    return conn
+      .prepare(
+        `SELECT s.id, s.contribution_id AS contributionId, c.linuxdo_id AS linuxdoId,
+                COALESCE(c.username, '') AS username, s.date, s.provider,
+                s.account_id AS accountId, s.call_count AS callCount, s.points, s.settled_at AS settledAt
+         FROM daily_settlements s
+         LEFT JOIN contributions c ON c.id = s.contribution_id
+         ORDER BY s.id DESC LIMIT ? OFFSET ?`,
+      )
+      .all(lim, off) as unknown as AdminSettlementRow[]
+  },
+
+  // 兑换记录：全局倒序（created_at DESC，id 次序稳定）。子查询按 linuxdo_id 取任一 username（纯兑换用户
+  // 可能无贡献号 → username 空串、前端显示 linuxdoId 数字兜底）。
+  // 🔴 §8 铁律：绝不 SELECT / 返回 result（存 CDK 兑换码原文，「不进他人可见接口」的敏感值）。
+  //   管理侧全局兑换记录只回状态/商品/花费/时间/归属人。
+  listRedemptionsAdmin(limit = 50, offset = 0): AdminRedemptionRow[] {
+    const lim = Math.min(200, Math.max(1, Math.floor(Number(limit) || 50)))
+    // offset 归一（codex 复审 P3）：非有限值（尤其 +Infinity——Number('Infinity')=Infinity 是真值、会绕过
+    // `||0`，Math.floor 后原样穿到 node:sqlite 的 OFFSET 绑定抛错＝脏输入变 500）一律回落 0。limit 侧 Math.min(200,…) 天然封顶不受影响。
+    const nOff = Number(offset)
+    const off = Number.isFinite(nOff) ? Math.max(0, Math.floor(nOff)) : 0
+    return conn
+      .prepare(
+        `SELECT r.id, r.linuxdo_id AS linuxdoId,
+                COALESCE((SELECT username FROM contributions WHERE linuxdo_id = r.linuxdo_id LIMIT 1), '') AS username,
+                r.item_name AS itemName, r.cost, r.status, r.created_at AS createdAt
+         FROM redemptions r ORDER BY r.created_at DESC, r.id DESC LIMIT ? OFFSET ?`,
+      )
+      .all(lim, off) as unknown as AdminRedemptionRow[]
+  },
+
+  // ===== 人工复核处理（P4-R3，§7.4）=====
+  // needs_review 号（拿不到稳定 account_id 的残缺号 / 首检 OAuth 失效 reauth）现无任何自动出口＝死胡同。
+  // 两动作都只走 transition CAS 改 verify_status，**完全不碰 daily_settlements / point_ledger**，故天然满足
+  // §7.4「不得绕过同号同日只结算一次」——重试不触发结算、终止不删已有结算/账本。CAS from=['needs_review']
+  // 亦防并发/状态已变时误操作（对非 needs_review 号调用返 false 不改）。
+
+  // 重试：按 pooled_at 分叉去向（codex 复审 P1）。needs_review 有两类，不能一律回首检：
+  //   ① 从没入池（首检 reauth / 残缺号，pooled_at IS NULL）→ 回首检队列 'submitted'，processPending 下轮
+  //      重新首检（残缺号可能仍拿不到 ID、reauth 号若已重授权则可过）。此类若 cpa reject，processPending
+  //      deleteContribution 删行释放唯一键本就是 §2.4 设计（从没入池的号允许修好重交），安全。
+  //   ② 入过池（巡检 checkPooledHealth 把 pooled→needs_review，pooled_at 非空）→ **直接回池 'pooled'**，绝不回首检：
+  //      a) 回首检 → processPending 入池经 transitionToPool 用新时间**覆写 pooled_at**（:406 单条 UPDATE 无
+  //         COALESCE）→ settleDailyUsage 下界 `u.date <= dayStr(pooledAt)` 后移 → 重试日之前未结的历史欠薪
+  //         **永久跳过**（migration 010「入过池补结欠薪」被冲垮）。
+  //      b) 回首检若 cpa reject → processPending deleteContribution **删行释放唯一键** → 违反 §2.4「成功入池的
+  //         号一辈子只交一次、失效也不重交」。
+  //      直接 transition→'pooled'：pooled_at 原值不动（transition 只改 verify_status）＝结算下界不移、欠薪照补；
+  //      不进首检管道＝不可能触发删行；号若实际仍坏，checkPooledHealth 下轮巡检再转出去（pooled 态常规守护者，
+  //      语义自洽）。
+  // 读后 CAS 无竞态：pooled_at 只由 transitionToPool（from=submitted/first_check）写，本行处 needs_review 期间
+  //   不可能被写；verify_status 由下面 transition 的 CAS 自身守（仅当仍 needs_review 才转）。返回是否真转。
+  retryReview(id: string): boolean {
+    const r = conn.prepare('SELECT pooled_at FROM contributions WHERE id=?').get(id) as unknown as
+      | { pooled_at: number | null }
+      | undefined
+    if (!r) return false
+    const to = r.pooled_at != null ? 'pooled' : 'submitted'
+    return db.transition(id, ['needs_review'], to)
+  },
+  // 终止：标记放弃、退出人工队列、保留行与审计痕迹。选 stopped 不删行：needs_review 从没入池
+  // （pooled_at 为 null）→ 转 stopped 后不进 eligibleForSettlement（该集按 pooled_at IS NOT NULL 过滤、
+  // 不看 verify_status），不影响结算；保留行便于审计追溯。
+  terminateReview(id: string): boolean {
+    return db.transition(id, ['needs_review'], 'stopped')
   },
 }
 
@@ -1216,6 +1318,43 @@ export interface AuditRow {
   target: string
   oldValue: string | null // JSON 摘要字符串（脱敏后）或 null
   newValue: string | null
+  createdAt: number
+}
+
+// ===== 管理侧全局分页只读行（P4-R3，§6.146）=====
+// 贡献记录（脱敏：无 email/reward_code）。points＝该号累计发分（daily_settlements 汇总）。
+export interface AdminContributionRow {
+  id: string
+  linuxdoId: number
+  username: string
+  provider: string
+  plan: string
+  accountId: string
+  verifyStatus: string
+  points: number
+  createdAt: number
+}
+// 每日用量结算记录。linuxdoId/username 由 LEFT JOIN contributions 取；取不到 → null/空串兜底。
+export interface AdminSettlementRow {
+  id: number
+  contributionId: string
+  linuxdoId: number | null
+  username: string
+  date: string
+  provider: string
+  accountId: string
+  callCount: number
+  points: number
+  settledAt: number
+}
+// 兑换记录（🔴 §8：绝不含 result＝CDK 码原文）。username 由 linuxdo_id 子查询取，纯兑换用户可能为空串。
+export interface AdminRedemptionRow {
+  id: string
+  linuxdoId: number
+  username: string
+  itemName: string
+  cost: number
+  status: string
   createdAt: number
 }
 
