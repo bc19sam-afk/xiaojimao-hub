@@ -229,6 +229,10 @@ function api(path: string): string {
 function authHeaders(extra?: Record<string, string>): Record<string, string> {
   return { Authorization: `Bearer ${env.cpa.managementKey}`, ...extra }
 }
+// cpamp HTTP 报错对外统一中性文案（§8）：绝不把 cpamp 状态码/响应体/内部 API 路径透传前端。
+// 原文只进服务端日志（console.error）供排查——响应体是 cpamp **返回**的，不含我们**发出**的
+// RT/管理密钥/CDK（密钥在 Authorization 头、RT 在上传件里，都不在响应体）。
+export const CPA_UNAVAILABLE = '账号服务暂时不可用，请稍后重试'
 async function req(method: string, path: string, body?: unknown): Promise<unknown> {
   const init: RequestInit = { method, headers: authHeaders(), cache: 'no-store' }
   if (body !== undefined) {
@@ -237,7 +241,11 @@ async function req(method: string, path: string, body?: unknown): Promise<unknow
   }
   const res = await fetch(api(path), init)
   const text = await res.text()
-  if (!res.ok) throw new Error(`CPA ${method} ${path} 失败: ${res.status} ${text.slice(0, 200)}`)
+  if (!res.ok) {
+    // 原文（状态码 + 响应体 + 内部路径）只进服务端日志，对外抛中性常量（§8）
+    console.error(`[cpa] ${method} ${path} ${res.status}`, text)
+    throw new Error(CPA_UNAVAILABLE)
+  }
   return text ? JSON.parse(text) : {}
 }
 
@@ -350,7 +358,10 @@ const realClient: CpaClient = {
       for (let i = 0; i < 15; i++) {
         const s = await getAuthStatus(state)
         if (s.status === 'ok') break
-        if (s.status === 'error') throw new Error(s.error || '授权失败')
+        if (s.status === 'error') {
+          if (s.error) console.error('[cpa] get-auth-status error', s.error) // cpamp 原文留服务端排查，不透传（§8）
+          throw new Error('授权失败')
+        }
         await sleep(1000)
       }
     }
@@ -359,7 +370,10 @@ const realClient: CpaClient = {
 
   async checkOAuth(provider, state, knownAccountIds, before) {
     const s = await getAuthStatus(state)
-    if (s.status === 'error') return { status: 'error', error: s.error || '授权失败' }
+    if (s.status === 'error') {
+      if (s.error) console.error('[cpa] get-auth-status error', s.error) // cpamp 原文留服务端排查，不透传（§8）
+      return { status: 'error', error: '授权失败' }
+    }
     if (s.status !== 'ok') return { status: 'wait' }
     // device 流程跨请求（startOAuth 拿 state → 用户别处授权 → 本请求轮询落号）：授权前快照由
     // startOAuth 拍、按 state 持久化，collect 层读出后作 before 传入（P1b-4 修好了 P1b-3 遗留的
@@ -388,7 +402,11 @@ const realClient: CpaClient = {
     const form = new FormData()
     form.append('file', new Blob([JSON.stringify(authFile)], { type: 'application/json' }), fileName)
     const up = await fetch(api('/v0/management/auth-files'), { method: 'POST', headers: authHeaders(), body: form })
-    if (!up.ok) throw new Error(`上传账号失败: ${up.status} ${(await up.text()).slice(0, 200)}`)
+    if (!up.ok) {
+      // cpamp 上传响应原文只进服务端日志，对外抛中性常量（§8）。响应体不含我们上传的 RT/token。
+      console.error(`[cpa] POST /v0/management/auth-files ${up.status}`, await up.text())
+      throw new Error(CPA_UNAVAILABLE)
+    }
     return { accountId, email, plan: 'unknown', authFileName: fileName, duplicate: false }
   },
 
