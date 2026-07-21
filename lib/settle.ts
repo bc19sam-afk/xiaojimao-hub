@@ -22,10 +22,6 @@ function dayStr(ms: number): string {
   return `${d.getFullYear()}-${m}-${day}`
 }
 
-// 日切延迟：过了午夜再等这么久才结「昨天」（默认 10 分钟＝需求 §3.3「每日 00:10 结算前一自然日」），
-// 吸收 cpamp 侧迟到落账的事件——太早结、hasSettled 闸会把迟到量永久排除（codex xhigh 于 PR #16 指出）。
-const SETTLE_GRACE_MS = 10 * 60_000
-
 // 本进程今天是否已跑过结算（按日驱动，codex xhigh 于 PR #16 指出：/v0/management/usage 是 ~19MB 全量
 // 事件流，8s tick 每轮都拉＝~205GB/天。结算一天一次就够）。进程重启后重跑一次无害——hasSettled/两层
 // UNIQUE 兜幂等，只多一次拉取。
@@ -45,9 +41,12 @@ export async function settleDailyUsage(
   skipped?: boolean
 }> {
   if (running) return { settled: 0, awarded: 0, skipped: true }
-  // 日切延迟内（00:00–00:10）不结算：等迟到事件落定，今天晚些时候再结昨天
+  // 日切延迟（结算时刻，§3.3）：过了午夜再等这么久才结「昨天」，吸收 cpamp 侧迟到落账——太早结、hasSettled
+  // 闸会把迟到量永久排除（codex xhigh 于 PR #16 指出）。默认 10 分钟＝「每日 00:10 结算前一自然日」，
+  // 后台可配（db.getSettleGraceMs，缺省仍 10min）；时区随服务器不可配。
+  const graceMs = db.getSettleGraceMs()
   const sinceMidnight = now - new Date(new Date(now).setHours(0, 0, 0, 0)).getTime()
-  if (sinceMidnight < SETTLE_GRACE_MS) return { settled: 0, awarded: 0, skipped: true }
+  if (sinceMidnight < graceMs) return { settled: 0, awarded: 0, skipped: true }
   const today = dayStr(now)
   // 按日驱动：本进程今天已跑过 → 跳过（不再全量拉 usage）。force 供测试/手动。
   if (!opts.force && lastRunDay === today) return { settled: 0, awarded: 0, skipped: true }
@@ -77,7 +76,17 @@ export async function settleDailyUsage(
       if (c.pooledAt != null && u.date <= dayStr(c.pooledAt)) continue
       if (db.hasSettled(c.id, u.date)) continue // 该日已结算 → 跳过（快速闸）
 
-      const points = Math.round(u.count * db.ratePerCall(c.provider, c.plan))
+      const rate = db.ratePerCall(c.provider, c.plan)
+      const points = Math.round(u.count * rate)
+      // 结算防御闸（P4-R2 codex 复审 P2）：单价被写脏（历史遗留 Infinity/NaN，或绕过路由上界直写 db）→ points
+      // 非法（溢出 Infinity / NaN / 负）。一律不结不发、跳过——留待管理员修好单价后下轮重结自愈（该日未落
+      // settlement，hasSettled 不吞）。⚠️ 绝不记 points=0 的 settlement 凑数：那会让 hasSettled 把该日欠薪永久吞掉。
+      if (!Number.isSafeInteger(points) || points < 0) {
+        console.error(
+          `[settle] 跳过非法折算 points=${points}：provider=${c.provider} account=${c.accountId} date=${u.date} rate=${rate}`,
+        )
+        continue
+      }
       // 发分 + 记结算同一事务（settleAndAward，BEGIN IMMEDIATE）：夹缝崩溃不再产生「ledger 已入账、
       // settlement 未记」的分叉；两层 UNIQUE 仍各自幂等兜底。points=0 不入账、仍记 settlement 免反复查。
       const r = db.settleAndAward({

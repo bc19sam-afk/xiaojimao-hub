@@ -10,6 +10,15 @@ interface PointRule {
   enabled: number
   label: string
 }
+// 折算规则（按次单价，P4-R2 §3.4）：pointsPerCall 可小数（usage_rates.points_per_call REAL）
+interface UsageRate {
+  id: number
+  provider: string
+  plan: string
+  pointsPerCall: number
+  enabled: number
+  label: string
+}
 interface RedeemItem {
   id: number
   name: string
@@ -58,8 +67,12 @@ const field =
 
 export default function AdminPanel() {
   const [rules, setRules] = useState<PointRule[]>([])
+  const [rates, setRates] = useState<UsageRate[]>([]) // 折算规则（按次单价）
   const [items, setItems] = useState<RedeemItem[]>([])
   const [quota, setQuota] = useState('') // LDC 每日额度（受控输入，字符串）
+  const [gateEnabled, setGateEnabled] = useState(true) // 信任门槛开关（缺省启用）
+  const [minTrust, setMinTrust] = useState('') // 信任门槛数值（受控输入，字符串）
+  const [graceMinutes, setGraceMinutes] = useState('') // 结算时刻：午夜后分钟（受控输入，字符串）
   const [audit, setAudit] = useState<AuditRow[]>([])
   const [msg, setMsg] = useState('')
 
@@ -68,9 +81,24 @@ export default function AdminPanel() {
     setRules(d.pointRules ?? [])
     setItems(d.redeemItems ?? [])
   }, [])
+  const loadRates = useCallback(async () => {
+    const d = await fetch('/api/admin/usage-rates', { cache: 'no-store' }).then((r) => r.json())
+    if (d.ok) setRates(d.usageRates ?? [])
+  }, [])
   const loadQuota = useCallback(async () => {
     const d = await fetch('/api/admin/ldc-quota', { cache: 'no-store' }).then((r) => r.json())
     if (d.ok) setQuota(String(d.quota))
+  }, [])
+  const loadGate = useCallback(async () => {
+    const d = await fetch('/api/admin/trust-gate', { cache: 'no-store' }).then((r) => r.json())
+    if (d.ok) {
+      setGateEnabled(d.enabled)
+      setMinTrust(String(d.minTrust))
+    }
+  }, [])
+  const loadSettle = useCallback(async () => {
+    const d = await fetch('/api/admin/settle-params', { cache: 'no-store' }).then((r) => r.json())
+    if (d.ok) setGraceMinutes(String(d.graceMinutes))
   }, [])
   const loadAudit = useCallback(async () => {
     const d = await fetch('/api/admin/audit?limit=50', { cache: 'no-store' }).then((r) => r.json())
@@ -78,9 +106,12 @@ export default function AdminPanel() {
   }, [])
   useEffect(() => {
     load()
+    loadRates()
     loadQuota()
+    loadGate()
+    loadSettle()
     loadAudit()
-  }, [load, loadQuota, loadAudit])
+  }, [load, loadRates, loadQuota, loadGate, loadSettle, loadAudit])
 
   const flash = (t: string) => {
     setMsg(t)
@@ -110,6 +141,45 @@ export default function AdminPanel() {
     } else flash(d.error || '失败')
   }
 
+  async function saveGate() {
+    const n = Number(minTrust)
+    if (minTrust.trim() === '' || !Number.isSafeInteger(n) || n < 0) {
+      flash('门槛须为非负整数')
+      return
+    }
+    const res = await fetch('/api/admin/trust-gate', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled: gateEnabled, minTrust: n }),
+    })
+    const d = await res.json()
+    if (res.ok) {
+      setGateEnabled(d.enabled)
+      setMinTrust(String(d.minTrust))
+      flash('已保存')
+      loadAudit()
+    } else flash(d.error || '失败')
+  }
+
+  async function saveSettle() {
+    const n = Number(graceMinutes)
+    if (graceMinutes.trim() === '' || !Number.isSafeInteger(n) || n < 0 || n > 1439) {
+      flash('结算时刻须为 0–1439 分钟')
+      return
+    }
+    const res = await fetch('/api/admin/settle-params', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ graceMinutes: n }),
+    })
+    const d = await res.json()
+    if (res.ok) {
+      setGraceMinutes(String(d.graceMinutes))
+      flash('已保存')
+      loadAudit()
+    } else flash(d.error || '失败')
+  }
+
   async function saveRule(r: Partial<PointRule>) {
     const res = await fetch('/api/admin/point-rules', {
       method: 'PUT',
@@ -125,6 +195,24 @@ export default function AdminPanel() {
   async function delRule(id: number) {
     const d = await fetch('/api/admin/point-rules?id=' + id, { method: 'DELETE' }).then((r) => r.json())
     setRules(d.pointRules)
+    flash('已删除')
+  }
+  async function saveRate(r: Partial<UsageRate>) {
+    const res = await fetch('/api/admin/usage-rates', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...r, enabled: r.enabled !== 0 }),
+    })
+    const d = await res.json()
+    if (res.ok) {
+      setRates(d.usageRates)
+      flash('已保存')
+      loadAudit()
+    } else flash(d.error || '失败')
+  }
+  async function delRate(id: number) {
+    const d = await fetch('/api/admin/usage-rates?id=' + id, { method: 'DELETE' }).then((r) => r.json())
+    setRates(d.usageRates)
     flash('已删除')
   }
   async function saveItem(it: Partial<RedeemItem>) {
@@ -181,6 +269,24 @@ export default function AdminPanel() {
           </div>
         </section>
 
+        {/* 折算规则（按次单价，P4-R2 §3.4）：按 (provider, 套餐) 每次调用积分单价，可小数。plan 填 * 作兜底 */}
+        <section className="mb-8 rounded-2xl border border-white/10 bg-white/[0.02] p-5">
+          <h2 className="mb-1 font-bold text-white">折算规则（按次单价）</h2>
+          <p className="mb-4 text-xs text-neutral-500">
+            号在池后，按 cpamp 每日调用量折算积分：结算 = round(次数 × 单价)。单价可小数（如 <code>0.5</code>）。plan 填{' '}
+            <code>*</code> 作该 provider 的兜底。改完点保存即时生效。改 <code>provider</code>/<code>plan</code> 需先删旧行再新增。
+          </p>
+          <div className="space-y-2">
+            <div className="grid grid-cols-[1fr_1fr_80px_1.4fr_auto_auto] gap-2 text-[11px] text-neutral-500">
+              <span>provider</span><span>plan</span><span>单价</span><span>标签</span><span>启用</span><span></span>
+            </div>
+            {rates.map((r) => (
+              <RateRow key={r.id} rate={r} onSave={saveRate} onDelete={() => delRate(r.id)} />
+            ))}
+            <RateRow onSave={saveRate} isNew />
+          </div>
+        </section>
+
         {/* 兑换项 */}
         <section className="rounded-2xl border border-white/10 bg-white/[0.02] p-5">
           <h2 className="mb-1 font-bold text-white">兑换项（商店）</h2>
@@ -224,6 +330,68 @@ export default function AdminPanel() {
             />
             <button
               onClick={saveQuota}
+              className="rounded-lg bg-[var(--brand)]/20 px-3 py-1.5 text-xs font-medium text-[var(--brand-bright)] hover:bg-[var(--brand)]/30"
+            >
+              保存
+            </button>
+          </div>
+        </section>
+
+        {/* 信任等级门槛 & 限身份开关（P4-R2 §1）：关＝登录即可、不限等级；开则等级不足拒登录（不使已登录会话失效） */}
+        <section className="mt-8 rounded-2xl border border-white/10 bg-white/[0.02] p-5">
+          <h2 className="mb-1 font-bold text-white">信任等级门槛</h2>
+          <p className="mb-4 text-xs text-neutral-500">
+            控制谁能登录贡献账号。关闭门槛＝登录即可、不限信任等级；开启则 linux.do 信任等级低于门槛者被拒。
+            调整只影响此后登录，不使已登录会话失效。
+          </p>
+          <div className="flex flex-wrap items-center gap-3">
+            <label className="flex items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                checked={gateEnabled}
+                onChange={(e) => setGateEnabled(e.target.checked)}
+                className="h-4 w-4 accent-emerald-500"
+              />
+              {gateEnabled ? '限信任等级' : '登录即可（不限）'}
+            </label>
+            <input
+              className={field + ' w-40' + (gateEnabled ? '' : ' opacity-40')}
+              type="number"
+              min={0}
+              value={minTrust}
+              onChange={(e) => setMinTrust(e.target.value)}
+              disabled={!gateEnabled}
+              placeholder="门槛等级，如 1"
+            />
+            <button
+              onClick={saveGate}
+              className="rounded-lg bg-[var(--brand)]/20 px-3 py-1.5 text-xs font-medium text-[var(--brand-bright)] hover:bg-[var(--brand)]/30"
+            >
+              保存
+            </button>
+          </div>
+        </section>
+
+        {/* 结算参数（P4-R2 §3.3）：结算时刻＝午夜后延迟分钟数，缺省 10（00:10）。时区随服务器不可配 */}
+        <section className="mt-8 rounded-2xl border border-white/10 bg-white/[0.02] p-5">
+          <h2 className="mb-1 font-bold text-white">结算参数</h2>
+          <p className="mb-4 text-xs text-neutral-500">
+            每日结算前一自然日的用量。结算时刻＝午夜后延迟多少分钟再结（吸收迟到落账），缺省 <code>10</code>（即 00:10）。
+            范围 0–1439 分钟。<span className="text-amber-300/80">时区随服务器，不可配。</span>
+          </p>
+          <div className="flex items-center gap-2">
+            <input
+              className={field + ' w-40'}
+              type="number"
+              min={0}
+              max={1439}
+              value={graceMinutes}
+              onChange={(e) => setGraceMinutes(e.target.value)}
+              placeholder="10"
+            />
+            <span className="text-xs text-neutral-500">分钟（午夜后）</span>
+            <button
+              onClick={saveSettle}
               className="rounded-lg bg-[var(--brand)]/20 px-3 py-1.5 text-xs font-medium text-[var(--brand-bright)] hover:bg-[var(--brand)]/30"
             >
               保存
@@ -401,6 +569,50 @@ function RuleRow({
       <div className="flex gap-1">
         <button
           onClick={() => onSave({ provider, plan, points, label, enabled: enabled ? 1 : 0 })}
+          className="rounded-lg bg-[var(--brand)]/20 px-2.5 py-1.5 text-xs font-medium text-[var(--brand-bright)] hover:bg-[var(--brand)]/30"
+        >
+          {isNew ? '新增' : '保存'}
+        </button>
+        {onDelete && (
+          <button onClick={onDelete} className="rounded-lg bg-rose-500/10 px-2.5 py-1.5 text-xs text-rose-300 hover:bg-rose-500/20">
+            删
+          </button>
+        )}
+      </div>
+    </div>
+  )
+}
+
+// 折算规则一行（P4-R2 §3.4）：仿 RuleRow，唯一差异＝单价输入可小数（step=0.1）。upsert 以 (provider, plan) 为键，不传 id
+function RateRow({
+  rate,
+  onSave,
+  onDelete,
+  isNew,
+}: {
+  rate?: UsageRate
+  onSave: (r: Partial<UsageRate>) => void
+  onDelete?: () => void
+  isNew?: boolean
+}) {
+  const [provider, setProvider] = useState(rate?.provider ?? '')
+  const [plan, setPlan] = useState(rate?.plan ?? '')
+  const [pointsPerCall, setPointsPerCall] = useState(rate?.pointsPerCall ?? 0)
+  const [label, setLabel] = useState(rate?.label ?? '')
+  const [enabled, setEnabled] = useState((rate?.enabled ?? 1) !== 0)
+
+  return (
+    <div className="grid grid-cols-[1fr_1fr_80px_1.4fr_auto_auto] items-center gap-2">
+      {/* 存量行 provider/plan 禁改（P4-R2 codex 复审 P2）：upsert 按 (provider,plan) 键，改键＝插新行、旧行仍
+          enabled 计价。改档口径＝先删旧行再新增（唯 isNew 行可编辑键）。置灰样式与信任门槛 disabled 输入一致。 */}
+      <input className={field + (isNew ? '' : ' opacity-40')} value={provider} onChange={(e) => setProvider(e.target.value)} placeholder="codex" disabled={!isNew} />
+      <input className={field + (isNew ? '' : ' opacity-40')} value={plan} onChange={(e) => setPlan(e.target.value)} placeholder="plus / *" disabled={!isNew} />
+      <input className={field} type="number" step={0.1} min={0} value={pointsPerCall} onChange={(e) => setPointsPerCall(Number(e.target.value))} />
+      <input className={field} value={label} onChange={(e) => setLabel(e.target.value)} placeholder="标签" />
+      <input type="checkbox" checked={enabled} onChange={(e) => setEnabled(e.target.checked)} className="h-4 w-4 accent-emerald-500" />
+      <div className="flex gap-1">
+        <button
+          onClick={() => onSave({ provider, plan, pointsPerCall, label, enabled: enabled ? 1 : 0 })}
           className="rounded-lg bg-[var(--brand)]/20 px-2.5 py-1.5 text-xs font-medium text-[var(--brand-bright)] hover:bg-[var(--brand)]/30"
         >
           {isNew ? '新增' : '保存'}

@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { env } from '@/lib/env'
+import { db } from '@/lib/db'
 import { exchangeCodeForToken, fetchLinuxDoUser } from '@/lib/linuxdo'
 import { signSession, SESSION_COOKIE, sessionCookieOptions, type SessionUser } from '@/lib/session'
 import { originOf, isSecureRequest } from '@/lib/request'
@@ -17,7 +17,8 @@ export async function GET(req: NextRequest) {
     const token = await exchangeCodeForToken(code)
     const profile = await fetchLinuxDoUser(token.access_token)
     const trustLevel = Number(profile.trust_level ?? 0)
-    if (trustLevel < env.linuxdo.minTrustLevel) return fail('trust')
+    // 信任门槛后台可配（§1）：开关开且等级不足才拦；开关关＝登录即可、不限信任等级。缺省门槛回落 env。
+    if (db.isTrustGateEnabled() && trustLevel < db.getMinTrustLevel()) return fail('trust')
 
     const user: SessionUser = {
       id: Number(profile.id),

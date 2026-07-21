@@ -1,4 +1,4 @@
-import type { PointRule, RedeemItem } from './db'
+import type { PointRule, UsageRate, RedeemItem } from './db'
 
 // ============================================================================
 // 审计条目构造器（P4-R1，§7.3）：把每个 admin 写入点的「旧值→新值」规整成 { action, target, old, new }
@@ -37,6 +37,30 @@ export function auditPointRuleDelete(old: PointRule | undefined, id: number): Au
     action: 'point_rule.delete',
     target: old ? `${old.provider}/${old.plan}` : `#${id}`,
     old: old ? ruleSummary(old) : undefined,
+  }
+}
+
+// ---- 折算规则 usage_rates（按次单价，可小数）----
+function rateSummary(r: UsageRate) {
+  return { provider: r.provider, plan: r.plan, pointsPerCall: r.pointsPerCall, enabled: r.enabled, label: r.label }
+}
+// next 为已规整（provider/plan 已小写，与落库/唯一键一致）的入参
+export function auditUsageRateUpsert(
+  old: UsageRate | undefined,
+  next: { provider: string; plan: string; pointsPerCall: number; enabled: boolean; label: string },
+): AuditEntry {
+  return {
+    action: 'usage_rate.upsert',
+    target: `${next.provider}/${next.plan}`,
+    old: old ? rateSummary(old) : undefined,
+    new: { provider: next.provider, plan: next.plan, pointsPerCall: next.pointsPerCall, enabled: next.enabled ? 1 : 0, label: next.label },
+  }
+}
+export function auditUsageRateDelete(old: UsageRate | undefined, id: number): AuditEntry {
+  return {
+    action: 'usage_rate.delete',
+    target: old ? `${old.provider}/${old.plan}` : `#${id}`,
+    old: old ? rateSummary(old) : undefined,
   }
 }
 
@@ -122,5 +146,29 @@ export function auditLdcQuota(oldQuota: number, newQuota: number): AuditEntry {
     target: 'ldc_daily_quota',
     old: oldQuota,
     new: newQuota,
+  }
+}
+
+// ---- 信任门槛 & 限身份开关（§1）----
+// enabled 规整 1/0（与本文件其它 enabled 摘要口径一致，审计日志可读一致）；minTrust 为门槛整数等级。
+export function auditTrustGate(
+  old: { enabled: boolean; minTrust: number },
+  next: { enabled: boolean; minTrust: number },
+): AuditEntry {
+  return {
+    action: 'trust_gate.set',
+    target: 'trust_gate',
+    old: { enabled: old.enabled ? 1 : 0, minTrust: old.minTrust },
+    new: { enabled: next.enabled ? 1 : 0, minTrust: next.minTrust },
+  }
+}
+
+// ---- 结算参数（结算时刻，§3.3）----
+export function auditSettleParam(oldMinutes: number, newMinutes: number): AuditEntry {
+  return {
+    action: 'settle_param.set',
+    target: 'settle_grace_minutes',
+    old: oldMinutes,
+    new: newMinutes,
   }
 }

@@ -95,24 +95,36 @@ export function seedDefaults(d: DatabaseSync): void {
       )
       for (const [p, pl, pts, label] of rules) stmt.run(p, pl, pts, label)
     }
-    // 用量单价（usage_rates，P2-R2）：每次调用积分单价，占位值、后台可调（管理 UI 留 R3）。分档演示
-    // codex-pro 高于 plus；claude/grok 用兜底档。数字皆占位——需求 §3.4「数字全为占位、随时调」。
-    const rateCount = (d.prepare('SELECT COUNT(*) AS n FROM usage_rates').get() as { n: number }).n
-    if (rateCount === 0) {
-      const rates: [string, string, number, string][] = [
-        ['codex', 'plus', 1, 'Codex Plus 每次调用'],
-        ['codex', 'pro', 2, 'Codex Pro 每次调用'],
-        ['codex', '*', 1, 'Codex 其它每次调用'],
-        ['claude', '*', 1, 'Claude 每次调用'],
-        ['grok', '*', 1, 'SuperGrok 每次调用'],
-      ]
-      // ON CONFLICT DO NOTHING：P2-R2 本块先行止血的幂等插入。现整个 seedDefaults 已包进外层
-      // BEGIN IMMEDIATE 单事务，此 ON CONFLICT 成冗余兜底、保留无害（不再单独依赖它防并发）。
-      const stmt = d.prepare(
-        `INSERT INTO usage_rates (provider, plan, points_per_call, label) VALUES (?,?,?,?)
-         ON CONFLICT(provider, plan) DO NOTHING`,
+    // 用量单价（usage_rates，P2-R2）：每次调用积分单价，占位值、后台可调。分档演示 codex-pro 高于 plus；
+    // claude/grok 用兜底档。数字皆占位——需求 §3.4「数字全为占位、随时调」。
+    // ⚠️ 一次性播种（P4-R2 codex 复审 P1）：本轮新增 DELETE usage-rates 让「管理员删空＝停发」成立，但旧逻辑
+    // 每次启动 rateCount===0 就播回默认档＝重启/部署后静默恢复发分。改用 marker 键 'usage_rates_seeded'
+    // （仿下方 observe_window_ms 的「键缺失才播」范式）：仅首次（无 marker）才进本段播种，**无论是否播种都写
+    // marker**，之后启动一律跳过、删空不回种。存量库（rates>0 且无 marker）首次重开跳过播种、补写 marker，
+    // 行为不变。整段已在外层 BEGIN IMMEDIATE 内、无并发问题。
+    if (d.prepare('SELECT 1 FROM app_config WHERE key=?').get('usage_rates_seeded') == null) {
+      const rateCount = (d.prepare('SELECT COUNT(*) AS n FROM usage_rates').get() as { n: number }).n
+      if (rateCount === 0) {
+        const rates: [string, string, number, string][] = [
+          ['codex', 'plus', 1, 'Codex Plus 每次调用'],
+          ['codex', 'pro', 2, 'Codex Pro 每次调用'],
+          ['codex', '*', 1, 'Codex 其它每次调用'],
+          ['claude', '*', 1, 'Claude 每次调用'],
+          ['grok', '*', 1, 'SuperGrok 每次调用'],
+        ]
+        // ON CONFLICT DO NOTHING：既有幂等兜底，保留无害（现整段已在外层 BEGIN IMMEDIATE 单事务内）。
+        const stmt = d.prepare(
+          `INSERT INTO usage_rates (provider, plan, points_per_call, label) VALUES (?,?,?,?)
+           ON CONFLICT(provider, plan) DO NOTHING`,
+        )
+        for (const [p, pl, ppc, label] of rates) stmt.run(p, pl, ppc, label)
+      }
+      // 无论是否播种都落 marker：之后启动不再进本段（管理员删空后不回种）
+      d.prepare('INSERT INTO app_config (key, value, updated_at) VALUES (?,?,?)').run(
+        'usage_rates_seeded',
+        '1',
+        Date.now(),
       )
-      for (const [p, pl, ppc, label] of rates) stmt.run(p, pl, ppc, label)
     }
     const itemCount = (d.prepare('SELECT COUNT(*) AS n FROM redeem_items').get() as { n: number }).n
     if (itemCount === 0) {
@@ -464,6 +476,41 @@ export const db = {
       .run(key, value, Date.now())
   },
 
+  // ===== 配置：信任等级门槛 & 限身份开关（P4-R2，§1）=====
+  // 两控件：门槛数值 min_trust_level + 是否启用门槛 trust_gate_enabled（关＝登录即可、不限信任等级）。
+  // 门槛只在登录回调判（callback route），调整不影响已登录会话（保留至过期）。
+  getMinTrustLevel(): number {
+    // 缺省回落 env.linuxdo.minTrustLevel（保留 ENV MIN_TRUST_LEVEL 作向后兼容默认）；脏值/负值同回落。
+    const raw = db.getConfig('min_trust_level')
+    if (raw == null) return env.linuxdo.minTrustLevel
+    const n = Math.floor(Number(raw))
+    return Number.isFinite(n) && n >= 0 ? n : env.linuxdo.minTrustLevel
+  },
+  setMinTrustLevel(n: number): void {
+    db.setConfig('min_trust_level', String(Math.max(0, Math.floor(Number(n) || 0))))
+  },
+  // 是否启用信任门槛：缺省 true（仅显式 '0' 才关＝登录即可、不限等级）。
+  isTrustGateEnabled(): boolean {
+    return db.getConfig('trust_gate_enabled') !== '0'
+  },
+  setTrustGateEnabled(on: boolean): void {
+    db.setConfig('trust_gate_enabled', on ? '1' : '0')
+  },
+
+  // ===== 配置：结算参数（结算时刻，P4-R2，§3.3）=====
+  // 结算时刻＝午夜后延迟分钟数（日切延迟）：settle_grace_minutes × 60000，缺省 10 分钟、钳 [0,1439]（一天内）。
+  // 时区随服务器不可配（§3.3 明确）。lib/settle.ts 每轮读，缺省仍 10min ⇒ 现有 daily-settlement 测试不破。
+  getSettleGraceMs(): number {
+    const raw = db.getConfig('settle_grace_minutes')
+    if (raw == null) return 10 * 60_000
+    const n = Math.floor(Number(raw))
+    if (!Number.isFinite(n) || n < 0) return 10 * 60_000 // 脏值/负值回落缺省
+    return Math.min(1439, n) * 60_000 // 上钳 1439 分钟（一天内）
+  },
+  setSettleGraceMinutes(n: number): void {
+    db.setConfig('settle_grace_minutes', String(Math.max(0, Math.min(1439, Math.floor(Number(n) || 0)))))
+  },
+
   // ===== 配置：发分规则 =====
   listPointRules(): PointRule[] {
     return conn
@@ -606,6 +653,25 @@ export const db = {
       .prepare("SELECT points_per_call FROM usage_rates WHERE provider=? AND plan='*' AND enabled=1")
       .get(p) as unknown as { points_per_call: number } | undefined
     return wild?.points_per_call ?? 0
+  },
+
+  // ===== 配置：折算规则 usage_rates（P4-R2，§3.4）=====
+  // 仿 point_rules CRUD，唯一差异：列名 points_per_call（REAL、可小数），字段名 pointsPerCall。ratePerCall（上）为读取器。
+  listUsageRates(): UsageRate[] {
+    return conn
+      .prepare('SELECT id, provider, plan, points_per_call AS pointsPerCall, enabled, label FROM usage_rates ORDER BY provider, points_per_call DESC')
+      .all() as unknown as UsageRate[]
+  },
+  upsertUsageRate(r: { id?: number; provider: string; plan: string; pointsPerCall: number; enabled: boolean; label: string }): void {
+    conn
+      .prepare(
+        `INSERT INTO usage_rates (provider, plan, points_per_call, enabled, label) VALUES (?,?,?,?,?)
+         ON CONFLICT(provider, plan) DO UPDATE SET points_per_call=excluded.points_per_call, enabled=excluded.enabled, label=excluded.label`,
+      )
+      .run(r.provider.toLowerCase(), r.plan.toLowerCase(), r.pointsPerCall, r.enabled ? 1 : 0, r.label)
+  },
+  deleteUsageRate(id: number): void {
+    conn.prepare('DELETE FROM usage_rates WHERE id=?').run(id)
   },
 
   // 记一笔当日结算：INSERT，(contribution_id, date) 冲突则 DO NOTHING（按日结算幂等）。返回是否本次真正落库。
@@ -1158,6 +1224,14 @@ export interface PointRule {
   provider: string
   plan: string
   points: number
+  enabled: number
+  label: string
+}
+export interface UsageRate {
+  id: number
+  provider: string
+  plan: string
+  pointsPerCall: number // usage_rates.points_per_call（REAL，可小数）
   enabled: number
   label: string
 }
