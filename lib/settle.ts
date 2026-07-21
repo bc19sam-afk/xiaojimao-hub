@@ -76,7 +76,17 @@ export async function settleDailyUsage(
       if (c.pooledAt != null && u.date <= dayStr(c.pooledAt)) continue
       if (db.hasSettled(c.id, u.date)) continue // 该日已结算 → 跳过（快速闸）
 
-      const points = Math.round(u.count * db.ratePerCall(c.provider, c.plan))
+      const rate = db.ratePerCall(c.provider, c.plan)
+      const points = Math.round(u.count * rate)
+      // 结算防御闸（P4-R2 codex 复审 P2）：单价被写脏（历史遗留 Infinity/NaN，或绕过路由上界直写 db）→ points
+      // 非法（溢出 Infinity / NaN / 负）。一律不结不发、跳过——留待管理员修好单价后下轮重结自愈（该日未落
+      // settlement，hasSettled 不吞）。⚠️ 绝不记 points=0 的 settlement 凑数：那会让 hasSettled 把该日欠薪永久吞掉。
+      if (!Number.isSafeInteger(points) || points < 0) {
+        console.error(
+          `[settle] 跳过非法折算 points=${points}：provider=${c.provider} account=${c.accountId} date=${u.date} rate=${rate}`,
+        )
+        continue
+      }
       // 发分 + 记结算同一事务（settleAndAward，BEGIN IMMEDIATE）：夹缝崩溃不再产生「ledger 已入账、
       // settlement 未记」的分叉；两层 UNIQUE 仍各自幂等兜底。points=0 不入账、仍记 settlement 免反复查。
       const r = db.settleAndAward({

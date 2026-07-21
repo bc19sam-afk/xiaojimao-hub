@@ -21,6 +21,10 @@ export async function PUT(req: NextRequest) {
   const ppc = b.pointsPerCall
   if (typeof ppc !== 'number' || !Number.isFinite(ppc) || ppc < 0)
     return NextResponse.json({ error: 'pointsPerCall 须为非负数' }, { status: 400 })
+  // 单价上界（P4-R2 codex 复审 P2）：1e6 × 现实日调用量 1e7 = 1e13 < 2^53，乘积必落安全整数区，杜绝结算侧
+  // Math.round(次数 × 单价) 溢出 Infinity 落非法余额。超界 400（结算侧另有防御闸兜库里既有脏值）。
+  if (ppc > 1_000_000)
+    return NextResponse.json({ error: 'pointsPerCall 过大' }, { status: 400 })
   // provider/plan 规整小写＝与唯一键 / ratePerCall 查表口径一致：既用于查旧值定位，也用于审计 target（同一口径）
   const provider = String(b.provider).toLowerCase()
   const plan = String(b.plan).toLowerCase()

@@ -274,7 +274,7 @@ export default function AdminPanel() {
           <h2 className="mb-1 font-bold text-white">折算规则（按次单价）</h2>
           <p className="mb-4 text-xs text-neutral-500">
             号在池后，按 cpamp 每日调用量折算积分：结算 = round(次数 × 单价)。单价可小数（如 <code>0.5</code>）。plan 填{' '}
-            <code>*</code> 作该 provider 的兜底。改完点保存即时生效。
+            <code>*</code> 作该 provider 的兜底。改完点保存即时生效。改 <code>provider</code>/<code>plan</code> 需先删旧行再新增。
           </p>
           <div className="space-y-2">
             <div className="grid grid-cols-[1fr_1fr_80px_1.4fr_auto_auto] gap-2 text-[11px] text-neutral-500">
@@ -603,8 +603,10 @@ function RateRow({
 
   return (
     <div className="grid grid-cols-[1fr_1fr_80px_1.4fr_auto_auto] items-center gap-2">
-      <input className={field} value={provider} onChange={(e) => setProvider(e.target.value)} placeholder="codex" />
-      <input className={field} value={plan} onChange={(e) => setPlan(e.target.value)} placeholder="plus / *" />
+      {/* 存量行 provider/plan 禁改（P4-R2 codex 复审 P2）：upsert 按 (provider,plan) 键，改键＝插新行、旧行仍
+          enabled 计价。改档口径＝先删旧行再新增（唯 isNew 行可编辑键）。置灰样式与信任门槛 disabled 输入一致。 */}
+      <input className={field + (isNew ? '' : ' opacity-40')} value={provider} onChange={(e) => setProvider(e.target.value)} placeholder="codex" disabled={!isNew} />
+      <input className={field + (isNew ? '' : ' opacity-40')} value={plan} onChange={(e) => setPlan(e.target.value)} placeholder="plus / *" disabled={!isNew} />
       <input className={field} type="number" step={0.1} min={0} value={pointsPerCall} onChange={(e) => setPointsPerCall(Number(e.target.value))} />
       <input className={field} value={label} onChange={(e) => setLabel(e.target.value)} placeholder="标签" />
       <input type="checkbox" checked={enabled} onChange={(e) => setEnabled(e.target.checked)} className="h-4 w-4 accent-emerald-500" />

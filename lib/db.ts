@@ -95,24 +95,36 @@ export function seedDefaults(d: DatabaseSync): void {
       )
       for (const [p, pl, pts, label] of rules) stmt.run(p, pl, pts, label)
     }
-    // 用量单价（usage_rates，P2-R2）：每次调用积分单价，占位值、后台可调（管理 UI 留 R3）。分档演示
-    // codex-pro 高于 plus；claude/grok 用兜底档。数字皆占位——需求 §3.4「数字全为占位、随时调」。
-    const rateCount = (d.prepare('SELECT COUNT(*) AS n FROM usage_rates').get() as { n: number }).n
-    if (rateCount === 0) {
-      const rates: [string, string, number, string][] = [
-        ['codex', 'plus', 1, 'Codex Plus 每次调用'],
-        ['codex', 'pro', 2, 'Codex Pro 每次调用'],
-        ['codex', '*', 1, 'Codex 其它每次调用'],
-        ['claude', '*', 1, 'Claude 每次调用'],
-        ['grok', '*', 1, 'SuperGrok 每次调用'],
-      ]
-      // ON CONFLICT DO NOTHING：P2-R2 本块先行止血的幂等插入。现整个 seedDefaults 已包进外层
-      // BEGIN IMMEDIATE 单事务，此 ON CONFLICT 成冗余兜底、保留无害（不再单独依赖它防并发）。
-      const stmt = d.prepare(
-        `INSERT INTO usage_rates (provider, plan, points_per_call, label) VALUES (?,?,?,?)
-         ON CONFLICT(provider, plan) DO NOTHING`,
+    // 用量单价（usage_rates，P2-R2）：每次调用积分单价，占位值、后台可调。分档演示 codex-pro 高于 plus；
+    // claude/grok 用兜底档。数字皆占位——需求 §3.4「数字全为占位、随时调」。
+    // ⚠️ 一次性播种（P4-R2 codex 复审 P1）：本轮新增 DELETE usage-rates 让「管理员删空＝停发」成立，但旧逻辑
+    // 每次启动 rateCount===0 就播回默认档＝重启/部署后静默恢复发分。改用 marker 键 'usage_rates_seeded'
+    // （仿下方 observe_window_ms 的「键缺失才播」范式）：仅首次（无 marker）才进本段播种，**无论是否播种都写
+    // marker**，之后启动一律跳过、删空不回种。存量库（rates>0 且无 marker）首次重开跳过播种、补写 marker，
+    // 行为不变。整段已在外层 BEGIN IMMEDIATE 内、无并发问题。
+    if (d.prepare('SELECT 1 FROM app_config WHERE key=?').get('usage_rates_seeded') == null) {
+      const rateCount = (d.prepare('SELECT COUNT(*) AS n FROM usage_rates').get() as { n: number }).n
+      if (rateCount === 0) {
+        const rates: [string, string, number, string][] = [
+          ['codex', 'plus', 1, 'Codex Plus 每次调用'],
+          ['codex', 'pro', 2, 'Codex Pro 每次调用'],
+          ['codex', '*', 1, 'Codex 其它每次调用'],
+          ['claude', '*', 1, 'Claude 每次调用'],
+          ['grok', '*', 1, 'SuperGrok 每次调用'],
+        ]
+        // ON CONFLICT DO NOTHING：既有幂等兜底，保留无害（现整段已在外层 BEGIN IMMEDIATE 单事务内）。
+        const stmt = d.prepare(
+          `INSERT INTO usage_rates (provider, plan, points_per_call, label) VALUES (?,?,?,?)
+           ON CONFLICT(provider, plan) DO NOTHING`,
+        )
+        for (const [p, pl, ppc, label] of rates) stmt.run(p, pl, ppc, label)
+      }
+      // 无论是否播种都落 marker：之后启动不再进本段（管理员删空后不回种）
+      d.prepare('INSERT INTO app_config (key, value, updated_at) VALUES (?,?,?)').run(
+        'usage_rates_seeded',
+        '1',
+        Date.now(),
       )
-      for (const [p, pl, ppc, label] of rates) stmt.run(p, pl, ppc, label)
     }
     const itemCount = (d.prepare('SELECT COUNT(*) AS n FROM redeem_items').get() as { n: number }).n
     if (itemCount === 0) {

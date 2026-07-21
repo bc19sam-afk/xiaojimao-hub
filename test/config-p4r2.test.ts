@@ -1,9 +1,12 @@
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
+import { spawn } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 import type { DailyUsage } from '../lib/cpa.ts'
+import type { Contribution } from '../lib/db.ts'
 
 // ============================================================================
 // P4-R2 后台配置化三块（§1 / §3.3 / §3.4）：
@@ -14,6 +17,18 @@ import type { DailyUsage } from '../lib/cpa.ts'
 //   ⚠️ 隔离红线：DB_PATH / MOCK_CPA_PATH 指临时目录再**动态 import**；绝不碰真实 data/app.db。
 //   before() 设 MIN_TRUST_LEVEL='2'（先于 import env）：让「缺省回落 env」可与 0 区分。
 // ============================================================================
+
+// 子进程重启模拟（E2 一次性播种测试用）：仿 seed-concurrency.test.ts——spawn 子进程用同 DB_PATH import
+// lib/db.ts（import 即触发单例 openDb→seedDefaults）再退出，验删空 usage_rates 后重开不回种。
+const here = path.dirname(fileURLToPath(import.meta.url))
+const root = path.resolve(here, '..')
+const setupPath = path.join(root, 'test', 'setup.mjs') // 子进程 --import：装 .ts 解析钩子
+const dbModule = path.join(root, 'lib', 'db.ts')
+const CHILD_ONESHOT = [
+  "import { pathToFileURL } from 'node:url'",
+  'await import(pathToFileURL(process.env.DB_MODULE).href)', // import 即触发 openDb→seedDefaults
+  '',
+].join('\n')
 
 let db: typeof import('../lib/db.ts').db
 let audit: typeof import('../lib/audit.ts')
@@ -30,6 +45,21 @@ async function withUsage<T>(usage: DailyUsage[], fn: () => Promise<T>): Promise<
   } finally {
     cpa.getDailyUsage = orig
   }
+}
+
+// 造一个「入过池」的号并落库（E1 结算防御闸用）：pooled_at=1（1970 下界）令所有 date 都在其后、不被 settle 下界挡
+function seedPooled(over: Partial<Contribution>): string {
+  const now = Date.now()
+  const c: Contribution = {
+    id: 'id-' + Math.random().toString(16).slice(2),
+    linuxdoId: 1, username: 'u', accountId: 'acc', email: 'e@example.com',
+    provider: 'codex', plan: 'plus', method: 'oauth', authFileName: 'f.json',
+    verifyStatus: 'pooled', points: 0, rewardStatus: 'none', rewardText: '', rewardNote: '',
+    createdAt: now, updatedAt: now, ...over,
+  }
+  db.insertUnique(c)
+  db.update(c.id, { pooledAt: 1 })
+  return c.id
 }
 
 before(async () => {
@@ -207,4 +237,50 @@ test('D4 audit 端到端：trust_gate 条目 recordAudit → listAudit 读回', 
   assert.ok(row, '应有 trust_gate.set 留痕')
   assert.equal(row!.target, 'trust_gate')
   assert.deepEqual(JSON.parse(row!.newValue as string), { enabled: 1, minTrust: 2 })
+})
+
+// ---------------------------- E：codex 复审 3 条回归 ----------------------------
+
+// E1 结算防御闸（codex 复审 P2）：巨额单价 → round(count×rate) 溢出 Infinity → 该(号,日)不结不发；
+//    改回正常单价 → 该日未被 hasSettled 吞、下轮重结自愈补发
+test('E1 结算防御闸：巨额单价该日不结不发；改回正常后下轮自愈', async () => {
+  const uid = 8100
+  const accountId = 'guard-acc'
+  const id = seedPooled({ id: 'guard-c', provider: 'grok', accountId, plan: 'super', linuxdoId: uid })
+  // 巨额单价（绕过路由上界、直写 db 层，模拟历史脏值）：ratePerCall 精确命中 grok/super=1e308
+  db.upsertUsageRate({ provider: 'grok', plan: 'super', pointsPerCall: 1e308, enabled: true, label: '脏' })
+  const now = new Date(2026, 5, 15, 12).getTime() // 2026-06-15 12:00 本地（过 grace 窗，避午夜跳过）
+  const usage: DailyUsage[] = [{ accountId, provider: 'grok', date: '2026-06-14', count: 10 }]
+  // 10 × 1e308 = Infinity → Math.round=Infinity → isSafeInteger false → 跳过：不抛、无 settlement、不发分
+  await withUsage(usage, () => settle.settleDailyUsage(now, { force: true }))
+  assert.equal(db.settlementsFor(id).length, 0, '非法折算不落 settlement')
+  assert.equal(db.balance(uid), 0, '非法折算不发分')
+  // 管理员改回正常单价 → 该日未被 hasSettled 吞、下轮重结自愈
+  db.upsertUsageRate({ provider: 'grok', plan: 'super', pointsPerCall: 2, enabled: true, label: '修' })
+  await withUsage(usage, () => settle.settleDailyUsage(now, { force: true }))
+  assert.equal(db.settlementsFor(id).length, 1, '修好后能补结（自愈）')
+  assert.equal(db.balance(uid), 20, '10 次 × 2 = 20 补发')
+})
+
+// E2 usage_rates 一次性播种（codex 复审 P1）：删空后重开进程（子进程 import lib/db.ts）不回种、marker 仍在
+test('E2 usage_rates 一次性播种：删空后重开进程不回种（marker 生效）', async () => {
+  assert.ok(db.getConfig('usage_rates_seeded') != null, '首次 import 已写 marker')
+  for (const r of db.listUsageRates()) db.deleteUsageRate(r.id) // 模拟管理员删空＝停发
+  assert.equal(db.listUsageRates().length, 0, '删空后 usage_rates 为空')
+  // spawn 子进程用同 DB_PATH import lib/db.ts（触发 openDb→seedDefaults）再退出
+  const childPath = path.join(tmpDir, 'oneshot-child.mjs')
+  fs.writeFileSync(childPath, CHILD_ONESHOT)
+  let stderr = ''
+  const code = await new Promise<number | null>((resolve) => {
+    const child = spawn(process.execPath, ['--import', setupPath, childPath], {
+      cwd: root,
+      env: { ...process.env, DB_MODULE: dbModule }, // 继承同 DB_PATH / MOCK=true
+      stdio: ['ignore', 'ignore', 'pipe'],
+    })
+    child.stderr.on('data', (b) => (stderr += b))
+    child.on('exit', resolve)
+  })
+  assert.equal(code, 0, `子进程应正常退出；stderr:\n${stderr}`)
+  assert.equal(db.listUsageRates().length, 0, '重开进程不回种：usage_rates 仍空')
+  assert.ok(db.getConfig('usage_rates_seeded') != null, 'marker 仍在')
 })
