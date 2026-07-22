@@ -88,7 +88,7 @@ ls -la data/                         # app.db 已生成，落在宿主卷里
 升级已由 `docker-entrypoint.sh` 落实成开机自动流程：**检测到待迁移才备份**（`schema-check` 判 schema 落后 → `node scripts/backup.ts`）→ **迁移**（`node scripts/migrate.ts`，打印 schema 版本）→ **启动**（`node server.js`）。单实例本身即锁，migrate 的 `busy_timeout` 兜住与 worker 的偶发并发。
 
 - **只在真有迁移时才备份**：schema 已是最新（日常重启、崩溃自动重启）就不备份，免得把「迁移前那份唯一回滚点」被 `BACKUP_KEEP` 轮转挤掉。
-- **崩溃循环不重复备份**：一次多迁移的升级若后段失败，库会停在中间版本、`restart:unless-stopped` 反复重启。入口用 `data/.upgrade-in-progress` 标记（内容=目标 schema 版本）去重：**同一目标的重试直接跳过备份**（迁移前那份快照已在），只有换了新目标才重新备份；迁移成功即删标记、升级闭环。这样崩溃循环里唯一的「升级前」回滚点不会被后续中间态备份 + `BACKUP_KEEP` 轮转挤掉。
+- **未完结升级不重复备份**：一次多迁移的升级若后段失败，库会停在中间版本、`restart:unless-stopped` 反复重启。入口用 `data/.upgrade-in-progress` 标记去重：**标记存在就跳过备份**（不比对内容；内容仅作日志记目标版本）；未完结的升级链哪怕中途换了目标版本（原目标 v12 卡住、又部署 v13 的新镜像），也共享同一份「原始升级前」快照作回滚点；迁移成功即删标记、升级闭环。这样崩溃循环 / 跨目标重试都不会用中间态备份 + `BACKUP_KEEP` 轮转挤掉唯一的「升级前」回滚点。
 - **备份 fail-closed**：备份失败即**中止启动**（不迁移、不起服务），保住回滚点；日志停在备份报错处，容器进入重启循环。
 
 ```bash
@@ -96,7 +96,7 @@ git pull                     # 或换用新镜像 tag
 docker compose up -d --build # 重建镜像并滚动重启；入口自动 备份→迁移→启动
 docker compose logs -f app   # 有迁移：[schema-check] 需迁移 → [backup] 完成 → [migrate] 完成 → 服务起
                              # 无迁移：[schema-check] 已最新，跳过备份 → [migrate] 完成 → 服务起
-                             # 迁移重试：[entrypoint] 同一升级…跳过备份 → [migrate] 完成 → 服务起
+                             # 迁移重试：[entrypoint] 上次升级…未完结…跳过备份 → [migrate] 完成 → 服务起
 ```
 
 > **备份失败 = 启动中止**（fail-closed 的预期副作用，不是 bug）：日志卡在 `[backup]` 报错、容器反复重启。先修根因——通常是 `./data` 磁盘满或权限不对（见 §2）；修好后 `docker compose up -d` 重试即可（幂等，会重走「备份→迁移→启动」）。**极端破窗**：确已另行留好快照、明知无需入口那份回滚点，要强行跳过备份启动，可临时覆盖入口进容器手动跑：
@@ -118,7 +118,7 @@ docker compose logs -f app   # 有迁移：[schema-check] 需迁移 → [backup]
 
 `scripts/backup.ts` 用 SQLite `VACUUM INTO` 产出 **WAL 安全的一致性单文件快照**（对源库只读、不打断在线写入），落到 `data/backups/backup-<时间戳>-<随机>.db`，并按 `BACKUP_KEEP`（默认 7）只保留最新 N 份。
 
-- 自动：容器启动时若 `schema-check` 判定**有待迁移**才备份（schema 已最新则跳过）；同一升级的崩溃重试由 `.upgrade-in-progress` 标记去重、**不重复备份**，保住迁移前唯一回滚点不被轮转挤掉，迁移成功即清标记；备份失败即中止启动（fail-closed）。详见 §4。
+- 自动：容器启动时若 `schema-check` 判定**有待迁移**才备份（schema 已最新则跳过）；未完结升级的重试（含中途换目标版本）由 `.upgrade-in-progress` 标记去重、**存在即跳过备份**，保住迁移前唯一回滚点不被轮转挤掉，迁移成功即清标记；备份失败即中止启动（fail-closed）。详见 §4。
 - 手动随时触发：
 
   ```bash
@@ -138,10 +138,12 @@ ls data/backups/                     # 记下 backup-XXXX.db
 # 2) 停服务（释放对 app.db 的写锁）
 docker compose stop app
 
-# 3) 备份现场后替换（-wal/-shm 是 WAL 副本，恢复整库快照时必须一并删除）
+# 3) 备份现场后替换（-wal/-shm 是 WAL 副本，恢复整库快照时必须一并删除；
+#    .upgrade-in-progress 也要清——手动还原=人为终结升级链，不清则下次真升级会被「标记存在」误判、跳过备份）
 cp data/app.db data/app.db.broken.bak 2>/dev/null || true
 cp data/backups/backup-XXXX.db data/app.db
 rm -f data/app.db-wal data/app.db-shm
+rm -f data/.upgrade-in-progress
 
 # 4) 起服务，校验
 docker compose start app

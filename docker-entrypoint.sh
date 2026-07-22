@@ -10,19 +10,21 @@ umask 077
 
 DB="${DB_PATH:-/app/data/app.db}"
 
-# 升级标记：内容 = 本次升级的目标 schema 版本，落 data/ 持久卷（umask 077 下自然 0600）。
+# 升级标记：落 data/ 持久卷（umask 077 下自然 0600），内容 = 触发备份时的目标 schema 版本（仅日志用）。
 # 为何需要：migrate() 逐迁移独立提交，一次多迁移的升级若后段失败，库会停在「中间版本」；
 #   restart:unless-stopped 每次重启 schema-check 都判「落后」，没有去重就每次都备份，且备的是
 #   中间态——BACKUP_KEEP 轮转很快把唯一那份「升级前」快照挤掉，恰在最需要回滚时丢掉回滚点。
-# 标记令「同一目标的重试」跳过备份（升级前快照已在），只有换了「新目标」才重新备份。
+# 语义：标记存在即跳过备份（不比对内容）。未完结的升级链哪怕中途换了目标版本（原目标 v12 卡住、
+#   又部署 v13 的新镜像），也共享同一份「原始升级前」快照作回滚点——直到迁移成功 rm 标记才闭环。
+#   若改判「内容≠当前目标就重新备份」，换目标时会拿中间态覆盖备份、把原始快照轮转挤掉（跨目标残洞）。
 MARKER="$(dirname "$DB")/.upgrade-in-progress"
 LATEST=$(node -e "import('./lib/migrate.ts').then((m) => console.log(m.LATEST_VERSION))")
 
 # 仅在「库已存在且 schema 落后」时才考虑备份（schema-check 退出非 0）：
 #   保住迁移前那份唯一回滚点，不被日常重启/崩溃循环反复备份 churn 掉（BACKUP_KEEP 轮转）。
 if [ -f "$DB" ] && ! node scripts/schema-check.ts; then
-  if [ -f "$MARKER" ] && [ "$(cat "$MARKER")" = "$LATEST" ]; then
-    echo "[entrypoint] 同一升级（目标 v$LATEST）重试，迁移前快照已在，跳过备份"
+  if [ -f "$MARKER" ]; then
+    echo "[entrypoint] 上次升级（标记 v$(cat "$MARKER")）未完结，本次目标 v$LATEST，沿用原升级前快照，跳过备份"
   else
     # 顺序铁律：先备份成功、再写标记。反过来会在备份失败后把下次备份也一起跳掉。
     # 备份 fail-closed：不 || 兜底，靠 set -e——失败即中止启动，绝不带着丢失的回滚点去迁移。
