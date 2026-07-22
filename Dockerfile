@@ -18,9 +18,15 @@ WORKDIR /app
 ENV NEXT_TELEMETRY_DISABLED=1
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
+# build 前先串行迁移建库：next build 会并发起多个 page-data worker，每个都求值 lib/db.ts 的
+# 模块级副作用去开库 + 跑迁移链。migrate() 逐迁移独立事务，裸并发下两个 worker 可能同时冲同一条
+# 非幂等迁移（如 migration 11 的 `ALTER TABLE redeem_items ADD COLUMN per_user_limit`）→ 报
+# duplicate column、clean build 随机挂。先单进程迁到最新，build 时各 worker 一看已最新即全跳，
+# 竞态消失（播种段本就有 BEGIN IMMEDIATE 兜并发）。此库随后连同 build 产物一并 rm，绝不进镜像。
+RUN node scripts/migrate.ts
 RUN npm run build
-# next build 会求值 lib/db.ts 的模块级副作用，在 data/app.db 建一个已播种的空库，
-# 且被文件追踪器一并拷进 .next/standalone/data。这里删掉：绝不把库烘进镜像（红线）。
+# 上一步迁移 + build 求值 lib/db.ts 都会在 data/app.db 留下库，且被文件追踪器拷进
+# .next/standalone/data。这里删掉：绝不把库烘进镜像（红线）。
 # runner 稍后自建空 data 目录，真实库只存在于挂载卷里。
 RUN rm -rf .next/standalone/data
 # public/ 当前不存在——建空目录让 runner 的 COPY 恒成立；日后加静态资源无需改本文件。

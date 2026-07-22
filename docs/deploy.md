@@ -88,6 +88,7 @@ ls -la data/                         # app.db 已生成，落在宿主卷里
 升级已由 `docker-entrypoint.sh` 落实成开机自动流程：**检测到待迁移才备份**（`schema-check` 判 schema 落后 → `node scripts/backup.ts`）→ **迁移**（`node scripts/migrate.ts`，打印 schema 版本）→ **启动**（`node server.js`）。单实例本身即锁，migrate 的 `busy_timeout` 兜住与 worker 的偶发并发。
 
 - **只在真有迁移时才备份**：schema 已是最新（日常重启、崩溃自动重启）就不备份，免得把「迁移前那份唯一回滚点」被 `BACKUP_KEEP` 轮转挤掉。
+- **崩溃循环不重复备份**：一次多迁移的升级若后段失败，库会停在中间版本、`restart:unless-stopped` 反复重启。入口用 `data/.upgrade-in-progress` 标记（内容=目标 schema 版本）去重：**同一目标的重试直接跳过备份**（迁移前那份快照已在），只有换了新目标才重新备份；迁移成功即删标记、升级闭环。这样崩溃循环里唯一的「升级前」回滚点不会被后续中间态备份 + `BACKUP_KEEP` 轮转挤掉。
 - **备份 fail-closed**：备份失败即**中止启动**（不迁移、不起服务），保住回滚点；日志停在备份报错处，容器进入重启循环。
 
 ```bash
@@ -95,6 +96,7 @@ git pull                     # 或换用新镜像 tag
 docker compose up -d --build # 重建镜像并滚动重启；入口自动 备份→迁移→启动
 docker compose logs -f app   # 有迁移：[schema-check] 需迁移 → [backup] 完成 → [migrate] 完成 → 服务起
                              # 无迁移：[schema-check] 已最新，跳过备份 → [migrate] 完成 → 服务起
+                             # 迁移重试：[entrypoint] 同一升级…跳过备份 → [migrate] 完成 → 服务起
 ```
 
 > **备份失败 = 启动中止**（fail-closed 的预期副作用，不是 bug）：日志卡在 `[backup]` 报错、容器反复重启。先修根因——通常是 `./data` 磁盘满或权限不对（见 §2）；修好后 `docker compose up -d` 重试即可（幂等，会重走「备份→迁移→启动」）。**极端破窗**：确已另行留好快照、明知无需入口那份回滚点，要强行跳过备份启动，可临时覆盖入口进容器手动跑：
@@ -116,7 +118,7 @@ docker compose logs -f app   # 有迁移：[schema-check] 需迁移 → [backup]
 
 `scripts/backup.ts` 用 SQLite `VACUUM INTO` 产出 **WAL 安全的一致性单文件快照**（对源库只读、不打断在线写入），落到 `data/backups/backup-<时间戳>-<随机>.db`，并按 `BACKUP_KEEP`（默认 7）只保留最新 N 份。
 
-- 自动：容器启动时若 `schema-check` 判定**有待迁移**才备份（schema 已最新则跳过，避免崩溃循环反复备份挤掉回滚点）；备份失败即中止启动（fail-closed）。详见 §4。
+- 自动：容器启动时若 `schema-check` 判定**有待迁移**才备份（schema 已最新则跳过）；同一升级的崩溃重试由 `.upgrade-in-progress` 标记去重、**不重复备份**，保住迁移前唯一回滚点不被轮转挤掉，迁移成功即清标记；备份失败即中止启动（fail-closed）。详见 §4。
 - 手动随时触发：
 
   ```bash
@@ -174,6 +176,7 @@ server {
         proxy_set_header   X-Real-IP         $remote_addr;
         proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
         proxy_set_header   X-Forwarded-Proto $scheme;
+        proxy_set_header   X-Forwarded-Host  $host;   # 覆盖客户端可能伪造的值；TRUST_FORWARDED_HEADERS=true 时据此推断域名，见 §6.2
     }
 }
 # 80 端口重定向到 443（略）
@@ -182,7 +185,8 @@ server {
 ### 6.2 域名与 env 对齐
 
 - 把 `.env` 的 `APP_BASE_URL` 设为公网 HTTPS 地址，例如 `https://hub.example.com`。
-- 若信任并已在反代清洗了 `x-forwarded-*` 头，可设 `TRUST_FORWARDED_HEADERS=true`；否则保持 false，固定用 `APP_BASE_URL` 推断 origin（防开放重定向）。
+- 若信任并已在反代**覆盖/清洗**了 `x-forwarded-*` 头，可设 `TRUST_FORWARDED_HEADERS=true`；否则保持 false，固定用 `APP_BASE_URL` 推断 origin（防开放重定向）。
+  - ⚠️ 设 `true` 的**前提**：反代必须用 `proxy_set_header X-Forwarded-Host $host`（见 §6.1）**覆盖**客户端可能伪造的 `X-Forwarded-Host`。`originOf()`（`lib/request.ts`）采信该头拼 origin，用于登录/OAuth 回调等重定向——一旦放行伪造值就是**开放重定向**（把用户导向攻击者域名）。nginx 默认不会自动覆盖它：不显式 `proxy_set_header` 就会把客户端原值透传上游。
 
 ### 6.3 Linux.do OAuth 回调
 

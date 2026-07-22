@@ -18,7 +18,10 @@ services:
     environment:
       # 🔴 关键：结算按服务器本地日折算，容器默认 UTC 会把结算日切错
       #    （CI 那个 UTC 00:00–00:10 grace 窗 flaky 的生产版）。tzdata 已装在镜像里。
-      TZ: Asia/Shanghai
+      # ${TZ:-Asia/Shanghai}：compose 启动时从 shell 环境或项目目录 .env（即 env_file 那份）
+      #   插值 TZ，未设则默认 Asia/Shanghai。用插值而非硬编码，是因为 environment 优先级高于
+      #   env_file——硬编码会悄悄盖掉用户在 .env 里设的 TZ，让「改 .env 换时区」失效。
+      TZ: ${TZ:-Asia/Shanghai}
 
     # 密钥/开关从 .env 读（SESSION_SECRET / MOCK / CPA_* / ADMIN_* 等）。
     # .env 含真实密钥，绝不进镜像/Git（见 .dockerignore、.gitignore）。首次部署先 cp .env.example .env。
