@@ -109,6 +109,8 @@ docker compose logs -f app   # 有迁移：[schema-check] 需迁移 → [backup]
 > **备份失败 = 启动中止**（fail-closed 的预期副作用，不是 bug）：日志卡在 `[backup]` 报错、容器反复重启。先修根因——通常是 `./data` 磁盘满或权限不对（见 §2）；修好后 `docker compose up -d` 重试即可（幂等，会重走「备份→迁移→启动」）。**极端破窗**：确已另行留好快照、明知无需入口那份回滚点，要强行跳过备份启动，可临时覆盖入口进容器手动跑：
 >
 > ```bash
+> docker compose stop app     # 必须先停：① app 仍在 restart 循环占着 127.0.0.1:3000，--service-ports 会撞端口；
+>                             #          ② 不停就是两容器共享同一 SQLite 卷，违反 §0 单实例红线
 > docker compose run --rm --service-ports --entrypoint sh app
 > # 进容器后：node scripts/migrate.ts && exec node server.js
 > ```
@@ -137,7 +139,7 @@ docker compose logs -f app   # 有迁移：[schema-check] 需迁移 → [backup]
 
 快照是完整一致的库文件，恢复即「用某份快照替换 app.db」。演练步骤：
 
-> 操作账号非 uid1000 时，下面直接读写 `./data`（0700，属主 1000）的命令都需 `sudo`；还原后务必用最后一行把 `app.db` 属主恢复成 1000，否则容器起来写不了库。
+> 操作账号非 uid1000 时，下面直接读写 `./data`（0700，属主 1000）的命令都需 `sudo`；还原用 `install` 一步把 `app.db` 设成 **属主 1000 + 权限 600**（`cp` 覆盖已存在文件会保留目标原 mode，老部署那份 0644 不会收敛，且属主也要还原），否则容器起来写不了库、或库权限倒退到 0644。
 
 ```bash
 # 1) 先做一次备份，拿到一份快照文件名
@@ -150,10 +152,9 @@ docker compose stop app
 # 3) 备份现场后替换（-wal/-shm 是 WAL 副本，恢复整库快照时必须一并删除；
 #    .upgrade-in-progress 也要清——手动还原=人为终结升级链，不清则下次真升级会因「标记指向的旧快照仍在」被误判、跳过备份）
 sudo cp data/app.db data/app.db.broken.bak 2>/dev/null || true
-sudo cp data/backups/backup-XXXX.db data/app.db
+sudo install -o 1000 -g 1000 -m 600 data/backups/backup-XXXX.db data/app.db   # 一步 覆盖还原 + 属主 uid1000 + 权限 600；不用 cp（覆盖会保留目标原 mode，老部署 0644 收不紧、属主也不还原）
 sudo rm -f data/app.db-wal data/app.db-shm
 sudo rm -f data/.upgrade-in-progress
-sudo chown 1000:1000 data/app.db     # 还原属主为容器用户 uid1000，否则起服务后写库失败
 
 # 4) 起服务，校验
 docker compose start app

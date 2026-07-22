@@ -31,6 +31,14 @@ MARKER="$(dirname "$DB")/.upgrade-in-progress"
 BK_DIR="${BACKUP_DIR:-/app/data/backups}"   # 与 scripts/backup.ts 默认解析一致（cwd=/app 的 data/backups）
 LATEST=$(node -e "import('./lib/migrate.ts').then((m) => console.log(m.LATEST_VERSION))")   # 仅供日志
 
+# 配置预检（动库前 fail-fast）：非 mock 缺 SESSION_SECRET(≥32)/CPA_* 时 lib/env.ts 会 throw——
+#   在备份/迁移之前就中止，避免「schema 已推进、服务却起不来」的中间态（可恢复但顺序不对）。
+#   放在任何动库操作（schema-check/备份/迁移）之前。mock 模式下 env.ts 只告警不抛，预检恒过（含「mock 临时密钥」告警）。
+#   env.ts 无 import、纯 process.env 读取，顶层 `export const env` 求值即调 resolveSessionSecret/resolveCpa 完成校验——
+#   import 它即完成 fail-fast、无副作用（不开库）。
+echo "[entrypoint] 配置预检"
+node -e "import('./lib/env.ts').then(() => {}, (e) => { console.error(String(e && e.message || e)); process.exit(1) })"
+
 # 仅在「库已存在且 schema 落后」时才考虑备份（schema-check 退出非 0）：
 #   保住迁移前那份唯一回滚点，不被日常重启/崩溃循环反复备份 churn 掉（BACKUP_KEEP 轮转）。
 if [ -f "$DB" ] && ! node scripts/schema-check.ts; then
