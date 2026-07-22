@@ -1,0 +1,31 @@
+# 构建上下文瘦身 + 防密钥泄露。此处只列**不进镜像**的东西。
+# 构建真正需要的 app/ components/ lib/ scripts/ instrumentation.ts
+# next.config.mjs tsconfig.json postcss.config.mjs tailwind.config.ts package*.json
+# 均**不在**排除列表里——别往下加它们。
+
+# 巨型 / 无关目录（.claude 是 worktree 元数据，极大）
+.claude
+.git
+.github
+node_modules
+.next
+out
+
+# 持久数据：库 + 备份，绝不烘进镜像（红线：无烘库）
+data
+
+# 密钥：.env / .env.local 含真实密钥，绝不进镜像。
+# .env.example 也一并排除——运行时用不到（配置从 compose 的 env_file 注入）。
+.env
+.env.*
+
+# 测试 / 文档 / 说明：运行时用不到
+test
+docs
+*.md
+
+# 杂项
+*.log
+.DS_Store
+*.tsbuildinfo
+.omx
