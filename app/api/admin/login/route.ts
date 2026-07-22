@@ -1,12 +1,14 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { checkAdminPassword, signAdminSession, adminCookie } from '@/lib/admin'
-import { checkLocked, recordFail, recordSuccess } from '@/lib/admin-ratelimit'
+import { checkLocked, recordFail, recordSuccess, resolveClientKey } from '@/lib/admin-ratelimit'
 import { isSecureRequest } from '@/lib/request'
+import { trustForwardedHeaders } from '@/lib/env'
 
 export async function POST(req: NextRequest) {
   const now = Date.now()
-  // 限流键取客户端 IP（x-forwarded-for 首个）；单机场景主要挡直连暴力猜密码（§8）。
-  const key = req.headers.get('x-forwarded-for')?.split(',')[0].trim() || 'direct'
+  // 限流键：转发头默认不可信 → 全部直连共享全局桶 'direct'，防伪造头轮换绕过；
+  // 仅可信反代下才按其追加在末尾的真实 IP 分桶（详见 resolveClientKey）。单机场景挡暴力猜密码（§8）。
+  const key = resolveClientKey(req.headers.get('x-forwarded-for'), trustForwardedHeaders)
   // 锁定期内直接拒绝——不泄剩余次数/锁定时长
   if (checkLocked(key, now)) {
     return NextResponse.json({ error: '尝试过于频繁，请稍后再试' }, { status: 429 })
