@@ -49,18 +49,18 @@
 
 ## 2. data 卷权限（uid 1000）
 
-容器以非 root 用户 `node`（uid **1000**）运行，需要对宿主 `./data` 有写权限。**Linux 宿主首次部署前**先建目录、授权、收紧权限：
+容器以非 root 用户 `node`（uid **1000**）运行，需要对宿主 `./data` 有写权限。**Linux 宿主首次部署前**用一条特权命令建目录、授权、收紧权限：
 
 ```bash
-mkdir -p data
-sudo chown -R 1000:1000 data
-chmod 700 data                # 仅 owner(uid1000) 可进：库含 OAuth 令牌快照与 CDK 码
+sudo install -d -o 1000 -g 1000 -m 700 data   # 一步完成 建目录 + 属主 uid1000 + 权限 700：仅 owner 可进（库含 OAuth 令牌快照与 CDK 码）
 ```
 
-否则容器启动会因无法写 `/app/data/app.db` 而报权限错。
-（macOS/Windows 的 Docker Desktop 通常自动处理 uid 映射，可跳过 chown。）
+用 `install -d` 一步到位、不拆成 `chown` + `chmod` 两步：若操作账号不是 uid1000，`sudo chown` 把 `data` 归 1000 后，紧接的**无 sudo** `chmod` 会因「非 owner 非 root 不能改权限」被拒——照两步走会卡在这。`install -d` 对已存在的目录同样适用（幂等地重设属主/权限）。
 
-> 🔒 **库文件权限**：entrypoint 里设了 `umask 077`，容器新建的 `app.db`、`-wal/-shm`、备份文件都落 **0600**（仅 owner 可读写）、目录 0700。配合上面的 `chmod 700 data`，同宿主的其他用户读不到库里的令牌/CDK。
+否则容器启动会因无法写 `/app/data/app.db` 而报权限错。
+（macOS/Windows 的 Docker Desktop 通常自动处理 uid 映射，可跳过此步。）
+
+> 🔒 **库文件权限**：entrypoint 里设了 `umask 077`，容器新建的 `app.db`、`-wal/-shm`、备份文件都落 **0600**（仅 owner 可读写）、目录 0700。配合上面 `install -d` 设的目录 700，同宿主的其他用户读不到库里的令牌/CDK。
 > 老部署（本次升级前建的库可能是 0644）想一并收紧：umask 只管新建文件、不改既有，停服后手动 `chmod 600 data/app.db` 即可。
 
 ---
@@ -76,7 +76,7 @@ chmod 700 data                # 仅 owner(uid1000) 可进：库含 OAuth 令牌�
 
 ```bash
 cp .env.example .env      # 填好 .env（见 §1）
-mkdir -p data && sudo chown -R 1000:1000 data && chmod 700 data   # Linux，见 §2
+sudo install -d -o 1000 -g 1000 -m 700 data   # Linux，见 §2（一条特权命令，别拆 chown+chmod 两步）
 docker compose up -d --build
 ```
 
@@ -137,20 +137,23 @@ docker compose logs -f app   # 有迁移：[schema-check] 需迁移 → [backup]
 
 快照是完整一致的库文件，恢复即「用某份快照替换 app.db」。演练步骤：
 
+> 操作账号非 uid1000 时，下面直接读写 `./data`（0700，属主 1000）的命令都需 `sudo`；还原后务必用最后一行把 `app.db` 属主恢复成 1000，否则容器起来写不了库。
+
 ```bash
 # 1) 先做一次备份，拿到一份快照文件名
 docker compose exec app node scripts/backup.ts
-ls data/backups/                     # 记下 backup-XXXX.db
+sudo ls data/backups/                # 记下 backup-XXXX.db
 
 # 2) 停服务（释放对 app.db 的写锁）
 docker compose stop app
 
 # 3) 备份现场后替换（-wal/-shm 是 WAL 副本，恢复整库快照时必须一并删除；
 #    .upgrade-in-progress 也要清——手动还原=人为终结升级链，不清则下次真升级会因「标记指向的旧快照仍在」被误判、跳过备份）
-cp data/app.db data/app.db.broken.bak 2>/dev/null || true
-cp data/backups/backup-XXXX.db data/app.db
-rm -f data/app.db-wal data/app.db-shm
-rm -f data/.upgrade-in-progress
+sudo cp data/app.db data/app.db.broken.bak 2>/dev/null || true
+sudo cp data/backups/backup-XXXX.db data/app.db
+sudo rm -f data/app.db-wal data/app.db-shm
+sudo rm -f data/.upgrade-in-progress
+sudo chown 1000:1000 data/app.db     # 还原属主为容器用户 uid1000，否则起服务后写库失败
 
 # 4) 起服务，校验
 docker compose start app

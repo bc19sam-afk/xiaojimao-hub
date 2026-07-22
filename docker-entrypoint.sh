@@ -54,7 +54,16 @@ fi
 
 echo "[entrypoint] 运行迁移"
 node scripts/migrate.ts
-# set -e 保证走到这里 = 迁移成功，本次升级闭环，清标记（下轮再有待迁移就重新备份、写新快照路径）。
+# 迁移后复核（防「假成功」）：schema_version 有表无行的遗留库（曾在 CREATE TABLE 与 INSERT 初始行之间被打断），
+#   migrate() 里每个迁移都跑 up() 但 `UPDATE schema_version SET version=?` 影响 0 行——版本永不落库，却仍返回内存值、
+#   照打「完成 v$LATEST」。若此时就 rm 标记，服务端 assertSchemaCurrent 见持久化 v0 拒启崩溃 → 重启时标记已没、
+#   schema-check 又判落后 → 把中间态重备份、BACKUP_KEEP 轮转挤掉真正的升级前快照 → 无回滚点死循环。
+# 故清标记前再跑一次 schema-check：持久化版本确已最新（exit 0）才清标记闭环；否则 set -e 中止启动、
+#   标记与快照都保留（可按 §5.2 人工还原）。此处 schema-check 会打「已最新，跳过备份」——「跳过备份」尾巴在
+#   复核语境略歪但无害，勿改 schema-check 输出（预检共用）。
+echo "[entrypoint] 迁移后复核 schema 版本"
+node scripts/schema-check.ts
+# 复核通过 = 迁移真正落库、本次升级闭环，清标记（下轮再有待迁移就重新备份、写新快照路径）。
 rm -f "$MARKER"
 
 echo "[entrypoint] 启动服务"
