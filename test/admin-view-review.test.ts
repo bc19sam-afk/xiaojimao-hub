@@ -249,11 +249,11 @@ test('F1 钳制：负 limit→1、负 offset→0、超大 limit→≤200', () =>
 
 // E1 auditContributionReview 构造器：toStatus 决定 new（去向真实）；retry→submitted/pooled、terminate→stopped
 test('E1 auditContributionReview：toStatus 决定 new（三去向）', () => {
-  const c = { provider: 'codex', accountId: 'acct_abc' }
+  const c = { id: 'c-e1', provider: 'codex', accountId: 'acct_abc' }
   // 从没入池 retry → submitted
   const rSub = audit.auditContributionReview('contribution.retry', c, 'submitted')
   assert.equal(rSub.action, 'contribution.retry')
-  assert.equal(rSub.target, 'codex/acct_abc', 'target=provider/accountId')
+  assert.equal(rSub.target, 'codex/contribution#c-e1', 'target=provider/contribution#id（不含裸 accountId）')
   assert.deepEqual(rSub.old, { verifyStatus: 'needs_review' })
   assert.deepEqual(rSub.new, { verifyStatus: 'submitted' })
   // 入过池 retry → pooled（去向必与真实一致，codex 复审 P1）
@@ -262,9 +262,13 @@ test('E1 auditContributionReview：toStatus 决定 new（三去向）', () => {
   // terminate → stopped
   const term = audit.auditContributionReview('contribution.terminate', c, 'stopped')
   assert.equal(term.action, 'contribution.terminate')
-  assert.equal(term.target, 'codex/acct_abc')
+  assert.equal(term.target, 'codex/contribution#c-e1')
   assert.deepEqual(term.old, { verifyStatus: 'needs_review' })
   assert.deepEqual(term.new, { verifyStatus: 'stopped' })
+  // §8 回归（对接-R2/codex P2）：claude 的 accountId=邮箱(PII)，构造器绝不把它写进 audit——target 及整条 entry 无邮箱
+  const pii = audit.auditContributionReview('contribution.retry', { id: 'x', provider: 'claude', accountId: 'foo@bar.com' }, 'submitted')
+  assert.equal(pii.target, 'claude/contribution#x')
+  assert.doesNotMatch(JSON.stringify(pii), /foo@bar\.com/)
 })
 
 // E2 端到端（category①）：从没入池 retry→submitted，recordAudit → listAudit 读回 new=submitted
@@ -274,7 +278,7 @@ test('E2 审计留痕端到端：从没入池 retry → listAudit new=submitted'
   assert.equal(db.retryReview(c.id), true)
   const toStatus = c.pooledAt != null ? 'pooled' : 'submitted' // 路由同款口径：pooled_at null → submitted
   db.recordAudit(actor, audit.auditContributionReview('contribution.retry', c, toStatus))
-  const row = db.listAudit(50, 0).find((r) => r.action === 'contribution.retry' && r.target === `grok/${c.accountId}`)
+  const row = db.listAudit(50, 0).find((r) => r.action === 'contribution.retry' && r.target === `grok/contribution#${c.id}`)
   assert.ok(row, '应有 contribution.retry 留痕')
   assert.equal(row!.actorId, 5)
   assert.deepEqual(JSON.parse(row!.oldValue as string), { verifyStatus: 'needs_review' })
@@ -321,7 +325,7 @@ test('G3 审计去向：入过池 retry → 审计 new=pooled', () => {
   assert.equal(db.retryReview(c.id), true)
   const toStatus = snap.pooledAt != null ? 'pooled' : 'submitted'
   db.recordAudit(actor, audit.auditContributionReview('contribution.retry', snap, toStatus))
-  const row = db.listAudit(50, 0).find((r) => r.action === 'contribution.retry' && r.target === 'codex/AUDPOOL')
+  const row = db.listAudit(50, 0).find((r) => r.action === 'contribution.retry' && r.target === `codex/contribution#${c.id}`)
   assert.ok(row, '应有留痕')
   assert.deepEqual(JSON.parse(row!.newValue as string), { verifyStatus: 'pooled' }, '入过池 retry 审计 new=pooled（与真实去向一致）')
 })
