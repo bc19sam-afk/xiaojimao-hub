@@ -1,5 +1,5 @@
 import { cpa } from './cpa'
-import { db } from './db'
+import { db, shortAccountLabel } from './db'
 
 // ============================================================================
 // 按日用量结算引擎（P2-R2，需求 §3.1/§3.3/§3.4）
@@ -83,7 +83,7 @@ export async function settleDailyUsage(
       // settlement，hasSettled 不吞）。⚠️ 绝不记 points=0 的 settlement 凑数：那会让 hasSettled 把该日欠薪永久吞掉。
       if (!Number.isSafeInteger(points) || points < 0) {
         console.error(
-          `[settle] 跳过非法折算 points=${points}：provider=${c.provider} account=${c.accountId} date=${u.date} rate=${rate}`,
+          `[settle] 跳过非法折算 points=${points}：provider=${c.provider} account=${shortAccountLabel(c.provider, c.accountId)} date=${u.date} rate=${rate}`,
         )
         continue
       }

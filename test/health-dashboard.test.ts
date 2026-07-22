@@ -322,6 +322,8 @@ test('shortAccountLabel：provider 中文 + 尾4位，不泄完整敏感号', ()
   assert.equal(shortAccountLabel('codex', ''), 'ChatGPT') // 空号仅 provider
   // 绝不含完整敏感段
   assert.doesNotMatch(shortAccountLabel('codex', 'acct_secret_1234'), /secret/)
+  // claude 的 accountId 本身是邮箱（对接-R1 §二③）：掩码后不得含完整邮箱——settle 日志据此按 §8 脱敏
+  assert.doesNotMatch(shortAccountLabel('claude', 'foo@bar.com'), /foo@bar\.com/)
 })
 
 test('describeLedgerEntry：usage 解析日期+账号短标识；其它 reason 稳定中文；不泄敏感', () => {

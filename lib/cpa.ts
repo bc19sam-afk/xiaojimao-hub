@@ -265,7 +265,7 @@ function normFile(f: RawFile): AuthFile {
     // 稳定业务 ID 的字段名跨 provider 不同，每条兜底都按 provider 划界、绝不跨 provider 泛认
     // （泛认未验证字段会把错的当 canonical ID 放行发分）：
     //   codex  —— account_id；
-    //   claude —— account（P0-A 实测，无 account_id）；
+    //   claude —— account（P0-A 实测，无 account_id；R1：该 account 值本身=邮箱、含 PII，下游须按 §8 敏感值对待）；
     //   grok   —— sub（OIDC subject；P0-A 扒 CLIProxyAPI xai 源码确认为稳定唯一标识，跨重授权稳定）。
     // account_id/accountId 最优先；也绝不用 claude 的 id 字段（那非稳定业务 ID，会把唯一键锚错）。
     accountId:
@@ -275,6 +275,7 @@ function normFile(f: RawFile): AuthFile {
       (provider === 'grok' ? f.sub : undefined) ??
       '',
     email: f.email ?? '',
+    // R1 核对（§二①）：claude auth-file 无 plan/planType 字段 → 归一 'unknown'（维持现状；要显示套餐需另找来源）
     plan: f.plan ?? f.planType ?? 'unknown',
     disabled: Boolean(f.disabled),
     provider,
@@ -433,19 +434,21 @@ const realClient: CpaClient = {
     return (detail.results ?? []).map(mapInspection)
   },
   async getDailyUsage() {
-    // ⚠️ 骨架（同 inspect）：真实 usage 事件字段名 / hub 来源标记格式 / 是否支持查询参数缩小范围
-    //   待对接样本核对，MOCK 阶段以 mockClient 验证聚合逻辑。数据源 GET /v0/management/usage（P0-A 实探）：
+    // R1 已核对（docs/probe-cpamp-real-R1.md §二②）：真实 usage 事件的三层结构与 account_snapshot /
+    //   auth_provider_snapshot / auth_label_snapshot / timestamp 字段名与本实现完全吻合、无结构性错配。
+    //   数据源 GET /v0/management/usage（P0-A 实探）：
     //   { apis: { [端点]: { models: { [模型]: { details: RawUsageDetail[] } } } } }，每条 detail = 一次请求。
     // 计量口径（§3.1/P0-A）：按 (auth_provider_snapshot, account_snapshot) 分组、timestamp 落自然日、
-    //   数 details 条数 = 该号当日调用次数；只算带 hub 来源标记（auth_label_snapshot）的贡献号。
+    //   数 details 条数 = 该号当日调用次数（贡献号判定见 isHubContribution，现阶段恒放行）。
     const data = (await req('GET', '/v0/management/usage')) as RawUsage
     const agg = new Map<string, DailyUsage>() // key = provider\0accountId\0date
     for (const apiEntry of Object.values(data.apis ?? {})) {
       for (const model of Object.values(apiEntry?.models ?? {})) {
         for (const d of model?.details ?? []) {
-          // TODO(对接)：hub 来源标记格式待定——只算贡献号（见 isHubContribution）。来源标记写入见后续单。
+          // R1 已核对：auth_label_snapshot 是 cpamp 自带账号 label（=邮箱）、非 hub 来源标记；贡献号判定见
+          // isHubContribution（现阶段恒放行）。专用 hub 来源标记写入见后续单（对接-R3）。
           if (!isHubContribution(d.auth_label_snapshot)) continue
-          const provider = providerFromToken(d.auth_provider_snapshot) // anthropic→claude、xai→grok
+          const provider = providerFromToken(d.auth_provider_snapshot) // R1 实测：真实值 = "claude"（非 "anthropic"，两名都认）、xai→grok
           const accountId = d.account_snapshot ?? ''
           const ts = d.timestamp
           if (!provider || !accountId || ts == null) continue // 认不出 provider / 无稳定号 / 无时间戳 → 跳过
@@ -484,7 +487,7 @@ export function mapInspection(r: RawInspectionResult): ProbeResult {
   return { accountId: r.accountId ?? '', decision, plan, reason }
 }
 
-// —— usage 事件流原始形状（P2-R2 骨架，字段名待对接样本核对，见 getDailyUsage 注释）——
+// —— usage 事件流原始形状（R1 已核对：四字段名与真实 cpamp 吻合，见 getDailyUsage 注释）——
 interface RawUsageDetail {
   account_snapshot?: string
   auth_provider_snapshot?: string
@@ -494,17 +497,18 @@ interface RawUsageDetail {
 interface RawUsage {
   apis?: Record<string, { models?: Record<string, { details?: RawUsageDetail[] }> }>
 }
-// TODO(对接)：hub 来源标记的确切格式待 usage 样本核对。占位实现——label 含 'hub' 视为贡献号。
-// ⚠️ 真实对接前必以样本校准：误纳官方号→错发分、漏纳贡献号→少发分（同 mapInspection 的 reason 词表纪律）。
-// ⚠️ label 预过滤已降级为「优化提示」而非硬闸（codex xhigh 于 PR #16 指出：现今没有任何收号路径写
-// label——RT 上传无 label 字段、OAuth 只提交 provider+redirect_url，硬过滤＝生产零发分）。真正的
-// 「是不是我们的号」由 settle 层的 pooled 号索引判定（(provider, account_id) 匹配，权威）；此处仅当
-// label **明确是别家标记**时跳过（现阶段一律放行）。「来源标记写入」已立项（路线图 P2 残项），写入
-// 落地 + 真实 label 格式核对后，可把这里升级回预过滤以省聚合量。
+// 🔴 R1 已核对（docs/probe-cpamp-real-R1.md §二⑤/三.1）：真实 auth_label_snapshot = 账号自带 label
+// （= 邮箱），containsHub=false——它**不是** hub 注入的来源标记。故绝不可把 label 预过滤「升级回」按
+// 「label 含 'hub'」硬闸：真实贡献号 label 里没有 'hub'，一旦硬过滤→贡献号被误剔除→生产零发分。
+// 归属权威判定由 settle 层 pooled 号索引负责（(provider, account_id) 匹配）；此处维持恒放行。
+// label 预过滤保持关闭，直到将来单独写入**专用 hub 来源标记字段**（非现有 auth_label_snapshot）——
+// 「来源标记写入」已立项（对接-R3/后续单），落地后方可用那个新字段做预过滤。切勿改本函数逻辑。
 function isHubContribution(_label: string | undefined): boolean {
-  return true // 放行；归属判定交给 settle 层 pooled 索引
+  return true // 放行；归属判定交给 settle 层 pooled 索引（R1 红线：真实 label 不含 'hub'，勿硬过滤）
 }
-// TODO(对接)：timestamp 单位待核对。占位启发式——数字 <1e12 视为秒、否则毫秒；字符串按 Date.parse。
+// R1 已核对（§二④）：真实 timestamp = UTC ISO-8601 字符串（如 2026-07-16T13:53:50.795Z），走 Date.parse
+// 分支解析成功；数字秒/毫秒分支对 claude 不触发，防御性保留。⚠️ 运维：源时间是 UTC，tsToMs→dayStr 落
+// 服务器本地时区日，故生产机时区必须对齐目标结算时区（与已知 CI-UTC-grace-window flaky 同源）。
 function tsToMs(ts: string | number): number {
   if (typeof ts === 'number') return ts < 1e12 ? ts * 1000 : ts
   return Date.parse(ts) || 0
