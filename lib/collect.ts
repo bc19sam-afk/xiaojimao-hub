@@ -1,6 +1,6 @@
 import { randomBytes } from 'crypto'
 import { cpa, type AuthFile, type IngestResult, type ProbeResult, type ProviderId, type StartResult } from './cpa'
-import { db, type Contribution, type ObservationKind } from './db'
+import { db, shortAccountLabel, type Contribution, type ObservationKind } from './db'
 import { env } from './env'
 import type { SessionUser } from './session'
 
@@ -190,12 +190,17 @@ export async function processPending(): Promise<{
     const pending = db.byVerifyStatus(['submitted', 'first_check'])
     if (pending.length === 0) return { checked: 0, activated: 0, rejected: 0 }
 
+    // 入池优先级：本轮 read-once（§2.5，缺省 10、后台可调），enterPool 闭包引用、不每号查库。
+    // 置于空池早返回之后：worker 空转 tick（无待处理号）不白读库。
+    const poolPriority = db.getPoolPriority()
     let pooled = 0 // 本轮入池数
     let rejected = 0 // 本轮首检失败·退回数
 
-    // 首检通过 → 入池：启用（setDisabled false）+ transition → pooled，此刻占用唯一键（§3.2）。
-    //   限额/额度暂满（decision=retry）不算失败 → 一并入池等恢复（§3.2「限额不算失败，先入池」）。
-    //   入池优先级 setPriority 接口层仍缺（留后续），本单只启用。启用失败→保持原态下轮重试。
+    // 首检通过 → 入池：启用（setDisabled false）+ 设高优先级（best-effort）+ transition → pooled，
+    //   此刻占用唯一键（§3.2）。限额/额度暂满（decision=retry）不算失败 → 一并入池等恢复
+    //   （§3.2「限额不算失败，先入池」）。入池优先级已接线（§2.5，缺省 10、后台可调）：best-effort——
+    //   设失败不挡入池（号已启用能计量，优先级设失败仅损号主上浮），下轮不重设（细化重试留后续单）。
+    //   realClient.setPriority 端点已按 CLIProxyAPI 上游源码核对（PATCH /auth-files/fields）、真发/重试留对接-R3；MOCK 下已验接线。启用失败→不入池、保持原态下轮重试。
     //   ⚠️ v4 三家一视同仁：不再按 pointsFor<=0 淘汰——provider 在 codex/claude/grok 内即可入池，
     //     按量折算规则（原 pointsFor）留 R2 重构。
     const enterPool = async (c: (typeof pending)[number], plan: string): Promise<void> => {
@@ -203,6 +208,15 @@ export async function processPending(): Promise<{
         await cpa.setDisabled(c.authFileName, false) // 首检通过→启用
       } catch {
         return // 启用失败：不入池，保持原态下轮重试
+      }
+      try {
+        await cpa.setPriority(c.authFileName, poolPriority) // 入池设高优先级（§2.5，缺省 10、后台可调）
+      } catch {
+        // best-effort：号已启用能计量，优先级设失败仅损号主上浮、不挡入池（挡入池=号主零收益、更糟）。
+        // 号已 pooled 后 processPending 只扫 submitted/first_check → 本轮不重设、无自动补设。残余窄窗：
+        // 管理员调高优先级后恰逢瞬时失败 → 该号停在缺省 10（=cpamp 上游默认，失败无害）无自动重试；
+        // 重设/补设机制留对接-R3（realClient 真写验证后细化）。
+        console.warn('[collect] setPriority 失败', shortAccountLabel(c.provider, c.accountId)) // §8 掩码（claude accountId=邮箱=PII）
       }
       if (plan !== c.plan) db.update(c.id, { plan })
       if (db.transitionToPool(c.id, ['submitted', 'first_check'], Date.now())) {

@@ -392,3 +392,33 @@ test('迁移007：observing+已记 hard_fail → stopped（已知死号不得进
   assert.equal(dead.verify_status, 'stopped') // 已知死号 → stopped
   d.close()
 })
+
+// ⑭ 入池设优先级接线（对接-R2b §2.5，MOCK 端到端）：processPending 入池时以配置的 pool_priority
+//    调 setPriority 并持久化到 mock auth-file。用 claude 号（走 otherPending 直接 enterPool，无需桩 inspect）。
+//    ⚠️ MOCK 只验**接线**（入池以配置值调了 setPriority 且持久化）；**不验**优先级真实影响烧号顺序
+//    （那是真 cpamp 行为，留对接-R3 用一次性测试号核对）。
+test('入池设优先级（对接-R2b）：processPending 以配置 pool_priority 调 setPriority 且持久化', async () => {
+  const uid = 6020
+  // MOCK 下 cpa.finishOAuth 会 mockCreate 建一个真实存在的 mock auth-file（disabled:true）并返回 IngestResult。
+  // 据此落一个 submitted contribution（authFileName 与 mock 文件同名）——setPriority 才有文件可写、可读回验证。
+  const ingest = await cpa.finishOAuth('claude', 'https://cb/?seed=r2b-wire', [], new Set<string>())
+  db.insertUnique(
+    makeContribution({
+      id: 'r2b-wire',
+      provider: 'claude',
+      accountId: ingest.accountId,
+      authFileName: ingest.authFileName,
+      plan: ingest.plan,
+      linuxdoId: uid,
+    }),
+  )
+  db.setPoolPriority(25) // 后台可调值
+  await collect.processPending()
+
+  const c = db.byUser(uid).find((x) => x.id === 'r2b-wire')
+  assert.ok(c)
+  assert.equal(c.verifyStatus, 'pooled') // 入池成功
+  const file = (await cpa.listAuthFiles()).find((f) => f.name === ingest.authFileName)
+  assert.ok(file, 'mock auth-file 应存在')
+  assert.equal(file.priority, 25) // 入池以配置值调了 setPriority 并持久化（接线验证）
+})

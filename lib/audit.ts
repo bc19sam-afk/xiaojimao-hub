@@ -149,6 +149,16 @@ export function auditLdcQuota(oldQuota: number, newQuota: number): AuditEntry {
   }
 }
 
+// ---- 入池优先级（§7.3）----
+export function auditPoolPriority(oldN: number, newN: number): AuditEntry {
+  return {
+    action: 'pool_priority.set',
+    target: 'pool_priority',
+    old: oldN,
+    new: newN,
+  }
+}
+
 // ---- 信任门槛 & 限身份开关（§1）----
 // enabled 规整 1/0（与本文件其它 enabled 摘要口径一致，审计日志可读一致）；minTrust 为门槛整数等级。
 export function auditTrustGate(

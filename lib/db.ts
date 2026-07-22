@@ -283,6 +283,11 @@ function toDailySettlement(r: DsRow): DailySettlement {
 const LDC_DAILY_QUOTA_KEY = 'ldc_daily_quota'
 const LDC_DAILY_QUOTA_DEFAULT = 2000
 
+// 入池优先级（§2.5/§7.1）：贡献号入池即设的全局优先级（cpamp 数字越大越优先），后台可调、缺省 10。
+// 存 app_config KV、复用通用 getConfig/setConfig（无需迁移）。
+const POOL_PRIORITY_KEY = 'pool_priority'
+const POOL_PRIORITY_DEFAULT = 10
+
 // 毫秒 → 所在自然日的 [今日 0 点, 明日 0 点) 毫秒半开区间（服务器本地时区）。与 lib/settle.ts / lib/cpa.ts
 // 的 dayStr（'YYYY-MM-DD' 日键）是**同一「服务器本地自然日」口径**，只是形式不同：额度判定要判「issued_at
 // 落在今日」＝时间戳落在此区间，需要的是毫秒边界而非日键串，故取此形，非另立第三种日期口径。用本地 getter
@@ -526,6 +531,19 @@ export const db = {
   },
   setSettleGraceMinutes(n: number): void {
     db.setConfig('settle_grace_minutes', String(Math.max(0, Math.min(1439, Math.floor(Number(n) || 0)))))
+  },
+
+  // ===== 配置：入池优先级（§2.5/§7.1）=====
+  // 贡献号入池即设的全局优先级（cpamp 数字越大越优先），缺省 10、后台可调。存 app_config['pool_priority']。
+  // 取值钳非负整数（脏值/缺失一律回落缺省，getPoolPriority 侧也防一道——即便绕 setter 直写脏值判定仍安全）。
+  getPoolPriority(): number {
+    const raw = db.getConfig(POOL_PRIORITY_KEY)
+    if (raw == null) return POOL_PRIORITY_DEFAULT
+    const n = Math.floor(Number(raw))
+    return Number.isFinite(n) && n >= 0 ? n : POOL_PRIORITY_DEFAULT
+  },
+  setPoolPriority(n: number): void {
+    db.setConfig(POOL_PRIORITY_KEY, String(Math.max(0, Math.floor(Number(n) || 0))))
   },
 
   // ===== 配置：发分规则 =====

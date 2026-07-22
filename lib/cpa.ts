@@ -37,6 +37,7 @@ export interface AuthFile {
   plan: string
   disabled: boolean
   provider?: ProviderId // 识别不出时 undefined（findNew 会保守跳过）
+  priority?: number // 仅 mockClient 填（供测试读回验证入池设优先级）；realClient 读侧不填——R1 实测 cpamp GET auth-files 无此字段
 }
 
 // 文件的 provider 标识（type 字段或文件名前缀）→ ProviderId。
@@ -115,6 +116,8 @@ export interface CpaClient {
   ingestRefreshToken(rt: string, knownAccountIds: string[]): Promise<IngestResult>
   listAuthFiles(): Promise<AuthFile[]>
   setDisabled(name: string, disabled: boolean): Promise<void>
+  // 设单号优先级（cpamp 数字越大越优先）。贡献号入池即调（§2.5），best-effort。
+  setPriority(name: string, priority: number): Promise<void>
   deleteAuthFile(name: string): Promise<void>
   inspect(): Promise<ProbeResult[]>
   // 按号按自然日的调用量（P2-R2）。settleDailyUsage 周期拉取 → 折算积分 → 按日发给号主。
@@ -193,6 +196,11 @@ const mockClient: CpaClient = {
     const store = mockLoad()
     const f = store.get(name)
     if (f) { f.disabled = disabled; mockSave(store) }
+  },
+  async setPriority(name, priority) {
+    const store = mockLoad()
+    const f = store.get(name)
+    if (f) { f.priority = priority; mockSave(store) } // 持久化，供测试经 listAuthFiles() 读回验证
   },
   async deleteAuthFile(name) {
     const store = mockLoad()
@@ -417,6 +425,20 @@ const realClient: CpaClient = {
   },
   async setDisabled(name, disabled) {
     await req('PATCH', '/v0/management/auth-files/status', { name, disabled })
+  },
+  async setPriority(name, priority) {
+    // 端点/字段/生效链已按 CLIProxyAPI 上游 main 源码核对（对接-R2b codex 双通道复查）：
+    //   • 路由表 internal/api/server.go:944-951 mgmt 组仅注册 PATCH /auth-files/status 与
+    //     /auth-files/fields——**无 /auth-files/priority**（旧占位猜测真发必 404）。正确端点＝
+    //     PATCH /v0/management/auth-files/fields，体 { name, priority }（priority 为 JSON number）。
+    //   • PatchAuthFileFields(handlers/management/auth_files.go:1487)：name 必填（匹配 FileName/ID），
+    //     其余键作 metadata 字段路径写入 auth 文件；404=文件不存在、200={status:"ok"}。
+    //   • 生效链：synthesizer(watcher/synthesizer/file.go:187-198) 读 metadata["priority"]→
+    //     Attributes["priority"]；selector(sdk/cliproxy/auth/selector.go:115) authPriority Atoi 后
+    //     collectAvailableByPriority 按优先级分桶调度（数字越大越先，与 P0-A 记载闭环）。
+    // ⚠️ 仍未对真实实例发过写，且线上 cpamp 版本可能滞后于上游 main——对接-R3 用一次性测试号
+    //   实测后方可视为已验。本单 realClient 依旧不真调（全部验证走 MOCK）。
+    await req('PATCH', '/v0/management/auth-files/fields', { name, priority })
   },
   async deleteAuthFile(name) {
     await req('DELETE', `/v0/management/auth-files?name=${encodeURIComponent(name)}`)
