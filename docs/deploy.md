@@ -30,7 +30,7 @@
 - 准备 `.env`：
 
   ```bash
-  cp .env.example .env
+  install -m 600 .env.example .env   # 用 install 而非 cp：cp 受宿主 umask 022 落 0644，.env 存密钥须 600（仅属主可读）；普通用户可跑、无需 sudo，已存在也幂等重设 600
   # 按需填：SESSION_SECRET（生产必填，见下）、ADMIN_PASSWORD 或 ADMIN_LINUXDO_IDS、
   # LINUXDO_CLIENT_ID/SECRET、以及切真实时的 MOCK=false + CPA_BASE_URL/CPA_MANAGEMENT_KEY
   ```
@@ -75,7 +75,7 @@ sudo install -d -o 1000 -g 1000 -m 700 data   # 一步完成 建目录 + 属主 
 - **公网 / 生产**：**必须 `MOCK=false`**（且**别设** `ALLOW_MOCK_PREVIEW`），并在 `.env` 配齐 `SESSION_SECRET`（≥32）、`CPA_BASE_URL`、`CPA_MANAGEMENT_KEY`——否则等于对外开放免鉴权预览登录。
 
 ```bash
-cp .env.example .env      # 填好 .env（见 §1）
+install -m 600 .env.example .env   # 填好 .env（见 §1）
 sudo install -d -o 1000 -g 1000 -m 700 data   # Linux，见 §2（一条特权命令，别拆 chown+chmod 两步）
 docker compose up -d --build
 ```
