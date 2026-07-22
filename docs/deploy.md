@@ -30,7 +30,7 @@
 - 准备 `.env`：
 
   ```bash
-  install -m 600 .env.example .env   # 用 install 而非 cp：cp 受宿主 umask 022 落 0644，.env 存密钥须 600（仅属主可读）；普通用户可跑、无需 sudo，已存在也幂等重设 600
+  [ -f .env ] || install -m 600 .env.example .env   # 已存在则跳过：避免误重跑把已配好的密钥清空。install 而非 cp（cp 受宿主 umask 022 落 0644，.env 存密钥须 600·仅属主可读；install 直接 600、普通用户可跑无需 sudo）；老 .env 想收权限手动 chmod 600 .env
   # 按需填：SESSION_SECRET（生产必填，见下）、ADMIN_PASSWORD 或 ADMIN_LINUXDO_IDS、
   # LINUXDO_CLIENT_ID/SECRET、以及切真实时的 MOCK=false + CPA_BASE_URL/CPA_MANAGEMENT_KEY
   ```
@@ -55,7 +55,7 @@
 sudo install -d -o 1000 -g 1000 -m 700 data   # 一步完成 建目录 + 属主 uid1000 + 权限 700：仅 owner 可进（库含 OAuth 令牌快照与 CDK 码）
 ```
 
-用 `install -d` 一步到位、不拆成 `chown` + `chmod` 两步：若操作账号不是 uid1000，`sudo chown` 把 `data` 归 1000 后，紧接的**无 sudo** `chmod` 会因「非 owner 非 root 不能改权限」被拒——照两步走会卡在这。`install -d` 对已存在的目录同样适用（幂等地重设属主/权限）。
+用 `install -d` 一步到位、不拆成 `chown` + `chmod` 两步：若操作账号不是 uid1000，`sudo chown` 把 `data` 归 1000 后，紧接的**无 sudo** `chmod` 会因「非 owner 非 root 不能改权限」被拒——照两步走会卡在这。`install -d` 对已存在的目录同样适用（幂等地重设属主/权限）。**但 `install -d` 只作用于目录本身、不递归移交已有内容的属主**：若 `data/` 已有旧内容（从非 Docker 部署迁移、或曾以别的 uid 跑过）且属主非 1000，`app.db`/`-wal`/`backups` 仍归旧属主、容器（uid1000）写不了——需**先停服务**再 `sudo chown -R 1000:1000 data` 递归移交属主；全新（空）目录无需。
 
 否则容器启动会因无法写 `/app/data/app.db` 而报权限错。
 （macOS/Windows 的 Docker Desktop 通常自动处理 uid 映射，可跳过此步。）
@@ -75,7 +75,7 @@ sudo install -d -o 1000 -g 1000 -m 700 data   # 一步完成 建目录 + 属主 
 - **公网 / 生产**：**必须 `MOCK=false`**（且**别设** `ALLOW_MOCK_PREVIEW`），并在 `.env` 配齐 `SESSION_SECRET`（≥32）、`CPA_BASE_URL`、`CPA_MANAGEMENT_KEY`——否则等于对外开放免鉴权预览登录。
 
 ```bash
-install -m 600 .env.example .env   # 填好 .env（见 §1）
+[ -f .env ] || install -m 600 .env.example .env   # 填好 .env（见 §1；已存在则跳过，不覆盖已配密钥）
 sudo install -d -o 1000 -g 1000 -m 700 data   # Linux，见 §2（一条特权命令，别拆 chown+chmod 两步）
 docker compose up -d --build
 ```
