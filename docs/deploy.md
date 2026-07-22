@@ -43,6 +43,8 @@
 
 - `.env.example` 是配置的**权威清单**：代码引用的每个 env 变量都登记在册，含注释与安全默认。
 
+> 🔴 **公网/对外部署必须 `MOCK=false`**（并配齐 `SESSION_SECRET`≥32、`CPA_BASE_URL`、`CPA_MANAGEMENT_KEY`）。`MOCK=true` 会开放**免鉴权**预览登录 `/api/auth/dev-login`、且**默认信任 `x-forwarded-*` 头**（可被伪造域名 / 开放重定向）——**仅限本机 / 内网预览**。容器启动时若非 `MOCK=false`，entrypoint 会打印 `⚠️ MOCK 模式` 告警。
+
 ---
 
 ## 2. data 卷权限（uid 1000）
@@ -67,6 +69,11 @@ chmod 700 data                # 仅 owner(uid1000) 可进：库含 OAuth 令牌�
 
 首次无库 → entrypoint 跳过备份、直接迁移建库。
 
+先按目标选 `MOCK`（见 §1 红线）：
+
+- **内网 / 本机预览**：可留 `MOCK=true`（内置模拟 CPA，无需真实网关）；启动日志会有 `⚠️ MOCK 模式` 告警，属预期。
+- **公网 / 生产**：**必须 `MOCK=false`**，并在 `.env` 配齐 `SESSION_SECRET`（≥32）、`CPA_BASE_URL`、`CPA_MANAGEMENT_KEY`——否则等于对外开放免鉴权预览登录。
+
 ```bash
 cp .env.example .env      # 填好 .env（见 §1）
 mkdir -p data && sudo chown -R 1000:1000 data && chmod 700 data   # Linux，见 §2
@@ -88,7 +95,7 @@ ls -la data/                         # app.db 已生成，落在宿主卷里
 升级已由 `docker-entrypoint.sh` 落实成开机自动流程：**检测到待迁移才备份**（`schema-check` 判 schema 落后 → `node scripts/backup.ts`）→ **迁移**（`node scripts/migrate.ts`，打印 schema 版本）→ **启动**（`node server.js`）。单实例本身即锁，migrate 的 `busy_timeout` 兜住与 worker 的偶发并发。
 
 - **只在真有迁移时才备份**：schema 已是最新（日常重启、崩溃自动重启）就不备份，免得把「迁移前那份唯一回滚点」被 `BACKUP_KEEP` 轮转挤掉。
-- **未完结升级不重复备份**：一次多迁移的升级若后段失败，库会停在中间版本、`restart:unless-stopped` 反复重启。入口用 `data/.upgrade-in-progress` 标记去重：**标记存在就跳过备份**（不比对内容；内容仅作日志记目标版本）；未完结的升级链哪怕中途换了目标版本（原目标 v12 卡住、又部署 v13 的新镜像），也共享同一份「原始升级前」快照作回滚点；迁移成功即删标记、升级闭环。这样崩溃循环 / 跨目标重试都不会用中间态备份 + `BACKUP_KEEP` 轮转挤掉唯一的「升级前」回滚点。
+- **未完结升级不重复备份（且防快照丢失）**：一次多迁移的升级若后段失败，库会停在中间版本、`restart:unless-stopped` 反复重启。入口用 `data/.upgrade-in-progress` 标记去重，**标记内容记的是升级前那份快照的绝对路径**：重试时先验证该快照仍在——**在就跳过备份**、沿用它作回滚点（未完结的升级链哪怕中途换目标版本，如原目标 v12 卡住、又部署 v13 的新镜像，也共享这同一份「原始升级前」快照）；**快照已丢**（`BACKUP_DIR` 被改到非持久路径、或快照被删）**则重新备份当前状态**（有回滚点总比裸迁移强）。迁移成功即删标记、升级闭环。这样崩溃循环 / 跨目标重试既不会用中间态备份 + `BACKUP_KEEP` 轮转挤掉唯一的「升级前」回滚点，也不会在快照丢失时没回滚点就裸跑迁移。
 - **备份 fail-closed**：备份失败即**中止启动**（不迁移、不起服务），保住回滚点；日志停在备份报错处，容器进入重启循环。
 
 ```bash
@@ -118,7 +125,7 @@ docker compose logs -f app   # 有迁移：[schema-check] 需迁移 → [backup]
 
 `scripts/backup.ts` 用 SQLite `VACUUM INTO` 产出 **WAL 安全的一致性单文件快照**（对源库只读、不打断在线写入），落到 `data/backups/backup-<时间戳>-<随机>.db`，并按 `BACKUP_KEEP`（默认 7）只保留最新 N 份。
 
-- 自动：容器启动时若 `schema-check` 判定**有待迁移**才备份（schema 已最新则跳过）；未完结升级的重试（含中途换目标版本）由 `.upgrade-in-progress` 标记去重、**存在即跳过备份**，保住迁移前唯一回滚点不被轮转挤掉，迁移成功即清标记；备份失败即中止启动（fail-closed）。详见 §4。
+- 自动：容器启动时若 `schema-check` 判定**有待迁移**才备份（schema 已最新则跳过）；未完结升级的重试（含中途换目标版本）由 `.upgrade-in-progress` 标记去重，标记记录升级前快照的绝对路径、**验证快照仍在才跳过备份**（快照丢失则重新备份当前状态），保住迁移前唯一回滚点不被轮转挤掉，迁移成功即清标记；备份失败即中止启动（fail-closed）。详见 §4。
 - 手动随时触发：
 
   ```bash
@@ -139,7 +146,7 @@ ls data/backups/                     # 记下 backup-XXXX.db
 docker compose stop app
 
 # 3) 备份现场后替换（-wal/-shm 是 WAL 副本，恢复整库快照时必须一并删除；
-#    .upgrade-in-progress 也要清——手动还原=人为终结升级链，不清则下次真升级会被「标记存在」误判、跳过备份）
+#    .upgrade-in-progress 也要清——手动还原=人为终结升级链，不清则下次真升级会因「标记指向的旧快照仍在」被误判、跳过备份）
 cp data/app.db data/app.db.broken.bak 2>/dev/null || true
 cp data/backups/backup-XXXX.db data/app.db
 rm -f data/app.db-wal data/app.db-shm
