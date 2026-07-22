@@ -43,7 +43,7 @@
 
 - `.env.example` 是配置的**权威清单**：代码引用的每个 env 变量都登记在册，含注释与安全默认。
 
-> 🔴 **公网/对外部署必须 `MOCK=false`**（并配齐 `SESSION_SECRET`≥32、`CPA_BASE_URL`、`CPA_MANAGEMENT_KEY`）。`MOCK=true` 会开放**免鉴权**预览登录 `/api/auth/dev-login`、且**默认信任 `x-forwarded-*` 头**（可被伪造域名 / 开放重定向）——**仅限本机 / 内网预览**。容器启动时若非 `MOCK=false`，entrypoint 会打印 `⚠️ MOCK 模式` 告警。
+> 🔴 **公网/对外部署必须 `MOCK=false`**（并配齐 `SESSION_SECRET`≥32、`CPA_BASE_URL`、`CPA_MANAGEMENT_KEY`）。`MOCK=true` 会开放**免鉴权**预览登录 `/api/auth/dev-login`、且**默认信任 `x-forwarded-*` 头**（可被伪造域名 / 开放重定向）——**仅限本机 / 内网预览**。容器启动时若非 `MOCK=false`，entrypoint 按**需求 §8 默认拒绝启动**（打印 `🛑` 并 `exit 1`）：内网/本机预览须**显式**设 `ALLOW_MOCK_PREVIEW=1` 放行（改打印 `⚠️ MOCK 预览模式` 告警后继续）。即「默认拒启 + 显式预览开关」——未声明预览的部署一律按生产对待。
 
 ---
 
@@ -71,8 +71,8 @@ sudo install -d -o 1000 -g 1000 -m 700 data   # 一步完成 建目录 + 属主 
 
 先按目标选 `MOCK`（见 §1 红线）：
 
-- **内网 / 本机预览**：可留 `MOCK=true`（内置模拟 CPA，无需真实网关）；启动日志会有 `⚠️ MOCK 模式` 告警，属预期。
-- **公网 / 生产**：**必须 `MOCK=false`**，并在 `.env` 配齐 `SESSION_SECRET`（≥32）、`CPA_BASE_URL`、`CPA_MANAGEMENT_KEY`——否则等于对外开放免鉴权预览登录。
+- **内网 / 本机预览**：可留 `MOCK=true`（内置模拟 CPA，无需真实网关），但须**显式**设 `ALLOW_MOCK_PREVIEW=1` 放行——否则 entrypoint 按需求 §8 默认拒启（打印 `🛑` 退出）；放行后启动日志有 `⚠️ MOCK 预览模式` 告警，属预期。
+- **公网 / 生产**：**必须 `MOCK=false`**（且**别设** `ALLOW_MOCK_PREVIEW`），并在 `.env` 配齐 `SESSION_SECRET`（≥32）、`CPA_BASE_URL`、`CPA_MANAGEMENT_KEY`——否则等于对外开放免鉴权预览登录。
 
 ```bash
 cp .env.example .env      # 填好 .env（见 §1）
@@ -95,7 +95,7 @@ ls -la data/                         # app.db 已生成，落在宿主卷里
 升级已由 `docker-entrypoint.sh` 落实成开机自动流程：**检测到待迁移才备份**（`schema-check` 判 schema 落后 → `node scripts/backup.ts`）→ **迁移**（`node scripts/migrate.ts`，打印 schema 版本）→ **启动**（`node server.js`）。单实例本身即锁，migrate 的 `busy_timeout` 兜住与 worker 的偶发并发。
 
 - **只在真有迁移时才备份**：schema 已是最新（日常重启、崩溃自动重启）就不备份，免得把「迁移前那份唯一回滚点」被 `BACKUP_KEEP` 轮转挤掉。
-- **未完结升级不重复备份（且防快照丢失）**：一次多迁移的升级若后段失败，库会停在中间版本、`restart:unless-stopped` 反复重启。入口用 `data/.upgrade-in-progress` 标记去重，**标记内容记的是升级前那份快照的绝对路径**：重试时先验证该快照仍在——**在就跳过备份**、沿用它作回滚点（未完结的升级链哪怕中途换目标版本，如原目标 v12 卡住、又部署 v13 的新镜像，也共享这同一份「原始升级前」快照）；**快照已丢**（`BACKUP_DIR` 被改到非持久路径、或快照被删）**则重新备份当前状态**（有回滚点总比裸迁移强）。迁移成功即删标记、升级闭环。这样崩溃循环 / 跨目标重试既不会用中间态备份 + `BACKUP_KEEP` 轮转挤掉唯一的「升级前」回滚点，也不会在快照丢失时没回滚点就裸跑迁移。
+- **未完结升级不重复备份（且防快照丢失）**：一次多迁移的升级若后段失败，库会停在中间版本、`restart:unless-stopped` 反复重启。入口用 `data/.upgrade-in-progress` 标记去重，备份后**把升级前快照钉成 `data/backups/preupgrade.db`**（改名移出 `backup-*.db` 轮转集——`lib/backup.ts` 轮转只认 `^backup-.*\.db$`，故 `BACKUP_KEEP` 与手动 `backup.ts` 都不会把它转掉），**标记内容记的就是这份 `preupgrade.db` 的绝对路径**：重试时先验证该快照仍在——**在就跳过备份**、沿用它作回滚点（未完结的升级链哪怕中途换目标版本，如原目标 v12 卡住、又部署 v13 的新镜像，也共享这同一份「原始升级前」快照）；**快照已丢**（`BACKUP_DIR` 被改到非持久路径、或快照被删）**则重新备份当前状态**（有回滚点总比裸迁移强）。迁移成功即删标记、升级闭环（`preupgrade.db` 作无害冗余留着，至多一份，下次升级 `mv` 覆盖）。这样崩溃循环 / 跨目标重试 / 升级卡住期间手动备份，既不会用中间态备份 + `BACKUP_KEEP` 轮转挤掉唯一的「升级前」回滚点，也不会在快照丢失时没回滚点就裸跑迁移。
 - **备份 fail-closed**：备份失败即**中止启动**（不迁移、不起服务），保住回滚点；日志停在备份报错处，容器进入重启循环。
 
 ```bash
@@ -127,7 +127,7 @@ docker compose logs -f app   # 有迁移：[schema-check] 需迁移 → [backup]
 
 `scripts/backup.ts` 用 SQLite `VACUUM INTO` 产出 **WAL 安全的一致性单文件快照**（对源库只读、不打断在线写入），落到 `data/backups/backup-<时间戳>-<随机>.db`，并按 `BACKUP_KEEP`（默认 7）只保留最新 N 份。
 
-- 自动：容器启动时若 `schema-check` 判定**有待迁移**才备份（schema 已最新则跳过）；未完结升级的重试（含中途换目标版本）由 `.upgrade-in-progress` 标记去重，标记记录升级前快照的绝对路径、**验证快照仍在才跳过备份**（快照丢失则重新备份当前状态），保住迁移前唯一回滚点不被轮转挤掉，迁移成功即清标记；备份失败即中止启动（fail-closed）。详见 §4。
+- 自动：容器启动时若 `schema-check` 判定**有待迁移**才备份（schema 已最新则跳过）；未完结升级的重试（含中途换目标版本）由 `.upgrade-in-progress` 标记去重，标记记录升级前快照（备份后钉成 `data/backups/preupgrade.db`、改名移出 `backup-*.db` 轮转集，不被 `BACKUP_KEEP`/手动备份轮转掉）的绝对路径、**验证快照仍在才跳过备份**（快照丢失则重新备份当前状态），保住迁移前唯一回滚点，迁移成功即清标记；备份失败即中止启动（fail-closed）。详见 §4。
 - 手动随时触发：
 
   ```bash
@@ -152,6 +152,7 @@ docker compose stop app
 # 3) 备份现场后替换（-wal/-shm 是 WAL 副本，恢复整库快照时必须一并删除；
 #    .upgrade-in-progress 也要清——手动还原=人为终结升级链，不清则下次真升级会因「标记指向的旧快照仍在」被误判、跳过备份）
 sudo cp data/app.db data/app.db.broken.bak 2>/dev/null || true
+# 还原源：日常回滚用某份 backup-XXXX.db；若还原的是「升级失败现场」，升级前快照就是 data/backups/preupgrade.db（钉住不轮转、即最近一次升级前的库）
 sudo install -o 1000 -g 1000 -m 600 data/backups/backup-XXXX.db data/app.db   # 一步 覆盖还原 + 属主 uid1000 + 权限 600；不用 cp（覆盖会保留目标原 mode，老部署 0644 收不紧、属主也不还原）
 sudo rm -f data/app.db-wal data/app.db-shm
 sudo rm -f data/.upgrade-in-progress
@@ -189,7 +190,7 @@ server {
         proxy_set_header   X-Real-IP         $remote_addr;
         proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
         proxy_set_header   X-Forwarded-Proto $scheme;
-        proxy_set_header   X-Forwarded-Host  $host;   # 覆盖客户端可能伪造的值；TRUST_FORWARDED_HEADERS=true 时据此推断域名，见 §6.2
+        proxy_set_header   X-Forwarded-Host  hub.example.com;   # 钉死你的域名，别用 $host（默认/唯一 server 下 $host 兜底取客户端 Host 头，伪造照样透传）；TRUST_FORWARDED_HEADERS=true 时据此推断域名，见 §6.2
     }
 }
 # 80 端口重定向到 443（略）
@@ -199,7 +200,7 @@ server {
 
 - 把 `.env` 的 `APP_BASE_URL` 设为公网 HTTPS 地址，例如 `https://hub.example.com`。
 - 若信任并已在反代**覆盖/清洗**了 `x-forwarded-*` 头，可设 `TRUST_FORWARDED_HEADERS=true`；否则保持 false，固定用 `APP_BASE_URL` 推断 origin（防开放重定向）。
-  - ⚠️ 设 `true` 的**前提**：反代必须用 `proxy_set_header X-Forwarded-Host $host`（见 §6.1）**覆盖**客户端可能伪造的 `X-Forwarded-Host`。`originOf()`（`lib/request.ts`）采信该头拼 origin，用于登录/OAuth 回调等重定向——一旦放行伪造值就是**开放重定向**（把用户导向攻击者域名）。nginx 默认不会自动覆盖它：不显式 `proxy_set_header` 就会把客户端原值透传上游。
+  - ⚠️ 设 `true` 的**前提**：反代必须把 `X-Forwarded-Host` **覆写为固定域名**（`proxy_set_header X-Forwarded-Host hub.example.com;`，见 §6.1）——**别用 `$host`**：默认/唯一 server 块下 `$host` 会兜底取客户端 Host 头，伪造值照样透传。`originOf()`（`lib/request.ts`）采信该头拼 origin，用于登录/OAuth 回调等重定向——一旦放行伪造值就是**开放重定向**（把用户导向攻击者域名）。nginx 默认不会自动覆盖它：不显式 `proxy_set_header` 就会把客户端原值透传上游。
 
 ### 6.3 Linux.do OAuth 回调
 

@@ -8,11 +8,20 @@ set -e
 # 放在 set -e 之后、任何建库/备份之前——覆盖 migrate 建的 app.db 及运行时 -wal/-shm。
 umask 077
 
-# MOCK 模式安全告警：口径与 lib/env.ts 的 `(MOCK ?? 'true') !== 'false'` 一致——只有恰为 false 才算非 mock，
-#   缺省/任何其他值都当 MOCK。MOCK 下 /api/auth/dev-login 免鉴权发会话、trustForwardedHeaders 默认 true、
-#   SESSION_SECRET 允许空——照文档默认 cp .env.example .env 直接上公网 = 免鉴权入口 + 伪造头信任。仅本机/内网预览可用。
+# MOCK 门控（需求 §8：仍 MOCK=true → 生产拒绝启动）：默认拒启，仅 ALLOW_MOCK_PREVIEW=1 显式放行内网预览。
+#   口径与 lib/env.ts 的 `(MOCK ?? 'true') !== 'false'` 一致——只有恰为 false 才算非 mock，缺省/任何其他值都当 MOCK。
+#   MOCK 下 /api/auth/dev-login 免鉴权发会话、trustForwardedHeaders 默认 true、SESSION_SECRET 允许空——
+#   照默认 cp .env.example .env 直接上公网 = 免鉴权入口 + 伪造头信任，故未显式声明预览就拒启。
+# 为何闸门在入口层而非 env.ts 层：next build 阶段 NODE_ENV=production、.env 被 .dockerignore 拦、MOCK 走默认 true——
+#   若在 env.ts 层硬拒，镜像构建自身就会炸（构建期无从设 MOCK=false）；运行时入口层才是正确闸门。
+#   「生产」无法程序自证，「未显式声明预览的部署一律按生产对待」即该需求的可实现形态。
 if [ "${MOCK:-}" != "false" ]; then
-  echo "⚠️ [entrypoint] MOCK 模式：/api/auth/dev-login 免鉴权发会话、默认信任 x-forwarded-* 头——仅限本机/内网预览，公网部署必须 MOCK=false"
+  if [ "${ALLOW_MOCK_PREVIEW:-}" = "1" ]; then
+    echo "⚠️ [entrypoint] MOCK 预览模式（ALLOW_MOCK_PREVIEW=1）：/api/auth/dev-login 免鉴权发会话、默认信任 x-forwarded-* 头——仅限本机/内网预览"
+  else
+    echo "🛑 [entrypoint] MOCK≠false 且未声明预览，按生产拒绝启动（需求 §8）。内网预览请设 ALLOW_MOCK_PREVIEW=1；生产请设 MOCK=false 并配齐 SESSION_SECRET/CPA_*"
+    exit 1
+  fi
 fi
 
 DB="${DB_PATH:-/app/data/app.db}"
@@ -55,8 +64,11 @@ if [ -f "$DB" ] && ! node scripts/schema-check.ts; then
     # 备份 fail-closed：不 || 兜底，靠 set -e——失败即中止启动，绝不带着丢失的回滚点去迁移。
     echo "[entrypoint] 检测到待迁移，先备份（备份失败即中止，保回滚点）"
     node scripts/backup.ts
-    # 紧跟成功备份：取刚落地的最新快照绝对路径写入标记（无 pipefail，退出码=head=0；必有 ≥1 份）。
-    ls -t "$BK_DIR"/backup-*.db | head -1 > "$MARKER"
+    # 钉住升级前快照：lib/backup.ts 轮转只认 ^backup-.*\.db$，改名 preupgrade.db 即豁免轮转——
+    #   防「升级卡住期间手动备份 + 低 BACKUP_KEEP」把唯一升级前回滚点转掉。至多一份，下次升级 mv 覆盖。
+    PIN="$BK_DIR/preupgrade.db"
+    mv "$(ls -t "$BK_DIR"/backup-*.db | head -1)" "$PIN"
+    echo "$PIN" > "$MARKER"
   fi
 fi
 
