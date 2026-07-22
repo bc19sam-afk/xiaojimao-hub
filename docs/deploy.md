@@ -47,15 +47,19 @@
 
 ## 2. data 卷权限（uid 1000）
 
-容器以非 root 用户 `node`（uid **1000**）运行，需要对宿主 `./data` 有写权限。**Linux 宿主首次部署前**先建目录并授权：
+容器以非 root 用户 `node`（uid **1000**）运行，需要对宿主 `./data` 有写权限。**Linux 宿主首次部署前**先建目录、授权、收紧权限：
 
 ```bash
 mkdir -p data
 sudo chown -R 1000:1000 data
+chmod 700 data                # 仅 owner(uid1000) 可进：库含 OAuth 令牌快照与 CDK 码
 ```
 
 否则容器启动会因无法写 `/app/data/app.db` 而报权限错。
 （macOS/Windows 的 Docker Desktop 通常自动处理 uid 映射，可跳过 chown。）
+
+> 🔒 **库文件权限**：entrypoint 里设了 `umask 077`，容器新建的 `app.db`、`-wal/-shm`、备份文件都落 **0600**（仅 owner 可读写）、目录 0700。配合上面的 `chmod 700 data`，同宿主的其他用户读不到库里的令牌/CDK。
+> 老部署（本次升级前建的库可能是 0644）想一并收紧：umask 只管新建文件、不改既有，停服后手动 `chmod 600 data/app.db` 即可。
 
 ---
 
@@ -65,7 +69,7 @@ sudo chown -R 1000:1000 data
 
 ```bash
 cp .env.example .env      # 填好 .env（见 §1）
-mkdir -p data && sudo chown -R 1000:1000 data   # Linux，见 §2
+mkdir -p data && sudo chown -R 1000:1000 data && chmod 700 data   # Linux，见 §2
 docker compose up -d --build
 ```
 
@@ -81,13 +85,26 @@ ls -la data/                         # app.db 已生成，落在宿主卷里
 
 ## 4. 升级流程（备份 → 迁移 → 校验 → 启动）
 
-升级已由 `docker-entrypoint.sh` 落实成开机自动流程：**有库先备份**（`node scripts/backup.ts`）→ **迁移**（`node scripts/migrate.ts`，打印 schema 版本）→ **启动**（`node server.js`）。单实例本身即锁，migrate 的 `busy_timeout` 兜住与 worker 的偶发并发。
+升级已由 `docker-entrypoint.sh` 落实成开机自动流程：**检测到待迁移才备份**（`schema-check` 判 schema 落后 → `node scripts/backup.ts`）→ **迁移**（`node scripts/migrate.ts`，打印 schema 版本）→ **启动**（`node server.js`）。单实例本身即锁，migrate 的 `busy_timeout` 兜住与 worker 的偶发并发。
+
+- **只在真有迁移时才备份**：schema 已是最新（日常重启、崩溃自动重启）就不备份，免得把「迁移前那份唯一回滚点」被 `BACKUP_KEEP` 轮转挤掉。
+- **备份 fail-closed**：备份失败即**中止启动**（不迁移、不起服务），保住回滚点；日志停在备份报错处，容器进入重启循环。
 
 ```bash
 git pull                     # 或换用新镜像 tag
 docker compose up -d --build # 重建镜像并滚动重启；入口自动 备份→迁移→启动
-docker compose logs -f app   # 确认见 [backup] 完成（有库）→ [migrate] 完成 → 服务起
+docker compose logs -f app   # 有迁移：[schema-check] 需迁移 → [backup] 完成 → [migrate] 完成 → 服务起
+                             # 无迁移：[schema-check] 已最新，跳过备份 → [migrate] 完成 → 服务起
 ```
+
+> **备份失败 = 启动中止**（fail-closed 的预期副作用，不是 bug）：日志卡在 `[backup]` 报错、容器反复重启。先修根因——通常是 `./data` 磁盘满或权限不对（见 §2）；修好后 `docker compose up -d` 重试即可（幂等，会重走「备份→迁移→启动」）。**极端破窗**：确已另行留好快照、明知无需入口那份回滚点，要强行跳过备份启动，可临时覆盖入口进容器手动跑：
+>
+> ```bash
+> docker compose run --rm --service-ports --entrypoint sh app
+> # 进容器后：node scripts/migrate.ts && exec node server.js
+> ```
+>
+> 破窗操作请清楚自己在做什么再用。
 
 > 升级前如需人工快照，见 §5 手动备份。回滚：停容器 → 用 §5 的恢复步骤还原到升级前的备份 → 起旧镜像。
 
@@ -99,7 +116,7 @@ docker compose logs -f app   # 确认见 [backup] 完成（有库）→ [migrate
 
 `scripts/backup.ts` 用 SQLite `VACUUM INTO` 产出 **WAL 安全的一致性单文件快照**（对源库只读、不打断在线写入），落到 `data/backups/backup-<时间戳>-<随机>.db`，并按 `BACKUP_KEEP`（默认 7）只保留最新 N 份。
 
-- 自动：每次容器启动（升级）时，若已有库则先备份（见 §4）。
+- 自动：容器启动时若 `schema-check` 判定**有待迁移**才备份（schema 已最新则跳过，避免崩溃循环反复备份挤掉回滚点）；备份失败即中止启动（fail-closed）。详见 §4。
 - 手动随时触发：
 
   ```bash
