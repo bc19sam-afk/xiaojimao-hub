@@ -126,6 +126,15 @@ function ymd(ms: number): string {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
 }
 
+// 结算注入用「今日正午」：CI 跑 UTC，run 若落在 00:00–00:10（settle 日切 grace 窗，缺省 10min，force 不绕）
+// 会全 skip → settled=0 假失败（存量 flaky，北京 08:00–08:10 push 必踩）。正午恒在窗外除根；由真实时钟同日
+// 派生 ⇒ 与本文件按真实时钟造的 usage 日期（ymd(Date.now()-86400000) 等）仍同历，「昨天<今天」关系不变。
+const noonToday = () => {
+  const d = new Date()
+  d.setHours(12, 0, 0, 0)
+  return d.getTime()
+}
+
 before(async () => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'xjm-settle-'))
   process.env.MOCK = 'true'
@@ -161,7 +170,7 @@ test('折算 round：单价小数 → points=round(count×单价)', async () => 
   seedC({ id, provider: 'codex', accountId, plan: 'roundplan', linuxdoId: uid })
   assert.equal(db.ratePerCall('codex', 'roundplan'), 0.5)
   // count=3 → round(3×0.5)=round(1.5)=2
-  await withUsage([{ accountId, provider: 'codex', date: '2020-01-01', count: 3 }], () => settle.settleDailyUsage(undefined, { force: true }))
+  await withUsage([{ accountId, provider: 'codex', date: '2020-01-01', count: 3 }], () => settle.settleDailyUsage(noonToday(), { force: true }))
   const s = db.settlementsFor(id)
   assert.equal(s.length, 1)
   assert.equal(s[0].points, 2)
@@ -176,8 +185,8 @@ test('结算幂等：同号同日跑两次 → 一笔 settlement、余额只加�
   const accountId = 'idem-account'
   seedC({ id, provider: 'codex', accountId, plan: 'plus', linuxdoId: uid })
   const usage: DailyUsage[] = [{ accountId, provider: 'codex', date: '2020-01-02', count: 10 }]
-  const r1 = await withUsage(usage, () => settle.settleDailyUsage(undefined, { force: true }))
-  const r2 = await withUsage(usage, () => settle.settleDailyUsage(undefined, { force: true }))
+  const r1 = await withUsage(usage, () => settle.settleDailyUsage(noonToday(), { force: true }))
+  const r2 = await withUsage(usage, () => settle.settleDailyUsage(noonToday(), { force: true }))
   assert.deepEqual({ settled: r1.settled, awarded: r1.awarded }, { settled: 1, awarded: 1 }) // 首轮结算+发分
   assert.deepEqual({ settled: r2.settled, awarded: r2.awarded }, { settled: 0, awarded: 0 }) // 次轮 hasSettled 跳过
   assert.equal(db.settlementsFor(id).length, 1) // 只一笔
@@ -204,7 +213,7 @@ test('结算资格：入过池的 stopped/needs_review 补结；从没入池的�
     { accountId: 'p-stopped', provider: 'grok', date: '2020-01-03', count: 20 },
     { accountId: 'p-review', provider: 'grok', date: '2020-01-03', count: 20 },
   ]
-  const r = await withUsage(usage, () => settle.settleDailyUsage(undefined, { force: true }))
+  const r = await withUsage(usage, () => settle.settleDailyUsage(noonToday(), { force: true }))
   assert.equal(r.settled, 2) // 只有两个「入过池」的结了
   for (const s of noPay) {
     assert.equal(db.settlementsFor('id-' + s.acc).length, 0, `${s.st}（从没入池）不应结算`)
@@ -227,7 +236,7 @@ test('多日：多个未结算日各结一笔各发分；已结算日不重结',
     { accountId, provider: 'grok', date: '2020-02-02', count: 7 },
     { accountId, provider: 'grok', date: '2020-02-03', count: 9 },
   ]
-  const r1 = await withUsage(days, () => settle.settleDailyUsage(undefined, { force: true }))
+  const r1 = await withUsage(days, () => settle.settleDailyUsage(noonToday(), { force: true }))
   assert.equal(r1.settled, 3)
   assert.equal(r1.awarded, 3)
   assert.equal(db.settlementsFor(id).length, 3)
@@ -235,7 +244,7 @@ test('多日：多个未结算日各结一笔各发分；已结算日不重结',
 
   // 重复旧三日 + 新增一日 → 只结新增日
   const more: DailyUsage[] = [...days, { accountId, provider: 'grok', date: '2020-02-04', count: 4 }]
-  const r2 = await withUsage(more, () => settle.settleDailyUsage(undefined, { force: true }))
+  const r2 = await withUsage(more, () => settle.settleDailyUsage(noonToday(), { force: true }))
   assert.equal(r2.settled, 1)
   assert.equal(r2.awarded, 1)
   assert.equal(db.settlementsFor(id).length, 4)
@@ -290,7 +299,7 @@ test('MOCK 端到端：交号 → 入池 → 按日结算 → 余额增加、set
   const expected = Math.round(y.count * db.ratePerCall('claude', pooled.plan))
   assert.ok(expected > 0, '演示需可见发分')
 
-  await settle.settleDailyUsage(undefined, { force: true })
+  await settle.settleDailyUsage(noonToday(), { force: true })
   assert.equal(db.balance(7041), expected) // 主余额增加
   const s = db.settlementsFor(cid)
   assert.equal(s.length, 1) // 只结昨天（今天进行中不结）
@@ -302,7 +311,7 @@ test('MOCK 端到端：交号 → 入池 → 按日结算 → 余额增加、set
   assert.ok(db.myRank(7041).points >= 1)
 
   // 幂等重跑：余额岿然不动、settlement 仍一笔
-  await settle.settleDailyUsage(undefined, { force: true })
+  await settle.settleDailyUsage(noonToday(), { force: true })
   assert.equal(db.balance(7041), expected)
   assert.equal(db.settlementsFor(cid).length, 1)
 })
@@ -358,7 +367,7 @@ test('入池当日不结、次日起结：pooled_at 当天 u.date 被下界挡�
     { accountId, provider: 'grok', date: ymd(poolDay), count: 5 }, // 入池当日 → 不结（'<=' 下界挡）
     { accountId, provider: 'grok', date: ymd(nextDay), count: 3 }, // 次日 → 结
   ]
-  const r = await withUsage(usage, () => settle.settleDailyUsage(undefined, { force: true }))
+  const r = await withUsage(usage, () => settle.settleDailyUsage(noonToday(), { force: true }))
   assert.equal(r.settled, 1) // 只结次日一笔
   assert.equal(db.balance(uid), 3) // 只发次日 3 次 × 1，入池当日 5 次不算
   assert.equal(db.settlementsFor(id).length, 1)
