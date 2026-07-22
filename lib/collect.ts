@@ -200,7 +200,7 @@ export async function processPending(): Promise<{
     //   此刻占用唯一键（§3.2）。限额/额度暂满（decision=retry）不算失败 → 一并入池等恢复
     //   （§3.2「限额不算失败，先入池」）。入池优先级已接线（§2.5，缺省 10、后台可调）：best-effort——
     //   设失败不挡入池（号已启用能计量，优先级设失败仅损号主上浮），下轮不重设（细化重试留后续单）。
-    //   realClient.setPriority 端点/字段未验、留对接-R3；MOCK 下已验接线。启用失败→不入池、保持原态下轮重试。
+    //   realClient.setPriority 端点已按 CLIProxyAPI 上游源码核对（PATCH /auth-files/fields）、真发/重试留对接-R3；MOCK 下已验接线。启用失败→不入池、保持原态下轮重试。
     //   ⚠️ v4 三家一视同仁：不再按 pointsFor<=0 淘汰——provider 在 codex/claude/grok 内即可入池，
     //     按量折算规则（原 pointsFor）留 R2 重构。
     const enterPool = async (c: (typeof pending)[number], plan: string): Promise<void> => {
@@ -212,7 +212,10 @@ export async function processPending(): Promise<{
       try {
         await cpa.setPriority(c.authFileName, poolPriority) // 入池设高优先级（§2.5，缺省 10、后台可调）
       } catch {
-        // best-effort：号已启用能计量，优先级设失败仅损号主上浮、不挡入池；下轮不重设
+        // best-effort：号已启用能计量，优先级设失败仅损号主上浮、不挡入池（挡入池=号主零收益、更糟）。
+        // 号已 pooled 后 processPending 只扫 submitted/first_check → 本轮不重设、无自动补设。残余窄窗：
+        // 管理员调高优先级后恰逢瞬时失败 → 该号停在缺省 10（=cpamp 上游默认，失败无害）无自动重试；
+        // 重设/补设机制留对接-R3（realClient 真写验证后细化）。
         console.warn('[collect] setPriority 失败', shortAccountLabel(c.provider, c.accountId)) // §8 掩码（claude accountId=邮箱=PII）
       }
       if (plan !== c.plan) db.update(c.id, { plan })

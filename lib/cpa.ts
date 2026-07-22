@@ -427,11 +427,18 @@ const realClient: CpaClient = {
     await req('PATCH', '/v0/management/auth-files/status', { name, disabled })
   },
   async setPriority(name, priority) {
-    // ⚠️ 未验端点/字段（对接-R3 前必核）：镜像 setDisabled 的 /status 写模式最佳猜测。
-    //   P0-A：cpamp 确认支持给单号设优先级（CLIProxyAPI auth.Attributes["priority"]，越大越先），
-    //   但 R1 为只读探测、**未探写操作**，故端点路径与请求体字段均为占位，真实形状须在对接-R3
-    //   用一次性测试号核对后方可真发。本单只在 MOCK 验证接线，realClient 不真调。
-    await req('PATCH', '/v0/management/auth-files/priority', { name, priority })
+    // 端点/字段/生效链已按 CLIProxyAPI 上游 main 源码核对（对接-R2b codex 双通道复查）：
+    //   • 路由表 internal/api/server.go:944-951 mgmt 组仅注册 PATCH /auth-files/status 与
+    //     /auth-files/fields——**无 /auth-files/priority**（旧占位猜测真发必 404）。正确端点＝
+    //     PATCH /v0/management/auth-files/fields，体 { name, priority }（priority 为 JSON number）。
+    //   • PatchAuthFileFields(handlers/management/auth_files.go:1487)：name 必填（匹配 FileName/ID），
+    //     其余键作 metadata 字段路径写入 auth 文件；404=文件不存在、200={status:"ok"}。
+    //   • 生效链：synthesizer(watcher/synthesizer/file.go:187-198) 读 metadata["priority"]→
+    //     Attributes["priority"]；selector(sdk/cliproxy/auth/selector.go:115) authPriority Atoi 后
+    //     collectAvailableByPriority 按优先级分桶调度（数字越大越先，与 P0-A 记载闭环）。
+    // ⚠️ 仍未对真实实例发过写，且线上 cpamp 版本可能滞后于上游 main——对接-R3 用一次性测试号
+    //   实测后方可视为已验。本单 realClient 依旧不真调（全部验证走 MOCK）。
+    await req('PATCH', '/v0/management/auth-files/fields', { name, priority })
   },
   async deleteAuthFile(name) {
     await req('DELETE', `/v0/management/auth-files?name=${encodeURIComponent(name)}`)
