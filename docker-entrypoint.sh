@@ -62,12 +62,21 @@ if [ -f "$DB" ] && ! node scripts/schema-check.ts; then
     fi
     # 顺序铁律：先备份成功、再写标记。反过来会在备份失败后把下次备份也一起跳掉。
     # 备份 fail-closed：不 || 兜底，靠 set -e——失败即中止启动，绝不带着丢失的回滚点去迁移。
+    # 备份前记录已有集合 → 备份 → 集合差找出新增那份（不靠 mtime——时钟回拨/放回旧快照会让 ls -t 选错份）
+    PRE_LIST=$(ls "$BK_DIR"/backup-*.db 2>/dev/null || true)
     echo "[entrypoint] 检测到待迁移，先备份（备份失败即中止，保回滚点）"
     node scripts/backup.ts
+    NEW_SNAP=""
+    for f in "$BK_DIR"/backup-*.db; do
+      case "$PRE_LIST" in
+        *"$f"*) ;;           # 备份前就有，跳过
+        *) NEW_SNAP="$f" ;;  # 新增即本次快照（文件名定长同构，无子串误匹配）
+      esac
+    done
     # 钉住升级前快照：lib/backup.ts 轮转只认 ^backup-.*\.db$，改名 preupgrade.db 即豁免轮转——
     #   防「升级卡住期间手动备份 + 低 BACKUP_KEEP」把唯一升级前回滚点转掉。至多一份，下次升级 mv 覆盖。
     PIN="$BK_DIR/preupgrade.db"
-    mv "$(ls -t "$BK_DIR"/backup-*.db | head -1)" "$PIN"
+    mv "$NEW_SNAP" "$PIN"
     echo "$PIN" > "$MARKER"
   fi
 fi

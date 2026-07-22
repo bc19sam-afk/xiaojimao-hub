@@ -158,6 +158,11 @@ sudo rm -f data/app.db-wal data/app.db-shm
 sudo rm -f data/.upgrade-in-progress
 
 # 4) 起服务，校验
+#    ⚠️ 分叉——还原的若是「升级失败现场」（用了 preupgrade.db，且本次升级的新镜像跑挂了），不要用 start：
+#       新镜像 entrypoint 见 schema 落后，会拿刚还原的旧库重跑同一个失败迁移，回滚白做。须先把代码/镜像退回旧版本
+#       （git checkout <旧提交/tag>，或改 compose 切回旧镜像 tag），再 `docker compose up -d --build` 重建容器——
+#       旧代码的 LATEST_VERSION 与旧库版本一致，schema-check 过、不再迁移，干净起来。
+#    日常演练 / 回滚到某份历史快照（镜像没换）才用下面这条：
 docker compose start app
 docker compose logs -f app           # [migrate] 完成、schema 版本正常
 curl -s http://127.0.0.1:3000/api/health   # {"ok":true}
