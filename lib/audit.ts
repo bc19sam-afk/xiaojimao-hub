@@ -174,19 +174,21 @@ export function auditSettleParam(oldMinutes: number, newMinutes: number): AuditE
 }
 
 // ---- 人工复核处理（P4-R3，§7.4）----
-// 人工重试/终止 needs_review 号（卡住任务的人工出口）。target=provider/accountId——account_id 非敏感、
-// 非码/RT/密钥，可记，便于审计追溯到具体号。old/new 只记 verifyStatus 迁移。
+// 人工重试/终止 needs_review 号（卡住任务的人工出口）。target=provider/contribution#id——**不含裸 accountId**：
+// 对接-R1 实锤 claude 的 accountId=邮箱（PII），写进 audit_log 会永久留痕（§8），故改用 contribution id 唯一
+// 定位、按需再回查号。old/new 只记 verifyStatus 迁移。
 // toStatus＝真实去向（由调用方按 retryReview 分叉口径给：terminate→'stopped'；retry 从没入池→'submitted'、
 // 入过池→'pooled'，见 db.retryReview）。**审计 new 必与真实去向一致**（codex 复审 P1：retry 硬编码 'submitted'
 // 对入过池号已不真）。两动作都不碰 daily_settlements / point_ledger（§7.4 幂等：重试不结算、终止不删账本）。
 export function auditContributionReview(
   action: 'contribution.retry' | 'contribution.terminate',
-  c: { provider: string; accountId: string },
+  c: { id: string; provider: string; accountId: string },
   toStatus: string,
 ): AuditEntry {
   return {
     action,
-    target: `${c.provider}/${c.accountId}`,
+    // §8：绝不把 accountId（claude=邮箱/PII）写进持久化审计；provider+contribution#id 既非敏感又可唯一回查
+    target: `${c.provider}/contribution#${c.id}`,
     old: { verifyStatus: 'needs_review' },
     new: { verifyStatus: toStatus },
   }
