@@ -37,6 +37,7 @@ export interface AuthFile {
   plan: string
   disabled: boolean
   provider?: ProviderId // 识别不出时 undefined（findNew 会保守跳过）
+  priority?: number // 仅 mockClient 填（供测试读回验证入池设优先级）；realClient 读侧不填——R1 实测 cpamp GET auth-files 无此字段
 }
 
 // 文件的 provider 标识（type 字段或文件名前缀）→ ProviderId。
@@ -115,6 +116,8 @@ export interface CpaClient {
   ingestRefreshToken(rt: string, knownAccountIds: string[]): Promise<IngestResult>
   listAuthFiles(): Promise<AuthFile[]>
   setDisabled(name: string, disabled: boolean): Promise<void>
+  // 设单号优先级（cpamp 数字越大越优先）。贡献号入池即调（§2.5），best-effort。
+  setPriority(name: string, priority: number): Promise<void>
   deleteAuthFile(name: string): Promise<void>
   inspect(): Promise<ProbeResult[]>
   // 按号按自然日的调用量（P2-R2）。settleDailyUsage 周期拉取 → 折算积分 → 按日发给号主。
@@ -193,6 +196,11 @@ const mockClient: CpaClient = {
     const store = mockLoad()
     const f = store.get(name)
     if (f) { f.disabled = disabled; mockSave(store) }
+  },
+  async setPriority(name, priority) {
+    const store = mockLoad()
+    const f = store.get(name)
+    if (f) { f.priority = priority; mockSave(store) } // 持久化，供测试经 listAuthFiles() 读回验证
   },
   async deleteAuthFile(name) {
     const store = mockLoad()
@@ -417,6 +425,13 @@ const realClient: CpaClient = {
   },
   async setDisabled(name, disabled) {
     await req('PATCH', '/v0/management/auth-files/status', { name, disabled })
+  },
+  async setPriority(name, priority) {
+    // ⚠️ 未验端点/字段（对接-R3 前必核）：镜像 setDisabled 的 /status 写模式最佳猜测。
+    //   P0-A：cpamp 确认支持给单号设优先级（CLIProxyAPI auth.Attributes["priority"]，越大越先），
+    //   但 R1 为只读探测、**未探写操作**，故端点路径与请求体字段均为占位，真实形状须在对接-R3
+    //   用一次性测试号核对后方可真发。本单只在 MOCK 验证接线，realClient 不真调。
+    await req('PATCH', '/v0/management/auth-files/priority', { name, priority })
   },
   async deleteAuthFile(name) {
     await req('DELETE', `/v0/management/auth-files?name=${encodeURIComponent(name)}`)

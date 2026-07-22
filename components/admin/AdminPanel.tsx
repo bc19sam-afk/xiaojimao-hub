@@ -117,6 +117,7 @@ export default function AdminPanel() {
   const [gateEnabled, setGateEnabled] = useState(true) // 信任门槛开关（缺省启用）
   const [minTrust, setMinTrust] = useState('') // 信任门槛数值（受控输入，字符串）
   const [graceMinutes, setGraceMinutes] = useState('') // 结算时刻：午夜后分钟（受控输入，字符串）
+  const [poolPriority, setPoolPriority] = useState('') // 入池优先级（受控输入，字符串）
   const [audit, setAudit] = useState<AuditRow[]>([])
   // 数据查看 + 人工复核（P4-R3）
   const [contributions, setContributions] = useState<ContributionRow[]>([])
@@ -149,6 +150,10 @@ export default function AdminPanel() {
     const d = await fetch('/api/admin/settle-params', { cache: 'no-store' }).then((r) => r.json())
     if (d.ok) setGraceMinutes(String(d.graceMinutes))
   }, [])
+  const loadPool = useCallback(async () => {
+    const d = await fetch('/api/admin/pool-priority', { cache: 'no-store' }).then((r) => r.json())
+    if (d.ok) setPoolPriority(String(d.poolPriority))
+  }, [])
   const loadAudit = useCallback(async () => {
     const d = await fetch('/api/admin/audit?limit=50', { cache: 'no-store' }).then((r) => r.json())
     if (d.ok) setAudit(d.audit ?? [])
@@ -176,13 +181,14 @@ export default function AdminPanel() {
     loadQuota()
     loadGate()
     loadSettle()
+    loadPool()
     loadAudit()
     loadContributions()
     loadSettlements()
     loadRedemptions()
     loadReview()
   }, [
-    load, loadRates, loadQuota, loadGate, loadSettle, loadAudit,
+    load, loadRates, loadQuota, loadGate, loadSettle, loadPool, loadAudit,
     loadContributions, loadSettlements, loadRedemptions, loadReview,
   ])
 
@@ -248,6 +254,25 @@ export default function AdminPanel() {
     const d = await res.json()
     if (res.ok) {
       setGraceMinutes(String(d.graceMinutes))
+      flash('已保存')
+      loadAudit()
+    } else flash(d.error || '失败')
+  }
+
+  async function savePool() {
+    const n = Number(poolPriority)
+    if (poolPriority.trim() === '' || !Number.isSafeInteger(n) || n < 0) {
+      flash('优先级须为非负整数')
+      return
+    }
+    const res = await fetch('/api/admin/pool-priority', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ poolPriority: n }),
+    })
+    const d = await res.json()
+    if (res.ok) {
+      setPoolPriority(String(d.poolPriority))
       flash('已保存')
       loadAudit()
     } else flash(d.error || '失败')
@@ -483,6 +508,30 @@ export default function AdminPanel() {
             <span className="text-xs text-neutral-500">分钟（午夜后）</span>
             <button
               onClick={saveSettle}
+              className="rounded-lg bg-[var(--brand)]/20 px-3 py-1.5 text-xs font-medium text-[var(--brand-bright)] hover:bg-[var(--brand)]/30"
+            >
+              保存
+            </button>
+          </div>
+        </section>
+
+        {/* 入池优先级（对接-R2b §2.5/§7.1）：贡献号入池即设的全局优先级，cpamp 数字越大越优先 */}
+        <section className="mt-8 rounded-2xl border border-white/10 bg-white/[0.02] p-5">
+          <h2 className="mb-1 font-bold text-white">入池优先级</h2>
+          <p className="mb-4 text-xs text-neutral-500">
+            贡献账号入池时统一设置的优先级，缺省 <code>10</code>，数值越大越优先被调用（号主越先赚分）。非负整数。
+          </p>
+          <div className="flex items-center gap-2">
+            <input
+              className={field + ' w-40'}
+              type="number"
+              min={0}
+              value={poolPriority}
+              onChange={(e) => setPoolPriority(e.target.value)}
+              placeholder="10"
+            />
+            <button
+              onClick={savePool}
               className="rounded-lg bg-[var(--brand)]/20 px-3 py-1.5 text-xs font-medium text-[var(--brand-bright)] hover:bg-[var(--brand)]/30"
             >
               保存
