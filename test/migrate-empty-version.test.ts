@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { DatabaseSync } from 'node:sqlite'
-import { migrate, LATEST_VERSION } from '../lib/migrate.ts'
+import { migrate, readSchemaVersion, LATEST_VERSION } from '../lib/migrate.ts'
 
 // ============================================================================
 // 「schema_version 有表无行」迁移假成功回归（codex xhigh 于 PR #29 复审发现）：
@@ -107,5 +107,16 @@ test('已有最新 schema 但版本行为空：拒绝重放且不改业务数据
   const versions = db.prepare('SELECT version FROM schema_version').all()
   assert.equal(versions.length, 0, '拒绝时不得猜测或回填版本')
   assert.match(error, /已有业务表.*拒绝自动重放/)
+  db.close()
+})
+
+test('schema_version 多行：版本读取与迁移都 fail-closed', () => {
+  const db = new DatabaseSync(':memory:')
+  migrate(db)
+  db.prepare('INSERT INTO schema_version (version) VALUES (?)').run(LATEST_VERSION)
+
+  assert.throws(() => readSchemaVersion(db), /schema_version 应仅有一行/)
+  assert.throws(() => migrate(db), /schema_version 应仅有一行/)
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM schema_version').get().n, 2)
   db.close()
 })

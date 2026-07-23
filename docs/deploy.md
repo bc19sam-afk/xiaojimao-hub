@@ -12,6 +12,7 @@
   **同一宿主默认只跑一套本系统**；若确需预演/第二 checkout，必须全程用独立项目名（如
   `docker compose -p xiaojimao-hub-staging ...`）并隔离端口与数据目录。历史上若用过 `-p OLD_NAME`，升级/回滚须继续带旧名，
   确认旧栈已停止并移交数据后再切换，避免同宿主留下两套资源。
+  如旧部署从未显式设 `-p`、而是依赖旧目录名推导出其他项目名，先用该旧名显式操作完停栈/数据移交，再切到默认名。
 - 🔴 **密钥不入库/不进镜像**：`.env`/`.env.local` 含真实密钥，由 `.gitignore` + `.dockerignore` 双拦。镜像里绝不烘 `data/app.db`。
 - worker 依赖**常驻 Node 进程**：`instrumentation.ts` 在服务启动时拉起 `lib/worker.ts` 的后台巡检（首检/存活/结算）。serverless 不适用。
 
@@ -123,8 +124,9 @@ docker compose logs -f app   # 有迁移：[schema-check] 需迁移 → [backup]
 > 破窗操作请清楚自己在做什么再用。
 
 > **空版本行保护**：若日志报 `schema_version 表存在但无版本行，且已有业务表`，迁移器会在修改业务
-> schema 前 fail-closed。这代表无法区分「旧版已跑过多少迁移」，不要盲填最新版本或反复重启；优先恢复
-> `preupgrade.db`，或复制数据库到离线环境核对实际 schema 后再补写正确版本。
+> schema 前 fail-closed。这代表无法区分「旧版已跑过多少迁移」，不要盲填最新版本或反复重启。只有在确认
+> `preupgrade.db` 确实早于该异常状态时才恢复它；首次检测到此状态时，entrypoint 可能刚把当前歧义库钙住为
+> `preupgrade.db`，此时应找更早的已知正常备份，或复制数据库到离线环境核对实际 schema 后再补写正确版本。
 
 > 升级前如需人工快照，见 §5 手动备份。回滚：停容器 → 用 §5 的恢复步骤还原到升级前的备份 → 起旧镜像。
 

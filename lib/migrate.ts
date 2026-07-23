@@ -499,6 +499,21 @@ function hasTable(db: DatabaseSync, name: string): boolean {
     .get(name)
 }
 
+// schema_version 是单行表：多行时不猜版本，直接拒绝继续。
+// 返回 null 表示表不存在或存在但无行，供起始版本与运行期守卫区分。
+export function readSchemaVersion(db: DatabaseSync): number | null {
+  if (!hasTable(db, 'schema_version')) return null
+  const rows = db
+    .prepare('SELECT version FROM schema_version ORDER BY rowid')
+    .all() as unknown as { version: number }[]
+  if (rows.length > 1) {
+    throw new Error(
+      `[migrate] schema_version 应仅有一行，实际有 ${rows.length} 行；已拒绝根据 LIMIT 1 猜测版本。`,
+    )
+  }
+  return rows[0]?.version ?? null
+}
+
 // 迁移执行纪律守卫（P1-0）：生产启动只校验 schema 版本，不执行迁移
 // （迁移是部署时的独立步骤 `npm run migrate`）。纯只读，不建 schema_version 表：
 //   无 schema_version 表（含全新空库）视为版本 0；
@@ -506,13 +521,7 @@ function hasTable(db: DatabaseSync, name: string): boolean {
 //   相等 → 通过；
 //   超前（DB 版本 > 代码版本，如代码回滚）→ warn 放行（迁移纪律「先加后删」向后兼容）。
 export function assertSchemaCurrent(db: DatabaseSync): void {
-  let version = 0
-  if (hasTable(db, 'schema_version')) {
-    const row = db.prepare('SELECT version FROM schema_version LIMIT 1').get() as unknown as
-      | { version: number }
-      | undefined
-    version = row?.version ?? 0
-  }
+  const version = readSchemaVersion(db) ?? 0
   if (version < LATEST_VERSION) {
     throw new Error(
       `[db] schema 版本落后（当前 ${version}，代码需要 ${LATEST_VERSION}）：请先运行 npm run migrate 完成迁移，再启动应用。`,
@@ -534,10 +543,8 @@ export function assertSchemaCurrent(db: DatabaseSync): void {
 //   重建表、覆写回填数据或撞 duplicate column。此态必须 fail-closed，先人工核对/恢复备份。
 function startingVersion(db: DatabaseSync): number {
   if (hasTable(db, 'schema_version')) {
-    const row = db.prepare('SELECT version FROM schema_version LIMIT 1').get() as unknown as
-      | { version: number }
-      | undefined
-    if (row) return row.version
+    const version = readSchemaVersion(db)
+    if (version != null) return version
 
     const existing = db
       .prepare(
@@ -573,11 +580,7 @@ export function migrate(db: DatabaseSync): number {
     db.exec('BEGIN IMMEDIATE')
     try {
       // 拿锁后重读版本：锁外读到的可能已过期（并发进程刚应用完此迁移）
-      const cur = (
-        db.prepare('SELECT version FROM schema_version LIMIT 1').get() as unknown as
-          | { version: number }
-          | undefined
-      )?.version ?? 0
+      const cur = readSchemaVersion(db) ?? 0
       if (m.version <= cur) {
         db.exec('ROLLBACK')
         version = cur
@@ -586,7 +589,11 @@ export function migrate(db: DatabaseSync): number {
       m.up(db)
       // 兼容「schema_version 表已建但初始行尚未落库」的中断态：
       // UPDATE 命中 0 行时补插版本，避免迁移表面成功、下次启动重放非幂等 DDL。
-      const updated = db.prepare('UPDATE schema_version SET version = ?').run(m.version)
+      const updated = db
+        .prepare(
+          'UPDATE schema_version SET version = ? WHERE rowid = (SELECT rowid FROM schema_version LIMIT 1)',
+        )
+        .run(m.version)
       if (updated.changes === 0) {
         db.prepare('INSERT INTO schema_version (version) VALUES (?)').run(m.version)
       }
