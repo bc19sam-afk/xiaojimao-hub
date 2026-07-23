@@ -1,39 +1,55 @@
 # 小鸡毛账号收集系统（Hub）
 
-对标 `hub.icoe.pp.ua`：用 Linux.do OAuth 做身份闸门，让用户授权贡献 Codex 账号，账号自动进 CPA（CLIProxyAPI）账号池，健康通过后发放公益站额度，形成自循环。
+用 Linux.do OAuth 作为身份入口：贡献者提交 Codex / Claude / Grok 账号，账号进入 CPA（CLIProxyAPI / cpamp）号池，系统按每日实际调用量折算积分，再用积分兑换 CDK / LDC。
+
+## 产品边界
+
+- 本站只负责**贡献台 + 按日结算 + 积分商店**。
+- CPA 号池的长期管理与调度属于独立系统，不在本项目内重复实现。
+- 首版部署形态锁定为**单机、单实例、SQLite 持久化卷、单 worker**。
+
+完整规则见 [`需求文档.md`](./需求文档.md)，实施记录见 [`实现路线图.md`](./实现路线图.md)。
 
 ## 架构
 
-```
-浏览器 ── Linux.do 登录 ──▶ Next.js 应用 ── Bearer 管理密钥 ──▶ CPA 网关(CLIProxyAPI)
-                             ├ /api/auth/linuxdo/*   身份闸门
-                             ├ /dashboard            授权收号 + 额度
-                             ├ /api/codex/oauth/*    (P1) 走 CPA 网页 OAuth 收号
-                             └ worker                (P2) 健康校验→启用→发额度
+```text
+浏览器 ── Linux.do 登录 ──▶ Next.js 应用 ──▶ SQLite
+                             │
+                             ├─ 授权 / RT 收号 ──▶ CPA 管理 API
+                             ├─ worker：首检 → 入池 → 存活巡检
+                             ├─ worker：每日用量 → 幂等结算 → 积分账本
+                             └─ 积分商店：CDK / LDC 库存与兑换
 ```
 
 ## 当前进度
 
-- **P0（已完成）**：Next.js 骨架 + Linux.do OAuth 登录 + JWT 会话 + 登录/看板页。
-- P1：dashboard + Codex OAuth 收号（照抄参考站并做得更好看）。
-- P2：健康校验 → 启用 → 发额度 → 通知。
-- P3：防刷 + 管理后台 + 部署。
+- **P0–P5 已合并收官**：身份、收号、首检入池、按日计量发分、Dashboard、排行榜、CDK/LDC 商店、后台配置、审计与人工复核已完成。
+- **P6-R1 已合并**：Docker / Compose、非 root 运行、持久化卷、迁移前备份、schema 复核、日志轮转、存活检查与部署手册已完成。
+- **MOCK 全链路可验证**：交号 → 首检 → 入池 → 每日用量 → 积分 → 兑换。
+- **仍未完成生产验收**：真实 Linux.do + 真号 E2E、CPA 写操作实测、真实服务器部署，以及 P6-R2 的 readiness、异机备份、恢复脚本和监控告警。
 
-## 本地运行
+> 请勿把“本地 MOCK 可运行”、“Docker 产物已完成”与“生产已验收”视为同一状态。
+
+## 本地 MOCK 运行
 
 ```bash
 npm install
-cp .env.example .env.local   # 填 LINUXDO_CLIENT_ID/SECRET、SESSION_SECRET
-npm run dev                  # http://localhost:3000
+[ -f .env.local ] || install -m 600 .env.example .env.local
+npm run dev
 ```
 
-`.env` 未填 Linux.do 时应用照常启动，只是点登录会跳回 `/login?error=config`。
+- `.env.example` 默认 `MOCK=true`，本地开发会自动迁移 SQLite，无需真实 CPA 密钥。
+- 未配 Linux.do OAuth 时，可使用本地预览登录；该模式仅限本机或内网。
+- 默认访问地址：`http://localhost:3000`。
 
-## 需要补的配置
+## 验证
 
-| 变量 | 用途 | 阶段 |
-|---|---|---|
-| `LINUXDO_CLIENT_ID` / `SECRET` | Linux.do OAuth 应用（回调填 `<APP_BASE_URL>/api/auth/linuxdo/callback`） | P0 |
-| `SESSION_SECRET` | 会话签名，`openssl rand -hex 32` | P0 |
-| `MIN_TRUST_LEVEL` | 最低信任等级门槛，防小号 | P0 |
-| `CPA_BASE_URL` / `CPA_MANAGEMENT_KEY` | CPA 网关地址与管理密钥 | P1 |
+```bash
+npm test
+npm run build
+node --env-file=.env.local scripts/schema-check.ts
+```
+
+## Docker 部署
+
+按 [`docs/deploy.md`](./docs/deploy.md) 准备权限为 `0600` 的 `.env`、`data` 持久化目录、HTTPS 反向代理和备份/恢复流程。公网或对外部署必须显式设置 `MOCK=false` 并配齐生产密钥。

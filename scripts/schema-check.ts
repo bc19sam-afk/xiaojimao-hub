@@ -4,11 +4,11 @@
 // 目的：只在「真有待迁移」时才备份，避免崩溃循环里每次重启都备份，
 //   把 BACKUP_KEEP 轮转很快把迁移前那份唯一回滚点挤掉。
 // 只读优先（node:sqlite readOnly，已验证可读 live WAL）；读不了再普通开、仅 SELECT，绝不写 PRAGMA。
-// 用 Node 26 内置 TS + node:sqlite，无新依赖；只复用 lib/migrate.ts 导出的 LATEST_VERSION，不改其逻辑。
+// 用 Node 26 内置 TS + node:sqlite，无新依赖；复用 lib/migrate.ts 的最新版本和单行版本读取逻辑。
 import { DatabaseSync } from 'node:sqlite'
 import fs from 'node:fs'
 import path from 'node:path'
-import { LATEST_VERSION } from '../lib/migrate.ts'
+import { LATEST_VERSION, readSchemaVersion } from '../lib/migrate.ts'
 
 const DB_PATH = process.env.DB_PATH || path.join(process.cwd(), 'data', 'app.db') // 与 lib/db.ts、scripts/migrate.ts 一致
 
@@ -19,14 +19,7 @@ function readVersion(dbPath: string): number {
     try {
       const db = new DatabaseSync(dbPath, opts)
       try {
-        const hasTable = db
-          .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_version'")
-          .get()
-        if (!hasTable) return 0
-        const row = db.prepare('SELECT version FROM schema_version LIMIT 1').get() as
-          | { version: number }
-          | undefined
-        return row?.version ?? 0
+        return readSchemaVersion(db) ?? 0
       } finally {
         db.close()
       }
