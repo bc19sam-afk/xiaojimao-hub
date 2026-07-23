@@ -125,7 +125,7 @@ docker compose logs -f app   # 有迁移：[schema-check] 需迁移 → [backup]
 
 > **空版本行保护**：若日志报 `schema_version 表存在但无版本行，且已有业务表`，迁移器会在修改业务
 > schema 前 fail-closed。这代表无法区分「旧版已跑过多少迁移」，不要盲填最新版本或反复重启。只有在确认
-> `preupgrade.db` 确实早于该异常状态时才恢复它；首次检测到此状态时，entrypoint 可能刚把当前歧义库钙住为
+> `preupgrade.db` 确实早于该异常状态时才恢复它；首次检测到此状态时，entrypoint 可能刚把当前歧义库钉住为
 > `preupgrade.db`，此时应找更早的已知正常备份，或复制数据库到离线环境核对实际 schema 后再补写正确版本。
 
 > 升级前如需人工快照，见 §5 手动备份。回滚：停容器 → 用 §5 的恢复步骤还原到升级前的备份 → 起旧镜像。
