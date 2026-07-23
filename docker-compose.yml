@@ -5,6 +5,8 @@
 #    SQLite 单写模型——多个写入者会腐坏库。多实例需 PostgreSQL + 独立锁 worker，
 #    本轮不做。扩容前先读 docs/deploy.md。
 # ============================================================================
+name: xiaojimao-hub
+
 services:
   app:
     build: .
@@ -24,7 +26,8 @@ services:
       TZ: ${TZ:-Asia/Shanghai}
 
     # 密钥/开关从 .env 读（SESSION_SECRET / MOCK / CPA_* / ADMIN_* 等）。
-    # .env 含真实密钥，绝不进镜像/Git（见 .dockerignore、.gitignore）。首次部署先 cp .env.example .env。
+    # .env 含真实密钥，绝不进镜像/Git（见 .dockerignore、.gitignore）。
+    # 首次部署：[ -f .env ] || install -m 600 .env.example .env（防重跑覆盖密钥）。
     env_file:
       - .env
 

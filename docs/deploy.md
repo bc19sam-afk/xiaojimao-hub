@@ -15,6 +15,7 @@
 
 | 项 | 值 |
 |---|---|
+| Compose 项目名 | `xiaojimao-hub`（已在 `docker-compose.yml` 固定，不受中文目录名影响） |
 | 运行时 | `node:26-alpine`，Next.js standalone（`node server.js`） |
 | 监听 | 容器内 `0.0.0.0:3000`；compose 只映射到宿主 `127.0.0.1:3000` |
 | 持久化 | 宿主 `./data` → 容器 `/app/data`（库 `app.db` + 备份 `backups/`） |
