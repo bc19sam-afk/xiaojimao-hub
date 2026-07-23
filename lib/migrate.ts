@@ -562,7 +562,12 @@ export function migrate(db: DatabaseSync): number {
         continue
       }
       m.up(db)
-      db.prepare('UPDATE schema_version SET version = ?').run(m.version)
+      // 兼容「schema_version 表已建但初始行尚未落库」的中断态：
+      // UPDATE 命中 0 行时补插版本，避免迁移表面成功、下次启动重放非幂等 DDL。
+      const updated = db.prepare('UPDATE schema_version SET version = ?').run(m.version)
+      if (updated.changes === 0) {
+        db.prepare('INSERT INTO schema_version (version) VALUES (?)').run(m.version)
+      }
       db.exec('COMMIT')
     } catch (err) {
       db.exec('ROLLBACK')
