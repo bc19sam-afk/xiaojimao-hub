@@ -8,6 +8,10 @@
 
 - **单机 · 单实例 · SQLite · 单 worker**。这是定死的模型，别改。
 - 🔴 **单实例红线**：绝不 `replicas>1`、绝不多容器共享 `./data` 卷。SQLite 是单写模型，多个写入者会腐坏库。要横向扩容得先换 PostgreSQL + 独立锁 worker——本轮不做。
+- Compose 默认项目名为 `xiaojimao-hub`（解决中文目录推导名为空），但 `-p` / `COMPOSE_PROJECT_NAME` 优先级更高。
+  **同一宿主默认只跑一套本系统**；若确需预演/第二 checkout，必须全程用独立项目名（如
+  `docker compose -p xiaojimao-hub-staging ...`）并隔离端口与数据目录。历史上若用过 `-p OLD_NAME`，升级/回滚须继续带旧名，
+  确认旧栈已停止并移交数据后再切换，避免同宿主留下两套资源。
 - 🔴 **密钥不入库/不进镜像**：`.env`/`.env.local` 含真实密钥，由 `.gitignore` + `.dockerignore` 双拦。镜像里绝不烘 `data/app.db`。
 - worker 依赖**常驻 Node 进程**：`instrumentation.ts` 在服务启动时拉起 `lib/worker.ts` 的后台巡检（首检/存活/结算）。serverless 不适用。
 
@@ -15,7 +19,7 @@
 
 | 项 | 值 |
 |---|---|
-| Compose 项目名 | `xiaojimao-hub`（已在 `docker-compose.yml` 固定，不受中文目录名影响） |
+| Compose 默认项目名 | `xiaojimao-hub`（已在 `docker-compose.yml` 设默认；`-p` / `COMPOSE_PROJECT_NAME` 可显式覆盖） |
 | 运行时 | `node:26-alpine`，Next.js standalone（`node server.js`） |
 | 监听 | 容器内 `0.0.0.0:3000`；compose 只映射到宿主 `127.0.0.1:3000` |
 | 持久化 | 宿主 `./data` → 容器 `/app/data`（库 `app.db` + 备份 `backups/`） |
@@ -117,6 +121,10 @@ docker compose logs -f app   # 有迁移：[schema-check] 需迁移 → [backup]
 > ```
 >
 > 破窗操作请清楚自己在做什么再用。
+
+> **空版本行保护**：若日志报 `schema_version 表存在但无版本行，且已有业务表`，迁移器会在修改业务
+> schema 前 fail-closed。这代表无法区分「旧版已跑过多少迁移」，不要盲填最新版本或反复重启；优先恢复
+> `preupgrade.db`，或复制数据库到离线环境核对实际 schema 后再补写正确版本。
 
 > 升级前如需人工快照，见 §5 手动备份。回滚：停容器 → 用 §5 的恢复步骤还原到升级前的备份 → 起旧镜像。
 

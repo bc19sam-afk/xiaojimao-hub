@@ -529,12 +529,34 @@ export function assertSchemaCurrent(db: DatabaseSync): void {
 //   全新空库、框架之前的旧库、半建库一律登记 0，由 migrate 主循环从 001 跑起。
 //   （不再按 contributions 是否存在特判 baseline=1——那会把「有 contributions 但缺其余
 //   baseline 表」的半建库误判为已迁移、跳过 001，随后 seedDefaults 查缺表即抛。）
+// schema_version 已存在但无行时只有「除它外无任何业务表」才能安全当 0：
+//   若已有业务表，可能是旧版 bug 已跑完/跑了部分迁移却没落版本；从 001 猜测重放会
+//   重建表、覆写回填数据或撞 duplicate column。此态必须 fail-closed，先人工核对/恢复备份。
 function startingVersion(db: DatabaseSync): number {
   if (hasTable(db, 'schema_version')) {
     const row = db.prepare('SELECT version FROM schema_version LIMIT 1').get() as unknown as
       | { version: number }
       | undefined
-    return row?.version ?? 0
+    if (row) return row.version
+
+    const existing = db
+      .prepare(
+        `SELECT name FROM sqlite_master
+         WHERE type='table' AND name<>'schema_version' AND name NOT LIKE 'sqlite_%'
+         ORDER BY name`,
+      )
+      .all() as unknown as { name: string }[]
+    if (existing.length > 0) {
+      const sample = existing
+        .slice(0, 5)
+        .map((r) => r.name)
+        .join(', ')
+      throw new Error(
+        `[migrate] schema_version 表存在但无版本行，且已有业务表（${sample}${existing.length > 5 ? ', …' : ''}）；` +
+          `无法安全判断已执行到哪一版，已拒绝自动重放。请恢复迁移前备份，或人工核对 schema 后补写正确版本。`,
+      )
+    }
+    return 0
   }
   db.exec('CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)')
   db.prepare(

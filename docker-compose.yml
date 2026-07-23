@@ -5,6 +5,8 @@
 #    SQLite 单写模型——多个写入者会腐坏库。多实例需 PostgreSQL + 独立锁 worker，
 #    本轮不做。扩容前先读 docs/deploy.md。
 # ============================================================================
+# 默认项目名：解决中文目录无法推导合法 Compose project name。
+# 同宿主多环境须用 `-p` / COMPOSE_PROJECT_NAME 显式设不同名称，见 docs/deploy.md。
 name: xiaojimao-hub
 
 services:

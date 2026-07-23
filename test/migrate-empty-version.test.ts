@@ -57,3 +57,55 @@ test('有表无行库跑第二次 migrate() 幂等无错（修复前会炸 dupli
   assert.equal(rows[0].version, LATEST_VERSION)
   db.close()
 })
+
+test('已有最新 schema 但版本行为空：拒绝重放且不改业务数据', () => {
+  const db = new DatabaseSync(':memory:')
+  migrate(db)
+  db.prepare(
+    `INSERT INTO contributions
+       (id, linuxdo_id, username, account_id, email, provider, plan, method, auth_file_name,
+        verify_status, points, reward_status, reward_text, reward_note, reward_code,
+        created_at, updated_at, pooled_at, snapshot_rule_version)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+  ).run(
+    'already-migrated',
+    1,
+    'tester',
+    'acc-existing',
+    'tester@example.com',
+    'codex',
+    'plus',
+    'oauth',
+    'codex-existing.json',
+    'pooled',
+    0,
+    'none',
+    '',
+    '',
+    null,
+    100,
+    100,
+    999,
+    'rule-v9',
+  )
+  db.exec('DELETE FROM schema_version')
+
+  let error = ''
+  try {
+    migrate(db)
+  } catch (err) {
+    error = (err as Error).message
+  }
+
+  const row = db
+    .prepare('SELECT pooled_at, snapshot_rule_version FROM contributions WHERE id=?')
+    .get('already-migrated') as unknown as {
+    pooled_at: number | null
+    snapshot_rule_version: string | null
+  }
+  assert.deepEqual({ ...row }, { pooled_at: 999, snapshot_rule_version: 'rule-v9' })
+  const versions = db.prepare('SELECT version FROM schema_version').all()
+  assert.equal(versions.length, 0, '拒绝时不得猜测或回填版本')
+  assert.match(error, /已有业务表.*拒绝自动重放/)
+  db.close()
+})
