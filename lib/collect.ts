@@ -172,6 +172,24 @@ export function pauseIncrement(now: number, base: number, intervalMs: number): n
   return gap > intervalMs * 2 ? gap - intervalMs : 0
 }
 
+// —— 巡检结果索引键：(provider, accountId) 复合键（对接-R2c）——
+// 身份纪律全系统是复合 canonical key（P1a/P1c）：account_id 命名空间按 provider 独立，跨 provider
+// 撞同一 id 是合法的不同号（见 cpa.ts knownAccountIds 注释）。裸 accountId 建索引＝把 A 家的判定
+// 套到 B 家号上（误停在用的号 / 未验证的号误入池）。分隔符 '\0' 与 getDailyUsage、下面 present 集同款。
+function probeKey(provider: string | undefined, accountId: string): string {
+  return `${provider ?? ''}\0${accountId}`
+}
+// 取本号的巡检结果：先按 (provider, accountId) 精确查，未命中回落查「无 provider」键。
+// ⚠️ 回落不可省：线上 cpamp 版本未知，老版本巡检结果可能不带 provider 字段；若只查复合键，
+// provider 缺失时全部查不到 → 首检号永不入池、存活巡检永不判失效＝静默零收益。带回落＝provider
+// 在时消除跨 provider 撞键，provider 缺时行为与本改动前完全一致。
+function findProbe(
+  byKey: Map<string, ProbeResult>,
+  c: { provider: string; accountId: string }, // Contribution.provider 是 string（与下面 present 集同）
+): ProbeResult | undefined {
+  return byKey.get(probeKey(c.provider, c.accountId)) ?? byKey.get(probeKey(undefined, c.accountId))
+}
+
 // —— 首检 → 入池（需求 §3.2 v4：考察期取消，首检通过即入池计量）——
 // worker 周期调用；手动也可触发。running 锁防单进程叠跑，跨实例幂等靠 DB。
 // 只拉「首检两态」submitted 待首检 / first_check 首检重试中；pooled 号本单不处理（按日计量＝R2、
@@ -261,9 +279,9 @@ export async function processPending(): Promise<{
         probes = null
       }
       if (probes !== null) {
-        const byId = new Map(probes.map((r) => [r.accountId, r]))
+        const byKey = new Map(probes.map((r) => [probeKey(r.provider, r.accountId), r]))
         for (const c of codexPending) {
-          const r = byId.get(c.accountId)
+          const r = findProbe(byKey, c)
           if (!r) continue // 本轮巡检未覆盖（刚落号/掉队）→ 跳过，下轮再检
           const plan = r.plan && r.plan !== 'unknown' ? r.plan : c.plan
           if (r.decision === 'ok' || (r.decision === 'retry' && SOFT_REASON.test(r.reason || ''))) {
@@ -344,9 +362,9 @@ export async function checkPooledHealth(
         probes = null // 不可观测：本轮跳过所有 codex，绝不误判死
       }
       if (probes !== null) {
-        const byId = new Map(probes.map((r) => [r.accountId, r]))
+        const byKey = new Map(probes.map((r) => [probeKey(r.provider, r.accountId), r]))
         for (const c of codexPooled) {
-          const r = byId.get(c.accountId)
+          const r = findProbe(byKey, c)
           if (!r) continue // 本轮巡检未覆盖 → 保持 pooled，下轮再查
           if (r.decision === 'reject') {
             // 401/撤权/删除＝明确失效 → 停用（CAS 守 pooled，防并发/过期结果误停已转他态的号）

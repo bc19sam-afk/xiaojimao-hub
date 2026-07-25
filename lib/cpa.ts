@@ -81,6 +81,11 @@ export interface ProbeResult {
   decision: ProbeDecision
   plan: string
   reason: string
+  // 探测结果所属 provider（归一后的内部名）。**可选**：线上 cpamp 版本未知，老版本巡检结果可能
+  // 不带 provider 字段——写死必填会让消费方按复合键查不到任何结果（首检号永不入池、存活巡检永不
+  // 判失效＝静默零收益）。消费方按 probeKey() 建/查键并回落（见 collect.ts），provider 在时消除
+  // 跨 provider 同 accountId 撞键，provider 缺时行为与今天完全一致。
+  provider?: ProviderId
 }
 
 // 按号按自然日的调用量（P2-R2 按量计量数据源）。date＝'YYYY-MM-DD' 自然日（时区随服务器）、
@@ -210,7 +215,7 @@ const mockClient: CpaClient = {
   async inspect() {
     return [...mockLoad().values()].map((f) => {
       const bad = hash(f.accountId).charCodeAt(0) % 10 === 0
-      return { accountId: f.accountId, decision: bad ? ('reject' as const) : ('ok' as const), plan: f.plan, reason: bad ? 'unauthorized' : 'ok' }
+      return { accountId: f.accountId, decision: bad ? ('reject' as const) : ('ok' as const), plan: f.plan, reason: bad ? 'unauthorized' : 'ok', provider: f.provider }
     })
   },
   async getDailyUsage() {
@@ -489,7 +494,13 @@ const realClient: CpaClient = {
 interface RawInspectionResult {
   accountId?: string; disabled?: boolean; status?: string; action?: string
   actionReason?: string; statusCode?: number | null; isQuota?: boolean; planType?: string; errorKind?: string
+  provider?: string
 }
+// action=keep 但 errorKind 是**健康分类**而非错误的白名单：xai 深度探测复用 errorKind 字段装健康
+// 结论（CPA-Manager-Plus apps/manager-server/internal/service/codexinspection/xai_probe.go:130/:172/
+// :248/:254/:257，其中 :172 处 official_api_healthy 被当健康证据用）。这几个值必须继续判 ok，
+// 否则将来开 xai 巡检后健康 grok 号永远入不了池、号主零收益。
+const HEALTHY_ERROR_KINDS = new Set(['inference_healthy', 'official_api_healthy', 'billing_healthy', 'billing_partial'])
 // cpamp codex-inspection 建议动作（P0-A 文档）→ ProbeDecision。文档动作：保留 keep / 启用 enable /
 // 重新登录 relogin / 禁用 disable / 删除 delete。⚠️ relogin/disable 必须在 `!errorKind→ok` 宽松兜底
 // **之前**拦截——否则「需重登/被禁用」的号无 errorKind 时会 fall-through 成 ok→被当健康发分。
@@ -504,9 +515,19 @@ export function mapInspection(r: RawInspectionResult): ProbeResult {
   else if (code === 401 || r.errorKind === 'invalidated' || r.action === 'delete') decision = 'reject'
   // relogin/reauth=OAuth 失效需重授权 → 转人工复核（不作为观测事件，见 processPending）
   else if (r.action === 'reauth' || r.action === 'relogin' || r.errorKind === 'reauth') decision = 'reauth'
+  // cpamp 把「探测没拿到有效应答」的号也标成 action=keep（保守保留、别乱动），并在 errorKind 里
+  // 记原因：missing_auth_index（没探）/ request_error（请求异常）/ missing_status（应答无
+  // status_code）/ http_status（非 2xx）。keep≠健康——这些号从没被证实能登录，当 ok 放行会让
+  // 未验证的号入池锁唯一键并开始计量发分（违反 collect.ts 首检纪律）→ 判 retry，留首检下轮再查。
+  // ⚠️ 例外：xai 深度探测复用 errorKind 装**健康分类**（xai_probe.go），这几个值是健康证据不是
+  // 错误，粗暴地「keep+任意 errorKind→retry」会让健康 grok 号永远入不了池、号主零收益。
+  // 方向取 fail-closed：未列入健康白名单的 errorKind 一律 retry（retry 不判死，只是晚一轮）。
+  else if (r.action === 'keep' && r.errorKind && !HEALTHY_ERROR_KINDS.has(r.errorKind)) decision = 'retry'
   else if (code === 200 || r.action === 'enable' || r.action === 'keep' || !r.errorKind) decision = 'ok'
   else decision = 'retry'
-  return { accountId: r.accountId ?? '', decision, plan, reason }
+  // provider 必须过 providerFromToken 归一（cpamp 发 "xai"、我方内部叫 "grok"），绝不裸透传；
+  // 认不出 → undefined（消费方回落按裸 accountId 匹配，见 ProbeResult.provider 注释）。
+  return { accountId: r.accountId ?? '', decision, plan, reason, provider: providerFromToken(r.provider) }
 }
 
 // —— usage 事件流原始形状（R1 已核对：四字段名与真实 cpamp 吻合，见 getDailyUsage 注释）——
