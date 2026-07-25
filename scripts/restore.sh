@@ -89,8 +89,32 @@ if [ -f "$DB" ]; then
   echo "→ 存下当前现场：$BACKUP_DIR/pre-restore.db（覆盖上一次的同名文件）"
   # shellcheck disable=SC2086  # $OWN 需按词拆分成 -o 1000 -g 1000（或空）
   $SUDO install -d $OWN -m 700 "$BACKUP_DIR"
-  # shellcheck disable=SC2086
-  $SUDO install $OWN -m 600 "$DB" "$BACKUP_DIR/pre-restore.db"
+  # 🔴 必须 VACUUM INTO，绝不能 cp/install：库跑 WAL 模式，`docker compose stop` 发 SIGTERM 后进程
+  #    不做 checkpoint 就退出，最后一段已提交数据只躺在 app.db-wal 里。裸拷主文件会丢这段，而下面
+  #    紧接着 `rm -f "$DB-wal"` 会把唯一副本删掉——等用户想反悔时，回滚点已残缺且不可挽回。
+  #    （同 lib/backup.ts 顶部那条 WAL 安全纪律；preupgrade.db 也是 VACUUM INTO 产的。）
+  #    借 app 镜像里的 node 跑：本脚本本就依赖 docker compose（上面刚 stop 过），非新依赖；
+  #    用 run 而非 exec，是因为恢复常发生在容器已停/崩溃循环时，exec 那会儿连不上。
+  # ⚠️ 容器内路径固定 /app/data——compose 的卷是 `./data:/app/data`，宿主侧改 DATA_DIR/BACKUP_DIR
+  #    只改宿主视角，容器里挂载点不变。若你**同时改了 compose 的卷映射**，下面两个容器内路径要跟着改。
+  $SUDO rm -f "$BACKUP_DIR/pre-restore.db"   # VACUUM INTO 目标已存在会报错
+  docker compose run --rm --no-deps -T --entrypoint node app -e '
+    const { DatabaseSync } = require("node:sqlite")
+    const src = new DatabaseSync("/app/data/app.db")
+    try {
+      src.exec("PRAGMA busy_timeout = 5000")
+      src.prepare("VACUUM INTO ?").run("/app/data/backups/pre-restore.db")
+    } finally {
+      src.close()
+    }
+  ' || {
+    echo "❌ 现场留存失败：产不出 $BACKUP_DIR/pre-restore.db" >&2
+    echo "   已中止，$DB 未被改动（fail-closed：没有回滚点就不做破坏性还原）。" >&2
+    echo "   如确认无需回滚点，手动移开当前库后重跑：mv $DB <你的存放路径>" >&2
+    exit 1
+  }
+  # 容器里覆盖了 entrypoint，那条 umask 077 不生效，产出可能是 0644——库含 OAuth 令牌快照与 CDK 码，收紧
+  $SUDO chmod 600 "$BACKUP_DIR/pre-restore.db"
 else
   echo "→ 当前无 $DB，跳过现场留存"
 fi

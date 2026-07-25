@@ -161,7 +161,9 @@ docker compose logs -f app   # 有迁移：[schema-check] 需迁移 → [backup]
 ./scripts/restore.sh data/backups/backup-2026-07-26T01-00-00-a1b2c3.db
 ```
 
-脚本按顺序做：校验快照是真 SQLite 文件 → `docker compose stop app` → 现场 `app.db` 存为 `data/backups/pre-restore.db`（单文件覆盖式，同 `preupgrade.db` 一样不进轮转集）→ `install` 快照为 `app.db`（0600 / 属主 1000）→ 删 `-wal`/`-shm`/`.upgrade-in-progress` → `docker compose start app` → 轮询 `/api/ready` 最多 60s。
+脚本按顺序做：校验快照是真 SQLite 文件 → `docker compose stop app` → 现场 `app.db` 用 `VACUUM INTO` 存为 `data/backups/pre-restore.db`（单文件覆盖式，同 `preupgrade.db` 一样不进轮转集）→ `install` 快照为 `app.db`（0600 / 属主 1000）→ 删 `-wal`/`-shm`/`.upgrade-in-progress` → `docker compose start app` → 轮询 `/api/ready` 最多 60s。
+
+- 🔴 **现场留存走 `VACUUM INTO`（借 app 镜像里的 node 起一次性容器），不是 `cp`**：`stop` 发的 SIGTERM 不做 WAL checkpoint，最后一段已提交数据只在 `app.db-wal` 里；裸拷主文件会丢这段，而脚本下一步就删 `-wal`——想反悔时回滚点已残缺且不可挽回。留存失败即 **fail-closed 中止**（不动 `app.db`），没有回滚点就不做破坏性还原。
 
 - 🔴 **分叉守卫**：若 `data/.upgrade-in-progress` 存在（＝上次升级没走完），脚本**拒绝执行**并打印指引，退出码 3。必须先把镜像/代码退回旧版本、`docker compose up -d --build` 重建容器，再带 `--after-image-rollback` 重跑——原因见下方手工步骤里的 ⚠️ 分叉说明。
 - 校验用 `/api/ready`（不是 `/api/health`）：liveness 通过只说明进程活着，readiness 才验证「库能读 + schema 版本与镜像匹配」——还原错版本的快照就卡在这一步。
@@ -184,7 +186,12 @@ docker compose stop app
 
 # 3) 备份现场后替换（-wal/-shm 是 WAL 副本，恢复整库快照时必须一并删除；
 #    .upgrade-in-progress 也要清——手动还原=人为终结升级链，不清则下次真升级会因「标记指向的旧快照仍在」被误判、跳过备份）
-sudo cp data/app.db data/app.db.broken.bak 2>/dev/null || true
+# 🔴 存现场必须 VACUUM INTO，别用 cp：stop 发的 SIGTERM 不做 checkpoint，最后一段已提交数据只在 app.db-wal 里，
+#    裸 cp 只拷主文件会丢这段，而下一条命令就把 -wal 删了——想反悔时回滚点已残缺且不可挽回。
+docker compose run --rm --no-deps --entrypoint node app -e \
+  'const {DatabaseSync}=require("node:sqlite");const s=new DatabaseSync("/app/data/app.db");
+   try{s.exec("PRAGMA busy_timeout=5000");s.prepare("VACUUM INTO ?").run("/app/data/backups/app.db.broken.bak")}finally{s.close()}'
+sudo chmod 600 data/backups/app.db.broken.bak   # run 覆盖了 entrypoint，那条 umask 077 不生效
 # 还原源：日常回滚用某份 backup-XXXX.db；若还原的是「升级失败现场」，升级前快照就是 data/backups/preupgrade.db（钉住不轮转、即最近一次升级前的库）
 sudo install -o 1000 -g 1000 -m 600 data/backups/backup-XXXX.db data/app.db   # 一步 覆盖还原 + 属主 uid1000 + 权限 600；不用 cp（覆盖会保留目标原 mode，老部署 0644 收不紧、属主也不还原）
 sudo rm -f data/app.db-wal data/app.db-shm
@@ -202,7 +209,7 @@ curl -s http://127.0.0.1:3000/api/health   # {"ok":true}（进程活着）
 curl -s http://127.0.0.1:3000/api/ready    # {"ok":true}（库可读 + schema 版本匹配 ← 恢复成功的判据）
 ```
 
-数据核对无误后删掉 `data/app.db.broken.bak`。
+数据核对无误后删掉 `data/backups/app.db.broken.bak`。
 
 ### 5.3 异机同步（离线副本）
 
