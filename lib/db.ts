@@ -1,7 +1,7 @@
 import { DatabaseSync } from 'node:sqlite'
 import fs from 'node:fs'
 import path from 'node:path'
-import { assertSchemaCurrent, migrate } from './migrate'
+import { assertSchemaCurrent, migrate, readSchemaVersion } from './migrate'
 import { env } from './env'
 
 // ============================================================================
@@ -1341,6 +1341,16 @@ export const db = {
   // 不看 verify_status），不影响结算；保留行便于审计追溯。
   terminateReview(id: string): boolean {
     return db.transition(id, ['needs_review'], 'stopped')
+  },
+
+  // ===== readiness 只读探针（P6-R2，§9）=====
+  // 供 lib/ready.ts（/api/ready）判定：对**应用实际在用的那条常驻连接**跑一条最轻只读语句 + 读 schema
+  // 版本。不新开连接（新开连接只能证明「文件能打开」，证明不了当前进程这条连接还活着）。纯只读、无副作用。
+  // 抛错不在此处吞——由调用方捕获判 503（库坏/表缺/schema_version 多行都该判「未就绪」而非静默放行）。
+  // 🔴 §8：只回数字，绝不回库路径/配置/任何业务数据。
+  readyProbe(): { alive: number; schemaVersion: number | null } {
+    const r = conn.prepare('SELECT 1 AS ok').get() as unknown as { ok: number } | undefined
+    return { alive: r?.ok ?? 0, schemaVersion: readSchemaVersion(conn) }
   },
 }
 

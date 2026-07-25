@@ -26,6 +26,21 @@ function resolveSessionSecret(): string {
   )
 }
 
+// dead-man 心跳地址（P6-R2，可选）：worker 每轮全成后 ping 一次，外部服务（healthchecks.io /
+// uptime-kuma）在约定时间内没收到就告警——单机规模够用，不上 Prometheus。
+// 缺省空＝关闭。设了但不是 http(s) 开头＝配错，警告一次并按关闭处理（不拒绝启动：告警通道配错
+// 不该拖垮收号主链路，且这是可选增强项）。
+function resolveHeartbeatUrl(): string {
+  const raw = (process.env.HEARTBEAT_URL || '').trim()
+  if (!raw) return ''
+  if (!/^https?:\/\//.test(raw)) {
+    // 🔴 §8：只说「格式不对」，绝不把配错的值回显到日志（可能含 uuid 型密钥）
+    console.warn('[env] HEARTBEAT_URL 不是 http:// 或 https:// 开头，已按未配置处理（心跳关闭）')
+    return ''
+  }
+  return raw
+}
+
 // CPA 配置：非 mock 时必须齐全，否则拒绝启动。
 function resolveCpa() {
   const baseUrl = (process.env.CPA_BASE_URL || '').replace(/\/+$/, '')
@@ -64,6 +79,8 @@ export const env = {
     enabled: (process.env.WORKER_ENABLED ?? 'true') !== 'false',
     // 巡检间隔（毫秒）。mock 下 8s 便于演示；真实对接 cpamp 时应放大到分钟级。
     intervalMs: Number(process.env.WORKER_INTERVAL_MS ?? '8000'),
+    // dead-man 心跳地址（可选，空＝关闭）。见 resolveHeartbeatUrl。
+    heartbeatUrl: resolveHeartbeatUrl(),
   },
 }
 

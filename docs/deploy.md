@@ -138,7 +138,12 @@ docker compose logs -f app   # 有迁移：[schema-check] 需迁移 → [backup]
 
 `scripts/backup.ts` 用 SQLite `VACUUM INTO` 产出 **WAL 安全的一致性单文件快照**（对源库只读、不打断在线写入），落到 `data/backups/backup-<时间戳>-<随机>.db`，并按 `BACKUP_KEEP`（默认 7）只保留最新 N 份。
 
-- 自动：容器启动时若 `schema-check` 判定**有待迁移**才备份（schema 已最新则跳过）；未完结升级的重试（含中途换目标版本）由 `.upgrade-in-progress` 标记去重，标记记录升级前快照（备份后钉成 `data/backups/preupgrade.db`、改名移出 `backup-*.db` 轮转集，不被 `BACKUP_KEEP`/手动备份轮转掉）的绝对路径、**验证快照仍在才跳过备份**（快照丢失则重新备份当前状态），保住迁移前唯一回滚点，迁移成功即清标记；备份失败即中止启动（fail-closed）。详见 §4。
+- **升级期自动**：容器启动时若 `schema-check` 判定**有待迁移**才备份（schema 已最新则跳过）；未完结升级的重试（含中途换目标版本）由 `.upgrade-in-progress` 标记去重，标记记录升级前快照（备份后钉成 `data/backups/preupgrade.db`、改名移出 `backup-*.db` 轮转集，不被 `BACKUP_KEEP`/手动备份轮转掉）的绝对路径、**验证快照仍在才跳过备份**（快照丢失则重新备份当前状态），保住迁移前唯一回滚点，迁移成功即清标记；备份失败即中止启动（fail-closed）。详见 §4。
+- **每日自动**（P6-R2）：worker 每轮巡检末尾检查「今天（服务器本地日）是否已有备份」，没有就备一份。升级期备份只在有待迁移时才跑——不升级的日子，上次升级以来的数据本来没有任何快照，这条补上。
+  - 判据落在**磁盘上的备份文件名**（不是进程内存标记）：容器 `restart:unless-stopped` 崩溃循环反复重启，也只会在「当天确实还没备过」时备一份，绝不产生备份 churn 把轮转集冲垮。
+  - 保留份数复用 `BACKUP_KEEP`（默认 7）＝**日备份保约 7 天**，不额外加开关。日备份与手动备份、升级期备份共用同一轮转集（`preupgrade.db` / `pre-restore.db` 因文件名不匹配 `backup-*.db` 而豁免）。
+  - 日志：`[worker] 每日自动备份完成`。备份失败只记 `[worker] 每日备份出错`、不影响首检/巡检/结算。
+  - ⚠️ 文件名里的时间戳是 **UTC**（`backup-2026-07-25T16-30-00-xxxxxx.db` 在 `TZ=Asia/Shanghai` 下属于本地的 07-26），判日时已做换算——按文件名肉眼对日期时注意这一层。
 - 手动随时触发：
 
   ```bash
@@ -148,7 +153,24 @@ docker compose logs -f app   # 有迁移：[schema-check] 需迁移 → [backup]
 
 ### 5.2 恢复演练（务必在上线前演练一次）
 
-快照是完整一致的库文件，恢复即「用某份快照替换 app.db」。演练步骤：
+快照是完整一致的库文件，恢复即「用某份快照替换 app.db」。
+
+#### 首选：`scripts/restore.sh`（宿主侧运行，仓库根目录）
+
+```bash
+./scripts/restore.sh data/backups/backup-2026-07-26T01-00-00-a1b2c3.db
+```
+
+脚本按顺序做：校验快照是真 SQLite 文件 → `docker compose stop app` → 现场 `app.db` 存为 `data/backups/pre-restore.db`（单文件覆盖式，同 `preupgrade.db` 一样不进轮转集）→ `install` 快照为 `app.db`（0600 / 属主 1000）→ 删 `-wal`/`-shm`/`.upgrade-in-progress` → `docker compose start app` → 轮询 `/api/ready` 最多 60s。
+
+- 🔴 **分叉守卫**：若 `data/.upgrade-in-progress` 存在（＝上次升级没走完），脚本**拒绝执行**并打印指引，退出码 3。必须先把镜像/代码退回旧版本、`docker compose up -d --build` 重建容器，再带 `--after-image-rollback` 重跑——原因见下方手工步骤里的 ⚠️ 分叉说明。
+- 校验用 `/api/ready`（不是 `/api/health`）：liveness 通过只说明进程活着，readiness 才验证「库能读 + schema 版本与镜像匹配」——还原错版本的快照就卡在这一步。
+- 环境变量：`SUDO=`（已是 uid1000 / macOS Docker Desktop 时跳过 sudo）、`DATA_DIR`、`BACKUP_DIR`、`APP_URL`。不能提权时自动省掉属主移交（只设权限 600）——Docker Desktop 会自动映射 uid，本就不需要 chown。
+- 退出码：0 成功 / 1 快照无效或校验超时 / 2 用法错 / 3 被升级标记拒绝。
+
+演练完数据核对无误后，删掉 `data/backups/pre-restore.db` 即可（它不占轮转名额，但会一直留着）。
+
+#### 后备：手工步骤（脚本不可用、或需要逐步观察时）
 
 > 操作账号非 uid1000 时，下面直接读写 `./data`（0700，属主 1000）的命令都需 `sudo`；还原用 `install` 一步把 `app.db` 设成 **属主 1000 + 权限 600**（`cp` 覆盖已存在文件会保留目标原 mode，老部署那份 0644 不会收敛，且属主也要还原），否则容器起来写不了库、或库权限倒退到 0644。
 
@@ -176,12 +198,39 @@ sudo rm -f data/.upgrade-in-progress
 #    日常演练 / 回滚到某份历史快照（镜像没换）才用下面这条：
 docker compose start app
 docker compose logs -f app           # [migrate] 完成、schema 版本正常
-curl -s http://127.0.0.1:3000/api/health   # {"ok":true}
+curl -s http://127.0.0.1:3000/api/health   # {"ok":true}（进程活着）
+curl -s http://127.0.0.1:3000/api/ready    # {"ok":true}（库可读 + schema 版本匹配 ← 恢复成功的判据）
 ```
 
 数据核对无误后删掉 `data/app.db.broken.bak`。
 
-> 异地/离线备份自动化、恢复脚本化留 R2；当前请把 `data/backups/` 纳入宿主机的常规异地备份。
+### 5.3 异机同步（离线副本）
+
+`data/backups/` 只在本机——磁盘坏、机器丢、误删都会连备份一起没。用 `scripts/sync-backups.sh` 定期推到另一台机器：
+
+```bash
+REMOTE=user@backup-host:/srv/xjm-backups ./scripts/sync-backups.sh
+# 或： ./scripts/sync-backups.sh user@backup-host:/srv/xjm-backups
+```
+
+- **宿主侧运行**，容器内不做 ssh（容器不该持有远端私钥，镜像也没装 rsync/ssh）。需要宿主装 `rsync`、配好到远端的免密 ssh。
+- 传 `data/backups/` 整目录，含 `preupgrade.db` / `pre-restore.db` 这些钉住的回滚点。
+- 🔴 **故意不加 `--delete`**：本地按 `BACKUP_KEEP` 每天轮转，加了 `--delete` 会把本地的轮转删除传播到异机——异机副本就退化成本地的镜像，既拿不到更长的留存，本地误删/被入侵删库也会立刻同步过去。代价是**远端只增不减，需自行清理**，例如在远端配：
+
+  ```bash
+  # 远端 crontab：保留 90 天
+  find /srv/xjm-backups -name 'backup-*.db' -mtime +90 -delete
+  ```
+
+- 宿主 crontab 示例（每天 03:20 同步一次；worker 的每日备份在当天首个 tick 就完成了）：
+
+  ```bash
+  20 3 * * * cd /opt/xiaojimao-hub && REMOTE=user@backup-host:/srv/xjm-backups ./scripts/sync-backups.sh >> /var/log/xjm-sync.log 2>&1
+  ```
+
+  > 环境变量：`BACKUP_DIR` 覆盖本地目录（默认 `data/backups`）。cron 里务必先 `cd` 到仓库根，或用绝对路径的 `BACKUP_DIR`。
+
+从异机副本恢复：把快照 `scp` 回本机任意路径，然后照 §5.2 用 `./scripts/restore.sh <路径>` 即可（脚本不要求快照必须在 `data/backups/` 下）。
 
 ---
 
@@ -266,11 +315,50 @@ ${APP_BASE_URL}/api/auth/linuxdo/callback
 
 ## 9. 健康检查与故障排查
 
-- **存活探针**：`GET /api/health` → `{"ok":true}`，无鉴权、无副作用、不泄露版本/配置/账号。镜像内置 `HEALTHCHECK`（用 Node fetch，alpine 无 curl），`docker ps` 的 `STATUS` 列会显示 healthy/unhealthy。readiness + DB 探活留 R2。
-- **看日志**：`docker compose logs -f app`。关键行：`[migrate] 完成`、`[worker] 后台巡检已启动`、`[backup] 完成`。
+### 9.1 两个探针
+
+| | `GET /api/health`（liveness） | `GET /api/ready`（readiness） |
+|---|---|---|
+| 判什么 | 进程活着 | 库能读 + schema 版本 === 代码要求 |
+| 响应 | 恒 `200 {"ok":true}` | `200 {"ok":true}` / `503 {"ok":false}` |
+| 不通该做什么 | **重启容器** | **摘流量 + 告警，别重启** |
+| 谁在用 | 镜像 `HEALTHCHECK`、反代存活判断 | 外部拨测、反代 upstream 摘除、恢复校验 |
+
+两者都无鉴权、无副作用，响应体只有 `ok` 字段——不带版本/路径/配置/账号信息（§8）。不就绪的具体原因（schema 版本差多少等）只进服务端日志：`[ready] 未就绪：...`。
+
+> 🔴 **`HEALTHCHECK` 故意仍用 liveness**：schema 落后时重启容器修不好问题（迁移是部署步骤，不是启动时自动跑），只会让容器反复重启进 churn 循环。readiness 的用途是让人/监控知道「这实例现在不该接流量」。
+
+### 9.2 排查
+
+- **看日志**：`docker compose logs -f app`。关键行：`[migrate] 完成`、`[worker] 后台巡检已启动`、`[backup] 完成`、`[worker] 每日自动备份完成`。
+- **`/api/ready` 返回 503**：先看日志里的 `[ready] 未就绪` 行。最常见是 schema 版本不匹配——升级时漏跑迁移，或还原了旧版本的快照。跑 `docker compose exec app node scripts/schema-check.ts` 看详情。
 - **确认非 root**：`docker compose exec app id` → `uid=1000`。
 - **确认库落卷**：宿主 `ls -la data/`，删容器重建后 `app.db` 仍在即为持久成功。
 - **日志轮转**：compose 已配 json-file `max-size=10m`、`max-file=5`，防磁盘被撑爆。
+
+### 9.3 监控接线（两条，都是可选）
+
+单机规模不上 Prometheus，两条轻量接法覆盖「服务挂了」和「worker 静默死了」：
+
+**① dead-man 心跳（catch「进程还在但 worker 不干活了」）**
+
+worker 每轮巡检**三段全部成功**后 GET 一次 `HEARTBEAT_URL`（节流：最少隔 5 分钟）。有段抛错就不发——外部超时后告警。发送失败只记 `[worker] 心跳发送失败`，不影响巡检。
+
+- [healthchecks.io](https://healthchecks.io)：建一个 Check，Period 设 5 分钟、Grace 设 10 分钟，把它给的 ping URL 填进 `.env` 的 `HEARTBEAT_URL`，重启容器生效。超时不打卡即邮件/Telegram 告警。
+- [Uptime Kuma](https://github.com/louislam/uptime-kuma) 自托管：新建 **Push** 类型监控，Heartbeat Interval 设 300s、Retries 2，把 Push URL 填进 `HEARTBEAT_URL`。
+
+  ```bash
+  # .env
+  HEARTBEAT_URL=https://hc-ping.com/<your-uuid>
+  ```
+
+  > 填的值必须 `http://` 或 `https://` 开头，否则启动时告警一次并按未配置处理（日志不回显该值——心跳 URL 常含 uuid 型密钥）。留空/注释 = 关闭。
+
+**② 外部拨测 `/api/ready`（catch「服务挂了 / 库坏了 / schema 不匹配」）**
+
+在 Uptime Kuma 建 HTTP(s) 监控指向 `https://<你的域名>/api/ready`，Accepted Status Codes 保持 `200-299`——未就绪时返回 503 即触发告警。间隔 60s 足够。
+
+> 两条互补：拨测证明「外部能访问且实例就绪」，心跳证明「后台 worker 还在正常干活」。只有拨测的话，worker 卡死但 HTTP 正常时不会有任何告警。
 
 ---
 
@@ -280,7 +368,11 @@ ${APP_BASE_URL}/api/auth/linuxdo/callback
 docker compose up -d --build        # 部署/升级
 docker compose logs -f app          # 跟随日志
 docker compose exec app node scripts/backup.ts   # 手动备份
+./scripts/restore.sh <快照路径>      # 从快照恢复（见 §5.2）
+REMOTE=user@host:/path ./scripts/sync-backups.sh # 备份推异机（见 §5.3）
 docker compose exec app date        # 核对时区
 docker compose exec app id          # 核对非 root
 docker compose down                 # 停并删容器（保留宿主 ./data）
+curl -s http://127.0.0.1:3000/api/health   # liveness
+curl -s http://127.0.0.1:3000/api/ready    # readiness（库 + schema 版本）
 ```
