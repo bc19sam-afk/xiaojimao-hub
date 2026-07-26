@@ -10,7 +10,7 @@ import { LATEST_VERSION } from './migrate'
 //               （schema 落后重启一万次也不会自己变好，只会进 churn 循环，故 HEALTHCHECK 不用它）。
 //
 // 判据两条，任一不满足即未就绪：
-//   ① 库连接还能跑只读语句（SELECT 1）——库文件被删/换/损坏、连接已关，这条就挂。
+//   ① 库连接还能跑只读语句（SELECT 1）+ 读出 schema 版本——连接已关闭、库已损坏到读不出版本行时抛错。
 //   ② schema 版本 === 代码要求的 LATEST_VERSION——落后（漏跑 migrate）或超前（代码回滚）都算未就绪。
 //      ⚠️ 与 assertSchemaCurrent 的差别：那个是**启动期**守卫、超前只 warn 放行（向后兼容纪律）；
 //      这里是**运行期**就绪信号，取严格相等——版本不一致时把流量摘走比继续服务安全，且这判断
@@ -24,6 +24,15 @@ import { LATEST_VERSION } from './migrate'
 export function checkReady(): boolean {
   try {
     const { alive, schemaVersion } = db.readyProbe()
+    // ⚠️ 这条分支**实测打不到**（P6-R2 复审第 8 条）：`SELECT 1` 是常量表达式，SQLite 压根不碰
+    //    库文件，只要连接没关就恒返回 1。实测六种坏法的真实去向（细节见 lib/db.ts readyProbe 注释）：
+    //      库文件被删 / 换成另一个库 / 头完好但数据页砸烂 → alive=1 且版本号照旧 → 本探针**放行**
+    //      截断到只剩头 / 整文件覆盖 / 连接已 close       → 读版本那步抛错 → 走下面的 catch ✅
+    //    即：真正兜住「库坏了」的是 catch 和 schemaVersion 比对，不是这个 alive 判断；且只兜得住
+    //    「坏在文件头/整体结构」那半边。保留 alive 判断是**廉价的契约断言**（readyProbe 返回形状变了
+    //    能就地暴露），不是有效的坏库探测。
+    //    🔴 别据此以为 readiness 能发现「库文件被删/被换/数据页损坏」——这三种它发现不了；那类故障
+    //       靠的是写入路径自己抛错 + 外部拨测，以及恢复流程里的 quick_check（scripts/restore.sh）。
     if (alive !== 1) {
       console.error('[ready] 未就绪：数据库只读探活未返回预期结果')
       return false

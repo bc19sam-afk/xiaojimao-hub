@@ -1347,6 +1347,16 @@ export const db = {
   // 供 lib/ready.ts（/api/ready）判定：对**应用实际在用的那条常驻连接**跑一条最轻只读语句 + 读 schema
   // 版本。不新开连接（新开连接只能证明「文件能打开」，证明不了当前进程这条连接还活着）。纯只读、无副作用。
   // 抛错不在此处吞——由调用方捕获判 503（库坏/表缺/schema_version 多行都该判「未就绪」而非静默放行）。
+  // ⚠️ 能探到什么，别高估（P6-R2 复审第 8 条，逐场景实测）：`SELECT 1` 是常量表达式，**不读库文件**，
+  //    连接没关就恒回 1；`SELECT version FROM schema_version` 也常命中本连接的 page cache。实测六种坏法：
+  //      库文件被删           → alive=1、旧版本号，**探不出来**（老连接照读缓存页）
+  //      被换成另一个库(v3)   → alive=1、仍报旧版本 11，**探不出来**（同上；新开连接才读到 3）
+  //      头完好·尾部数据页砸烂 → alive=1、旧版本号，**探不出来**
+  //      截断到只剩文件头      → 抛 "database disk image is malformed" → 调用方 catch 判未就绪 ✅
+  //      整文件覆盖(头也没了)  → 抛 "file is not a database" → 同上 ✅
+  //      连接已 close         → 抛 "database is not open" → 同上 ✅
+  //    规律：**坏在文件头/整体结构才探得到，坏在数据页或整个文件被替换探不到**。故本探针的实际覆盖面是
+  //    「连接还活着 + 本进程认知里的 schema 版本对不对得上」，不是「磁盘上的库是好的」。
   // 🔴 §8：只回数字，绝不回库路径/配置/任何业务数据。
   readyProbe(): { alive: number; schemaVersion: number | null } {
     const r = conn.prepare('SELECT 1 AS ok').get() as unknown as { ok: number } | undefined

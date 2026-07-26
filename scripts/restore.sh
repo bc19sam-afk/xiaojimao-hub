@@ -12,7 +12,10 @@
 #
 # 环境变量：
 #   SUDO=        操作账号已是 uid1000 / macOS Docker Desktop 时置空跳过 sudo（默认用 sudo）
-#   DATA_DIR     宿主数据目录，默认 data
+#   DATA_DIR     宿主数据目录，默认 data。🔴 **必须与 docker-compose.yml 里绑到 /app/data 的宿主
+#                路径一致**（默认那条是 `./data:/app/data`）：脚本按它定位要还原的库文件，容器按
+#                compose 那条绑定定位它实际读的库——两者必须指同一个目录，否则还原了个 app 根本
+#                不读的文件。改了 compose 的绑定源就同步改这个。
 #   BACKUP_DIR   备份目录，默认 $DATA_DIR/backups
 #   APP_URL      校验地址，默认 http://127.0.0.1:3000
 # =============================================================================
@@ -23,6 +26,63 @@ BACKUP_DIR="${BACKUP_DIR:-$DATA_DIR/backups}"
 APP_URL="${APP_URL:-http://127.0.0.1:3000}"
 MARKER="$DATA_DIR/.upgrade-in-progress"
 DB="$DATA_DIR/app.db"
+
+# 路径归一：docker -v 只认绝对路径（相对路径会被当成**命名卷**静默建一个空卷，
+# 于是容器看到的是空目录、脚本却以为在读宿主的库）。同时用于判断两个路径是否指向同一文件。
+#
+# 🔴 必须 fail-closed：`cd` 失败时 `$(...)` 只是取到空串，拼出来的会是 `/pre-restore.db` 这种
+#    **看着像绝对路径的垃圾**——拿它当 `-v` 源就等于把宿主根目录 `/` 挂进容器。而这不是理论情形：
+#    `data/backups` 按 §2 是 0700 且属主 uid1000，操作账号不是 1000 时 `cd` 必然 Permission denied。
+#    故显式判空并中止。
+abspath() {
+  _d=$(cd -- "$(dirname -- "$1")" 2>/dev/null && pwd) || _d=""
+  if [ -z "$_d" ]; then
+    echo "❌ 无法解析路径（目录不存在或无权进入）：$1" >&2
+    echo "   $DATA_DIR 按 docs §2 是 0700/属主 uid1000；操作账号不是 1000 时请用 sudo 跑本脚本。" >&2
+    exit 1
+  fi
+  printf '%s/%s\n' "$_d" "$(basename -- "$1")"
+}
+
+# 目录版：直接 cd 进目标目录本身。abspath 只验证**父目录**存在，用它解析目录会让
+# 「目录不存在」蒙混过关，而 docker -v 遇到不存在的源路径会以 root 悄悄新建一个空目录
+# ——容器于是读到空目录，脚本却以为在读宿主的库。挂载源必须走这个。
+absdir() {
+  _d=$(cd -- "$1" 2>/dev/null && pwd) || _d=""
+  if [ -z "$_d" ]; then
+    echo "❌ 目录不存在或无权进入：$1" >&2
+    echo "   $DATA_DIR 按 docs §2 是 0700/属主 uid1000；操作账号不是 1000 时请用 sudo 跑本脚本。" >&2
+    exit 1
+  fi
+  printf '%s\n' "$_d"
+}
+
+# 借 app 镜像里的 node 跑一段只读/备份 JS。本脚本本就依赖 docker compose（下面要 stop/start），
+# 不是新依赖；用 run 而非 exec，是因为恢复常发生在容器已停/崩溃循环时，exec 那会儿连不上。
+#
+# 🔴 显式 `-v` 挂载，**不依赖 compose 里那条 `./data:/app/data`**：那条只绑默认路径，`BACKUP_DIR`
+#    被改到别处时就对不上——脚本头与 docs §5.2 声称支持该覆盖项，此前却会把 pre-restore.db 写进
+#    容器内的临时层、宿主看不见（P6-R2 复审第 5 条：别让文档承诺代码不支持的能力）。
+#    容器内挂载点**写死**（/d、/b、/snapdir），宿主侧路径只经 -v 参数传入、绝不拼进 JS 源码：
+#    含空格/引号/`$` 的宿主路径既不会造成 JS 语法错，也不会被当代码执行。
+#    两个调用点的挂载数不同，故不做「可变参数」的通用封装——shell 里拼 -v 列表必须靠
+#    unquoted 词拆分，那正好在含空格的宿主路径上断掉（本仓库路径就是中文目录）。写死两个函数最稳。
+
+# 把 <宿主快照文件>本身挂成容器内的 /snap.db（ro），跑 JS。
+# 挂**文件**而非所在目录：目录里可能还有别的库/密钥，没必要整个暴露给一次性容器。
+node_with_snapshot() {
+  docker compose run --rm --no-deps -T \
+    -v "$1:/snap.db:ro" \
+    --entrypoint node app -e "$2"
+}
+
+# 挂 <宿主 DATA_DIR>→/d、<宿主 BACKUP_DIR>→/b，跑 JS。
+node_in_data() {
+  docker compose run --rm --no-deps -T \
+    -v "$1:/d" \
+    -v "$2:/b" \
+    --entrypoint node app -e "$3"
+}
 
 # 非 uid1000 账号读写 ./data（0700、属主 1000）需要 sudo；已是 root 或显式 SUDO= 则不用。
 if [ "$(id -u)" = "0" ]; then SUDO="${SUDO-}"; else SUDO="${SUDO-sudo}"; fi
@@ -61,6 +121,16 @@ if [ "$(head -c 15 "$SNAPSHOT" 2>/dev/null || true)" != "SQLite format 3" ]; the
   exit 1
 fi
 
+SNAPSHOT_ABS="$(abspath "$SNAPSHOT")"
+DB_ABS="$(abspath "$DB")"
+
+# 🔴 快照 == 目标库：还原「自己盖自己」没有意义，且下面 install 会因 same file 报错（exit 64）而
+#    中止在半途（此时 app 已停、现场已存）。提前拒绝，给出清晰指引。
+if [ "$SNAPSHOT_ABS" = "$DB_ABS" ]; then
+  echo "❌ 快照就是当前库本身（$DB），还原它没有意义。" >&2
+  exit 2
+fi
+
 # 🔴 分叉守卫（docs §5.2）：标记在＝上次升级没走完。此时若直接 start，新镜像 entrypoint 见 schema
 #    落后会拿刚还原的旧库重跑同一个失败迁移，回滚白做。必须先把镜像/代码退回旧版本、`up -d --build`
 #    重建容器，再带 --after-image-rollback 跑本脚本。
@@ -80,41 +150,88 @@ fi
 echo "→ 恢复源：$SNAPSHOT"
 echo "→ 目标库：$DB"
 
+# 🔴 完整性校验（P6-R2 复审第 3 条）：`head -c 15` 只看文件头，一个**截断/损坏**的快照照样能过——
+#    实测截到 2048 字节的库仍带 'SQLite format 3' 头，但 quick_check 抛 malformed。不校验就会
+#    停服务、换库，直到 readiness 才发现，而那时现场已经被换掉了。故放在所有破坏性步骤之前。
+#    只读打开（readOnly:true），绝不改动快照本身。
+echo "→ 校验快照完整性（PRAGMA quick_check）"
+# `immutable=1`（不是单纯 readOnly:true）：纯 cp 出来的快照会保留 journal_mode=wal，SQLite 打开时
+# 即便只读也要在**同目录**建 -wal/-shm——挂 :ro 会直接报 "attempt to write a readonly database"，
+# 把好快照误判成坏的。immutable 让 SQLite 完全跳过 WAL/锁机制，只读文件本身；实测仍能检出
+# 截断（2048 字节）与页损坏（均抛 malformed），且不在宿主目录留任何副产物。
+node_with_snapshot "$SNAPSHOT_ABS" '
+  const { DatabaseSync } = require("node:sqlite")
+  const d = new DatabaseSync("file:/snap.db?immutable=1", { readOnly: true })
+  try {
+    const r = d.prepare("PRAGMA quick_check").get()
+    if (!r || r.quick_check !== "ok") {
+      console.error("quick_check 未返回 ok：" + JSON.stringify(r))
+      process.exit(1)
+    }
+  } finally {
+    d.close()
+  }
+' || {
+  echo "❌ 快照未通过完整性校验（截断/损坏）：$SNAPSHOT" >&2
+  echo "   已中止，$DB 未被改动，app 也未停。换一份快照重试。" >&2
+  exit 1
+}
+
 echo "→ 停 app（释放对 app.db 的写锁）"
 docker compose stop app
 
 # 现场先存一份：单文件覆盖式，仿 preupgrade.db 的钉住模式——文件名不匹配 ^backup-.*\.db$，
 # 故不进 BACKUP_KEEP 轮转集，也不会被 latestBackupDay 误当成「今天的日常备份」。
+PRE_RESTORE="$BACKUP_DIR/pre-restore.db"
+RESTORE_SRC="$SNAPSHOT"   # 实际用来还原的路径，可能被下面改指到副本
 if [ -f "$DB" ]; then
-  echo "→ 存下当前现场：$BACKUP_DIR/pre-restore.db（覆盖上一次的同名文件）"
+  echo "→ 存下当前现场：$PRE_RESTORE（覆盖上一次的同名文件）"
   # shellcheck disable=SC2086  # $OWN 需按词拆分成 -o 1000 -g 1000（或空）
   $SUDO install -d $OWN -m 700 "$BACKUP_DIR"
+
+  # 🔴 自毁防护（P6-R2 复审必修 1）：用户跑过一次 restore 后想拿 pre-restore.db 回到最初状态，
+  #    是最自然的二次反悔路径。但下面这段会用**当前 app.db** 重建同名文件——$SNAPSHOT 在被
+  #    读取前就被覆盖，还原出来的是当前坏状态，且脚本一路 ✅、readiness 也过（库合法、版本也对），
+  #    用户不会发现回滚失败，而唯一回滚点已经没了。故先把它拷到临时副本，从副本还原。
+  #    ⚠️ 先算好再比：`if [ x = "$(abspath ...)" ]` 里 `set -e` 不生效，abspath 万一失败会取到空串、
+  #       比较悄悄不成立 → 守卫静默失效，正好回到本条要修的那个数据丢失场景。故提到 if 外面。
+  PRE_RESTORE_ABS="$(abspath "$PRE_RESTORE")"
+  if [ "$SNAPSHOT_ABS" = "$PRE_RESTORE_ABS" ]; then
+    RESTORE_SRC="$BACKUP_DIR/.restore-src.db"
+    echo "   ⚠️ 恢复源就是 $PRE_RESTORE，先复制一份到 $RESTORE_SRC 再用（否则会被本步覆盖）"
+    $SUDO rm -f "$RESTORE_SRC"
+    $SUDO cp -- "$SNAPSHOT" "$RESTORE_SRC"   # 快照是静态文件（非活动库），cp 即可，无 WAL 问题
+    $SUDO chmod 600 "$RESTORE_SRC"
+  fi
+
   # 🔴 必须 VACUUM INTO，绝不能 cp/install：库跑 WAL 模式，`docker compose stop` 发 SIGTERM 后进程
   #    不做 checkpoint 就退出，最后一段已提交数据只躺在 app.db-wal 里。裸拷主文件会丢这段，而下面
   #    紧接着 `rm -f "$DB-wal"` 会把唯一副本删掉——等用户想反悔时，回滚点已残缺且不可挽回。
   #    （同 lib/backup.ts 顶部那条 WAL 安全纪律；preupgrade.db 也是 VACUUM INTO 产的。）
-  #    借 app 镜像里的 node 跑：本脚本本就依赖 docker compose（上面刚 stop 过），非新依赖；
-  #    用 run 而非 exec，是因为恢复常发生在容器已停/崩溃循环时，exec 那会儿连不上。
-  # ⚠️ 容器内路径固定 /app/data——compose 的卷是 `./data:/app/data`，宿主侧改 DATA_DIR/BACKUP_DIR
-  #    只改宿主视角，容器里挂载点不变。若你**同时改了 compose 的卷映射**，下面两个容器内路径要跟着改。
-  $SUDO rm -f "$BACKUP_DIR/pre-restore.db"   # VACUUM INTO 目标已存在会报错
-  docker compose run --rm --no-deps -T --entrypoint node app -e '
+  # 🔴 同 lib/backup.ts 的原子发布纪律：先写 .tmp- 临时名，成功后才 mv 就位——中途被杀
+  #    不会留下一个残缺的 pre-restore.db 冒充回滚点。
+  $SUDO rm -f "$PRE_RESTORE.tmp"
+  DATA_DIR_ABS="$(absdir "$DATA_DIR")"
+  BACKUP_DIR_ABS="$(absdir "$BACKUP_DIR")"   # 上面 install -d 刚建好，必存在
+  node_in_data "$DATA_DIR_ABS" "$BACKUP_DIR_ABS" '
     const { DatabaseSync } = require("node:sqlite")
-    const src = new DatabaseSync("/app/data/app.db")
+    const src = new DatabaseSync("/d/app.db")
     try {
       src.exec("PRAGMA busy_timeout = 5000")
-      src.prepare("VACUUM INTO ?").run("/app/data/backups/pre-restore.db")
+      src.prepare("VACUUM INTO ?").run("/b/pre-restore.db.tmp")
     } finally {
       src.close()
     }
   ' || {
-    echo "❌ 现场留存失败：产不出 $BACKUP_DIR/pre-restore.db" >&2
+    echo "❌ 现场留存失败：产不出 $PRE_RESTORE" >&2
     echo "   已中止，$DB 未被改动（fail-closed：没有回滚点就不做破坏性还原）。" >&2
     echo "   如确认无需回滚点，手动移开当前库后重跑：mv $DB <你的存放路径>" >&2
+    $SUDO rm -f "$PRE_RESTORE.tmp"
     exit 1
   }
   # 容器里覆盖了 entrypoint，那条 umask 077 不生效，产出可能是 0644——库含 OAuth 令牌快照与 CDK 码，收紧
-  $SUDO chmod 600 "$BACKUP_DIR/pre-restore.db"
+  $SUDO chmod 600 "$PRE_RESTORE.tmp"
+  $SUDO mv -- "$PRE_RESTORE.tmp" "$PRE_RESTORE"   # 就位（同目录 mv 原子）
 else
   echo "→ 当前无 $DB，跳过现场留存"
 fi
@@ -123,7 +240,8 @@ fi
 # 老部署那份 0644 收不紧、属主也不还原）
 echo "→ 还原快照为 $DB（0600 / uid1000）"
 # shellcheck disable=SC2086
-$SUDO install $OWN -m 600 "$SNAPSHOT" "$DB"
+$SUDO install $OWN -m 600 "$RESTORE_SRC" "$DB"
+[ "$RESTORE_SRC" = "$SNAPSHOT" ] || $SUDO rm -f "$RESTORE_SRC"   # 清掉临时副本
 
 # -wal/-shm 是旧库的 WAL 副本，换整库快照时必须一并删除；
 # 标记也要清——手动还原＝人为终结升级链，不清则下次真升级会因「标记指向的旧快照仍在」被误判、跳过备份。

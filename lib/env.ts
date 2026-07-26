@@ -33,8 +33,20 @@ function resolveSessionSecret(): string {
 function resolveHeartbeatUrl(): string {
   const raw = (process.env.HEARTBEAT_URL || '').trim()
   if (!raw) return ''
-  if (!/^https?:\/\//.test(raw)) {
-    // 🔴 §8：只说「格式不对」，绝不把配错的值回显到日志（可能含 uuid 型密钥）
+  // 🔴 §8 脱敏靠**真解析**，不能只靠前缀正则（P6-R2 复审第 4 条）：正则只看开头，
+  //    `https://ho st/<uuid>` 这种「http 开头但不合法」的值照样放行，等到 pingHeartbeat 里
+  //    fetch 才抛 `Failed to parse URL from https://ho st/<uuid>`——错误对象被 console.warn
+  //    打出来，整条 URL（含 uuid 型密钥）就进了日志，正是本函数要防的事。实测复现过。
+  //    改用 new URL() 在**配置期**判定：不合法就地拦下，绝不让它流到 fetch 的报错里。
+  let parsed: URL
+  try {
+    parsed = new URL(raw)
+  } catch {
+    // 只说「格式不对」，绝不回显配错的值本身
+    console.warn('[env] HEARTBEAT_URL 不是合法 URL，已按未配置处理（心跳关闭）')
+    return ''
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
     console.warn('[env] HEARTBEAT_URL 不是 http:// 或 https:// 开头，已按未配置处理（心跳关闭）')
     return ''
   }

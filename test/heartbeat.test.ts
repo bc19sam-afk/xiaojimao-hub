@@ -129,3 +129,45 @@ test('心跳：带 AbortSignal（超时保护）', async () => {
   assert.ok(sig instanceof AbortSignal, '应传入 AbortSignal')
   assert.equal(sig.aborted, false)
 })
+
+// ============================================================================
+// P6-R2 复审第 7 条：首检「卡住」（skipped）也要掐掉心跳
+//
+// processPending 的 running 锁没释放时返回 { skipped:true } 而**不抛**——上一轮吊死在某个 await
+// （cpamp 连接卡住等）就会一直如此。tick 只 catch 异常的话 healthy 恒 true、心跳照打，
+// dead-man 在「worker 真的不干活了」时反而保持沉默，正是它该报警的那个场景。
+// ============================================================================
+
+test('复审7：首检 skipped（锁未释放＝可能卡死）→ 判不健康 → 不发心跳', async () => {
+  const { pendingIsHealthy } = await import('../lib/worker.ts')
+  assert.equal(
+    pendingIsHealthy({ skipped: true }),
+    false,
+    '🔴 首检被锁挡住时必须判不健康，否则 worker 卡死期间心跳照打、dead-man 永不告警',
+  )
+  // 串到真实心跳链路上确认确实不发
+  const { f, calls } = spyFetch()
+  assert.equal(await pingHeartbeat(pendingIsHealthy({ skipped: true }), 1_000_000, f), false)
+  assert.deepEqual(calls, [], '首检卡住时绝不能发心跳')
+})
+
+test('复审7：首检正常跑完 → 判健康 → 正常发心跳', async () => {
+  const { pendingIsHealthy } = await import('../lib/worker.ts')
+  assert.equal(pendingIsHealthy({ checked: 3, activated: 1, rejected: 0 }), true)
+  assert.equal(pendingIsHealthy({ checked: 0, activated: 0, rejected: 0 }), true, '没号可检也算正常')
+  const { f, calls } = spyFetch()
+  assert.equal(await pingHeartbeat(pendingIsHealthy({ activated: 0 }), 1_000_000, f), true)
+  assert.deepEqual(calls, [HB_URL])
+})
+
+// ⚠️ 部分采纳的边界（别回退）：另两段的 skipped **不并进** healthy。
+//    它们的 skipped 是正常节流而非卡死——实测 8s tick、一天 10800 轮下，checkPooledHealth 因
+//    5 分钟节流 skip 97.33%、settleDailyUsage 因 grace 窗 + 日闸 skip 99.99%。若一并并进去，
+//    「三段同时真跑」一天只剩 1 轮，心跳一天最多 1 次，而外部 Period 建议 5 分钟 → 恒定误报。
+test('复审7 边界：健康判据只看首检，不看另两段的节流 skipped', async () => {
+  const { pendingIsHealthy } = await import('../lib/worker.ts')
+  // pendingIsHealthy 的入参只有首检结果——签名本身就钉住了「另两段不参与」。
+  // 这里额外钉住语义：一个「没做任何事但没被锁挡住」的首检结果仍算健康。
+  assert.equal(pendingIsHealthy({ checked: 0, activated: 0, rejected: 0 }), true)
+  assert.equal(pendingIsHealthy({}), true, 'skipped 缺省（undefined）＝没被挡住＝健康')
+})

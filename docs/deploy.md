@@ -161,14 +161,18 @@ docker compose logs -f app   # 有迁移：[schema-check] 需迁移 → [backup]
 ./scripts/restore.sh data/backups/backup-2026-07-26T01-00-00-a1b2c3.db
 ```
 
-脚本按顺序做：校验快照是真 SQLite 文件 → `docker compose stop app` → 现场 `app.db` 用 `VACUUM INTO` 存为 `data/backups/pre-restore.db`（单文件覆盖式，同 `preupgrade.db` 一样不进轮转集）→ `install` 快照为 `app.db`（0600 / 属主 1000）→ 删 `-wal`/`-shm`/`.upgrade-in-progress` → `docker compose start app` → 轮询 `/api/ready` 最多 60s。
+脚本按顺序做：校验快照是真 SQLite 文件 → **`PRAGMA quick_check` 完整性校验** → `docker compose stop app` → 现场 `app.db` 用 `VACUUM INTO` 存为 `data/backups/pre-restore.db`（单文件覆盖式，同 `preupgrade.db` 一样不进轮转集）→ `install` 快照为 `app.db`（0600 / 属主 1000）→ 删 `-wal`/`-shm`/`.upgrade-in-progress` → `docker compose start app` → 轮询 `/api/ready` 最多 60s。
 
+- 🔴 **完整性校验在所有破坏性步骤之前**：文件头检查（`SQLite format 3`）挡不住**截断/页损坏**——实测截到 2048 字节的库文件头仍然完好，但 `quick_check` 报 malformed。校验不过就直接中止：app 没停、`app.db` 没动。校验借 app 镜像里的 node 起一次性只读容器，以 `file:...?immutable=1` 打开（不是单纯 `readOnly`：纯 `cp` 出来的快照保留 `journal_mode=wal`，只读打开也要在同目录建 `-wal`/`-shm`，挂 `:ro` 会报 "attempt to write a readonly database" 把好快照误判成坏的）。
 - 🔴 **现场留存走 `VACUUM INTO`（借 app 镜像里的 node 起一次性容器），不是 `cp`**：`stop` 发的 SIGTERM 不做 WAL checkpoint，最后一段已提交数据只在 `app.db-wal` 里；裸拷主文件会丢这段，而脚本下一步就删 `-wal`——想反悔时回滚点已残缺且不可挽回。留存失败即 **fail-closed 中止**（不动 `app.db`），没有回滚点就不做破坏性还原。
+- 🔴 **用 `pre-restore.db` 本身当恢复源是安全的**：跑过一次 restore 后想回到最初状态，最自然的做法就是拿 `pre-restore.db` 再还原一次——而这一步恰好会用**当前** `app.db` 重建同名文件。脚本检出这种情形时先把它复制成 `.restore-src.db`、从副本还原，避免恢复源在被读取前就被覆盖（那样会一路打 ✅、`/api/ready` 也过，但还原出来的是当前坏状态，且唯一回滚点已经没了）。
 
 - 🔴 **分叉守卫**：若 `data/.upgrade-in-progress` 存在（＝上次升级没走完），脚本**拒绝执行**并打印指引，退出码 3。必须先把镜像/代码退回旧版本、`docker compose up -d --build` 重建容器，再带 `--after-image-rollback` 重跑——原因见下方手工步骤里的 ⚠️ 分叉说明。
 - 校验用 `/api/ready`（不是 `/api/health`）：liveness 通过只说明进程活着，readiness 才验证「库能读 + schema 版本与镜像匹配」——还原错版本的快照就卡在这一步。
 - 环境变量：`SUDO=`（已是 uid1000 / macOS Docker Desktop 时跳过 sudo）、`DATA_DIR`、`BACKUP_DIR`、`APP_URL`。不能提权时自动省掉属主移交（只设权限 600）——Docker Desktop 会自动映射 uid，本就不需要 chown。
-- 退出码：0 成功 / 1 快照无效或校验超时 / 2 用法错 / 3 被升级标记拒绝。
+  - `BACKUP_DIR` 可自由改到任意路径（含 `data/` 之外）：脚本用显式 `-v` 把它挂进一次性容器，不依赖 compose 里那条 `./data:/app/data`。
+  - 🔴 `DATA_DIR` **必须与 `docker-compose.yml` 里绑到 `/app/data` 的宿主路径一致**（默认那条是 `./data:/app/data`）：脚本按它定位要还原的库文件，容器按 compose 那条绑定定位它实际读的库；两者指的不是同一个目录时，还原的就是个 app 根本不读的文件。改了 compose 的绑定源要同步改这个。
+- 退出码：0 成功 / 1 快照无效（不存在／非 SQLite／未过 `quick_check`）、路径无法解析或校验超时 / 2 用法错（含「快照就是当前库本身」）/ 3 被升级标记拒绝。
 
 演练完数据核对无误后，删掉 `data/backups/pre-restore.db` 即可（它不占轮转名额，但会一直留着）。
 

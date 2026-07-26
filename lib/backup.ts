@@ -28,19 +28,32 @@ export function backupDb(dbPath: string, backupDir: string, keep: number, now: D
   const rand = crypto.randomBytes(3).toString('hex')
   const target = path.resolve(backupDir, `backup-${ts}-${rand}.db`)
 
+  // 🔴 原子发布（P6-R2 复审必修 2）：先写**不匹配 BACKUP_RE 的临时名**，VACUUM 全程成功后才
+  //    rename 成 backup-*.db。若直接写最终名，VACUUM 中途断电/进程被杀会留下一个「有 SQLite 头
+  //    但内容截断」的 backup-*.db——它同时污染两条判据：latestBackupDay 认它是「今天已备过」
+  //    → 整天不再备份；BACKUP_KEEP 轮转集也认它 → 占一个名额把真好备份挤出去。两条都是静默的。
+  //    rename 同目录内是原子的（不跨设备），故不存在「改到一半的文件名」。
+  //    临时名以 `.tmp-` 打头：既不匹配 BACKUP_RE（不进轮转集），也不匹配 backupLocalDay 的文件名
+  //    模式（不被当成「今天备过了」）——残缺产物再也影响不了任何判据。
+  //    ⚠️ 遗留清理：VACUUM 抛错（磁盘满等）由下面 catch 删掉临时文件；只有**硬杀**（SIGKILL/断电）
+  //    会留下一个 .tmp-backup-*.db。它无害（不进任何判据），手动删即可。故意不自动清扫同目录的
+  //    .tmp-*：手动 `scripts/backup.ts` 与 worker 的每日备份是两个进程，扫一遍会误删对方正在写的那份。
+  const tmp = path.resolve(backupDir, `.tmp-backup-${ts}-${rand}.db`)
+
   const src = new DatabaseSync(dbPath)
   try {
     src.exec('PRAGMA busy_timeout = 5000')
     try {
-      src.prepare('VACUUM INTO ?').run(target)
+      src.prepare('VACUUM INTO ?').run(tmp)
     } catch (err) {
-      fs.rmSync(target, { force: true }) // 失败时 VACUUM INTO 可能留下残缺目标文件
+      fs.rmSync(tmp, { force: true }) // 失败时 VACUUM INTO 可能留下残缺目标文件
       throw err
     }
   } finally {
     src.close()
   }
-  fs.chmodSync(target, 0o600)
+  fs.chmodSync(tmp, 0o600) // 先收权限再改名：发布出去的那一刻权限已经是 0600，没有 0644 的窗口
+  fs.renameSync(tmp, target)
 
   // 保留策略：刚产出的这份必留，其余按 mtime 新→旧排序再留 keep-1 份，更旧的删掉
   const others = fs

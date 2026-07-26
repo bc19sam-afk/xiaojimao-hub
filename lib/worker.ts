@@ -34,6 +34,13 @@ function backupPaths(): { dbPath: string; dir: string; keep: number } {
 let lastCheckedDay = ''
 
 // 每日备份闸：返回本轮是否真的备了一份（供测试断言与日志）。now 注入以可测。
+//
+// ⚠️ 已知代价（P6-R2 复审第 6 条，本轮**有意不改**）：backupDb 里的 `VACUUM INTO` 是
+//    **同步**调用，跑的那一下会阻塞整个事件循环——期间 HTTP 请求不被处理。当前规模下可忽略：
+//    真实库 76KB，VACUUM 耗时微秒级；复审实测 294MB 库要 489ms、49MB 要 85ms。
+//    但这是**随库大小线性增长**的：库涨到几百 MB 时每天会有一次几百毫秒的全站卡顿，
+//    那时就该把备份挪出主进程（独立 cron 容器 / worker_threads），而不是继续放在 tick 里。
+//    判断阈值：`ls -la data/app.db` 超过 ~50MB 就该动手了。
 export function runDailyBackup(now: Date = new Date()): boolean {
   const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(
     now.getDate(),
@@ -85,6 +92,22 @@ export function __resetHeartbeatThrottle(): void {
   lastHeartbeatAt = 0
 }
 
+// 首检结果 → 本轮是否算「收号链路正常」（心跳前提）。抽成函数只为可测：tick 是闭包，
+// 里面的 healthy 判定没有别的入口能断言。
+//
+// 🔴 首检 skipped 也算不健康（P6-R2 复审第 7 条）：processPending 的 running 锁没释放时它返回
+//    { skipped:true } 而**不抛**——上一轮卡在某个 await（cpamp 连接吊死等）就会一直如此。
+//    只 catch 异常的话 healthy 恒 true、心跳照打，dead-man 反而在「worker 真的不干活了」时保持
+//    沉默，正是它该报警的那个场景。
+// ⚠️ 只并**首检**这一段的 skipped，另两段的不并——它们的 skipped 是正常节流，语义完全不同：
+//    实测（8s tick、一天 10800 轮）checkPooledHealth 因 5 分钟节流 skip 掉 97.33% 的轮次，
+//    settleDailyUsage 因 grace 窗 + 一天一次 skip 掉 99.99%。三段都并进去的话「三段同时真跑」
+//    一天只有 1 轮 → 心跳一天最多 1 次，而外部 Period 建议 5 分钟 → 恒定误报。
+//    只有首检的 skipped 是纯锁语义（＝真的卡住了），故只采纳这一段。
+export function pendingIsHealthy(r: { skipped?: boolean }): boolean {
+  return !r.skipped
+}
+
 export function startWorker() {
   if (started) return // 防重复启动（dev 热更可能多次触发）
   if (!env.worker.enabled) {
@@ -100,6 +123,11 @@ export function startWorker() {
     let healthy = true
     try {
       const r = await processPending()
+      // 首检被上一轮的锁挡住＝可能卡死，掐掉本轮心跳（理由见 pendingIsHealthy 上的说明）
+      if (!pendingIsHealthy(r)) {
+        healthy = false
+        console.warn('[worker] 首检被上一轮的锁挡住（可能卡死），本轮不发心跳')
+      }
       if (r.activated || r.rejected) {
         console.log(`[worker] 巡检完成：通过 ${r.activated}，淘汰 ${r.rejected}`)
       }
