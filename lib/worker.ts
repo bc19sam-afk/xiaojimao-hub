@@ -104,8 +104,27 @@ export function __resetHeartbeatThrottle(): void {
 //    settleDailyUsage 因 grace 窗 + 一天一次 skip 掉 99.99%。三段都并进去的话「三段同时真跑」
 //    一天只有 1 轮 → 心跳一天最多 1 次，而外部 Period 建议 5 分钟 → 恒定误报。
 //    只有首检的 skipped 是纯锁语义（＝真的卡住了），故只采纳这一段。
-export function pendingIsHealthy(r: { skipped?: boolean }): boolean {
-  return !r.skipped
+//
+// 🔴 CPA 整体故障也算不健康（P6-R2 复审三轮第 2 条）：cpamp 巡检接口挂了（5xx/网络不通）时
+//    processPending 内部 catch 住、把本轮 codex 待检号全跳过——这是 PR #15 定的收号纪律
+//    （「不可观测」绝不能误退回好号），**语义不能改**。但它因此一路返回
+//    { checked:n, activated:0, rejected:0 } 且不抛 → healthy 恒 true → 心跳照打，
+//    而收号链路实际上是断的（号一个也进不了池）。docs §6 承诺「心跳证明后台 worker 还在正常
+//    干活」，这就是实测复现过的那条假绿。故 processPending 额外回一个纯健康信号 inspectFailed，
+//    在这里消费：收号语义分毫未动，只是让 dead-man 能看见 CPA 挂了。
+//    ⚠️ 缺省 undefined ＝本轮压根没调 inspect（没有 codex 待检号）＝没有可观测到的 CPA 故障，
+//       按健康算——绝不能因为「本轮没活干」就误报不健康（那会让心跳恒不发）。
+export function pendingIsHealthy(r: { skipped?: boolean; inspectFailed?: boolean }): boolean {
+  return !r.skipped && !r.inspectFailed
+}
+
+// 结算结果 → 本轮是否算「结算链路正常」。抽成函数的理由同 pendingIsHealthy：tick 是闭包，不抽出来
+// 就没有入口能断言这条判据。
+// 🔴 只看 lockHeld，**不看 skipped**（P6-R2 复审三轮第 3 条）：settleDailyUsage 的 skipped 有三个
+//    来源，只有 running 锁那一个代表「上一轮卡在某个 await 没回来」；另两个（日切 grace 窗 /
+//    今天已结过）是正常节流，实测占 99.99% 的轮次，并进去＝心跳一天最多 1 次、恒定误报。
+export function settleIsHealthy(s: { skipped?: boolean; lockHeld?: boolean }): boolean {
+  return !s.lockHeld
 }
 
 export function startWorker() {
@@ -123,10 +142,13 @@ export function startWorker() {
     let healthy = true
     try {
       const r = await processPending()
-      // 首检被上一轮的锁挡住＝可能卡死，掐掉本轮心跳（理由见 pendingIsHealthy 上的说明）
+      // 两种「没抛但收号链路不正常」的情形都掐掉本轮心跳（理由见 pendingIsHealthy 上的说明）。
+      // 分开记日志：一条指向「worker 卡死」，一条指向「CPA 挂了」——排障方向完全不同，
+      // 合成一句话会把运维引到错的那一边。
       if (!pendingIsHealthy(r)) {
         healthy = false
-        console.warn('[worker] 首检被上一轮的锁挡住（可能卡死），本轮不发心跳')
+        if (r.skipped) console.warn('[worker] 首检被上一轮的锁挡住（可能卡死），本轮不发心跳')
+        if (r.inspectFailed) console.warn('[worker] CPA 巡检接口不可用，待检号本轮全跳过，本轮不发心跳')
       }
       if (r.activated || r.rejected) {
         console.log(`[worker] 巡检完成：通过 ${r.activated}，淘汰 ${r.rejected}`)
@@ -150,6 +172,14 @@ export function startWorker() {
     // 结算故障不拖累首检；两者共用同一 tick 周期，各自 running 锁防叠跑。
     try {
       const s = await settleDailyUsage()
+      // 🔴 只认 lockHeld，不认 skipped（P6-R2 复审三轮第 3 条）：settleDailyUsage 的 skipped 有三个来源，
+      //    只有 running 锁那一个代表「上一轮卡在某个 await 没回来」。另两个（日切 grace 窗 / 今天已结过）
+      //    是正常节流，实测占 99.99% 的轮次——并进健康判据＝心跳一天最多 1 次、恒定误报。详见 settle.ts
+      //    返回类型上的说明。
+      if (s.lockHeld) {
+        healthy = false
+        console.warn('[worker] 结算被上一轮的锁挡住（可能卡死），本轮不发心跳')
+      }
       if (s.settled || s.awarded) {
         console.log(`[worker] 按日结算：结算 ${s.settled} 笔，发分 ${s.awarded} 笔`)
       }

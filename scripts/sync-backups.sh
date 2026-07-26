@@ -34,6 +34,12 @@ command -v rsync >/dev/null 2>&1 || { echo "❌ 未找到 rsync，请先安装" 
 
 # -a 保权限属主时间戳（备份文件是 0600，别在传输中放宽）；-z 压缩；--partial 断点续传
 # 结尾斜杠：同步**目录内容**到远端目录下。含 preupgrade.db / pre-restore.db（钉住的回滚点，一并异机保存）。
+#
+# --exclude '.tmp-*'：`lib/backup.ts` 的原子发布会先写 `.tmp-backup-*.db`，正常路径下写完即 rename，
+# 但**硬杀/断电**会留下残缺的临时文件（见 backup.ts 顶部说明）。rsync 默认**不跳过隐藏文件**，
+# 会把这种半截库同步到异机。它在远端不消费任何判据（远端不跑轮转/latestBackupDay），纯占空间，
+# 但异机目录里躺着「看起来像备份的残缺库」本身就是恢复时的误选风险，故排除。
+# 也顺带避开「正在写的那一份」——同步与备份撞车时传半截文件毫无意义。
 echo "→ 同步 $BACKUP_DIR/ → $REMOTE"
-rsync -az --partial "$BACKUP_DIR/" "$REMOTE"
+rsync -az --partial --exclude '.tmp-*' "$BACKUP_DIR/" "$REMOTE"
 echo "✅ 同步完成（未启用 --delete：远端只增不减，清理策略见 docs/deploy.md §5.3）"

@@ -13,6 +13,44 @@ import path from 'node:path'
 
 const BACKUP_RE = /^backup-.*\.db$/
 
+// ============================================================================
+// 跨进程发布锁（P6-R2 复审三轮第 5 条）
+//
+// 缺它的后果是**丢光备份**：手动 `npm run backup` 与 worker 每日备份是两个进程，各自跑完
+// VACUUM 后都执行「留自己 + 按 mtime 留 keep-1 份」。`BACKUP_KEEP=1` 时 `slice(0)` ＝删掉
+// 除自己以外的**全部**——两进程交错就互相删掉对方刚发布的那份，两次调用都返回成功路径，
+// 备份目录却是空的（复审实测：并发 6 轮有 2 轮剩 0 份）。keep>=2 时同样会少留。
+//
+// 锁的载体用 SQLite 自己：`BEGIN IMMEDIATE` 拿的是文件级 RESERVED 写锁，跨进程互斥（实测另一
+// 进程被挡满 busy_timeout），且**持锁进程被 SIGKILL 后由内核释放 fd 自动解锁**（实测等待 0ms
+// 即可拿到）——不会像「创建标记文件当锁」那样留下永久锁死的僵尸锁。无新依赖。
+//
+// ⚠️ 临界区只包「发布 + 轮转」，**不包 VACUUM**：VACUUM 写的是各自唯一命名的 .tmp- 文件，
+//    互不干扰；而它是同步调用、大库要几百毫秒（见 worker.ts 的说明），包进锁里会让第二个进程
+//    的事件循环白白多阻塞一整个 VACUUM 的时长。临界区里只有 rename + readdir + unlink，微秒级。
+// ⚠️ 拿不到锁就抛错（fail-closed）：临界区不含任何可能卡住的操作，超时说明现场真出了异常，
+//    这时宁可报「备份失败」也不能绕过锁去轮转——那正是本条要修的数据丢失。
+const LOCK_FILE = '.backup.lock'
+const LOCK_TIMEOUT_MS = 10_000
+
+function withPublishLock<T>(backupDir: string, fn: () => T): T {
+  const lock = new DatabaseSync(path.resolve(backupDir, LOCK_FILE))
+  try {
+    lock.exec(`PRAGMA busy_timeout = ${LOCK_TIMEOUT_MS}`)
+    try {
+      lock.exec('BEGIN IMMEDIATE')
+    } catch (err) {
+      throw new Error(
+        `备份发布锁获取超时（${LOCK_TIMEOUT_MS}ms）：${path.resolve(backupDir, LOCK_FILE)}。` +
+          `临界区只做 rename/轮转（微秒级），超时说明现场异常，已中止本次备份。原因：${err}`,
+      )
+    }
+    return fn()
+  } finally {
+    lock.close() // 事务未提交时 close 即回滚并释放锁；进程被杀则由内核释放
+  }
+}
+
 // 备份 dbPath 到 backupDir/backup-<时间戳到秒>-<随机>.db（权限 0600），
 // 并按 keep 只保留最新 keep 份（仅清理匹配命名模式的文件）。返回备份文件绝对路径。
 // now 注入以可测；更要紧的是让**判定时刻与命名时刻同源**（见 dailyBackupIfDue）：若命名各取各的
@@ -53,17 +91,23 @@ export function backupDb(dbPath: string, backupDir: string, keep: number, now: D
     src.close()
   }
   fs.chmodSync(tmp, 0o600) // 先收权限再改名：发布出去的那一刻权限已经是 0600，没有 0644 的窗口
-  fs.renameSync(tmp, target)
 
-  // 保留策略：刚产出的这份必留，其余按 mtime 新→旧排序再留 keep-1 份，更旧的删掉
-  const others = fs
-    .readdirSync(backupDir)
-    .filter((f) => BACKUP_RE.test(f))
-    .map((f) => path.resolve(backupDir, f))
-    .filter((p) => p !== target)
-    .map((p) => ({ p, mtime: fs.statSync(p).mtimeMs }))
-    .sort((a, b) => b.mtime - a.mtime)
-  for (const old of others.slice(keep - 1)) fs.rmSync(old.p, { force: true })
+  // 🔴 发布 + 轮转必须在同一把跨进程锁内（见上面 withPublishLock）：rename 与「按 mtime 留 keep-1」
+  //    之间若被另一个进程插进来发布，两边的 readdir 都看不到对方那份，就会各自把对方删掉。
+  //    锁内先 rename 再 readdir，保证「读到的目录内容」与「自己已发布」是同一个瞬间的视图。
+  withPublishLock(backupDir, () => {
+    fs.renameSync(tmp, target)
+
+    // 保留策略：刚产出的这份必留，其余按 mtime 新→旧排序再留 keep-1 份，更旧的删掉
+    const others = fs
+      .readdirSync(backupDir)
+      .filter((f) => BACKUP_RE.test(f))
+      .map((f) => path.resolve(backupDir, f))
+      .filter((p) => p !== target)
+      .map((p) => ({ p, mtime: fs.statSync(p).mtimeMs }))
+      .sort((a, b) => b.mtime - a.mtime)
+    for (const old of others.slice(keep - 1)) fs.rmSync(old.p, { force: true })
+  })
 
   return target
 }

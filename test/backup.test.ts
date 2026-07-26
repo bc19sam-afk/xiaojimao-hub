@@ -284,3 +284,124 @@ test('原子发布：产物权限 0600（chmod 在 rename 之前）', () => {
   const p = backupDb(dbPath, path.join(dir, 'backups'), 3)
   assert.equal(fs.statSync(p).mode & 0o777, 0o600)
 })
+
+// ============================================================================
+// 跨进程发布锁（P6-R2 复审三轮第 5 条）
+//
+// 手动 `npm run backup` 与 worker 每日备份是两个进程。发布(rename)与轮转(按 mtime 留 keep-1)
+// 之间若被对方插进来，两边的 readdir 都看不到对方那份 → 各自把对方刚发布的删掉。
+// `BACKUP_KEEP=1` 时 slice(0)＝删掉除自己以外全部，最坏结果是**目录里一份不剩**，而两次调用
+// 都返回成功路径——静默的备份全丢。
+//
+// 紧对齐测法（同 seed-concurrency.test.ts）：N 个子进程各自 import 真实 backupDb、写 ready 文件、
+// 忙旋等 GO；父进程见 N 个 ready 齐了才落 GO，把它们同刻放行。破损版实测 15/20 轮出错
+// （13 轮剩 0 份、2 轮剩 2 份）且 10 轮因 readdir 与 statSync 之间文件被对方删掉而 ENOENT 崩溃；
+// 修复版 20/20 轮精确剩 1 份、零崩溃。取 5 轮＝破损版漏检概率 0.25^5≈0.1%。
+// ⚠️ 隔离红线：全程临时目录，子进程只收显式路径参数，不碰 DB_PATH / 真实 data。
+// ============================================================================
+
+// 子进程：import 真实 backupDb → 写 ready → 忙旋等 GO → 备份。忙旋（非 sleep 轮询）是为了
+// 把「放行 → 进临界区」的抖动压到微秒级，否则毫秒级抖动远大于临界区宽度、根本撞不上。
+const RACE_CHILD_SRC = [
+  "import fs from 'node:fs'",
+  "import { pathToFileURL } from 'node:url'",
+  'const { MOD, DB, DIR, BARRIER, READY, KEEP } = process.env',
+  'const { backupDb } = await import(pathToFileURL(MOD).href)',
+  "fs.writeFileSync(READY, '')",
+  'while (!fs.existsSync(BARRIER)) {}',
+  'backupDb(DB, DIR, Number(KEEP))',
+  '',
+].join('\n')
+
+test('跨进程锁：N 进程紧对齐同刻备份 → 精确剩 keep 份、零崩溃（不互删）', async () => {
+  const N = 4
+  const ROUNDS = 5
+  const KEEP = 1 // keep=1 是最坏情形：slice(0) 删掉除自己以外全部
+  const raceDir = fs.mkdtempSync(path.join(tmpDir, 'xproc-lock-'))
+  const childPath = path.join(raceDir, 'race-child.mjs')
+  fs.writeFileSync(childPath, RACE_CHILD_SRC)
+  const setupPath = path.resolve(import.meta.dirname, 'setup.mjs')
+  const modPath = path.resolve(import.meta.dirname, '../lib/backup.ts')
+
+  for (let r = 0; r < ROUNDS; r++) {
+    const roundDir = path.join(raceDir, `r${r}`)
+    fs.mkdirSync(roundDir, { recursive: true })
+    const dbPath = path.join(roundDir, 'app.db')
+    const d = new DatabaseSync(dbPath)
+    d.exec('CREATE TABLE t (id INTEGER PRIMARY KEY)')
+    d.prepare('INSERT INTO t (id) VALUES (1)').run()
+    d.close()
+    const backupsDir = path.join(roundDir, 'backups')
+    fs.mkdirSync(backupsDir)
+    const readyDir = path.join(roundDir, 'ready')
+    fs.mkdirSync(readyDir)
+    const barrier = path.join(roundDir, 'GO')
+
+    const procs = Array.from({ length: N }, (_v, i) => {
+      const c = spawn(process.execPath, ['--import', setupPath, childPath], {
+        env: {
+          ...process.env,
+          MOD: modPath,
+          DB: dbPath,
+          DIR: backupsDir,
+          BARRIER: barrier,
+          READY: path.join(readyDir, String(i)),
+          KEEP: String(KEEP),
+        },
+        stdio: ['ignore', 'ignore', 'pipe'],
+      })
+      let stderr = ''
+      c.stderr.on('data', (b) => (stderr += b))
+      return new Promise<{ code: number | null; stderr: string }>((res) =>
+        c.on('exit', (code) => res({ code, stderr })),
+      )
+    })
+
+    // 等所有子进程都到 backupDb 门口再统一放行
+    const deadline = Date.now() + 20_000
+    while (fs.readdirSync(readyDir).length < N) {
+      if (Date.now() > deadline) throw new Error(`第 ${r} 轮：子进程未在 20s 内就绪`)
+      await sleep(5)
+    }
+    fs.writeFileSync(barrier, '1')
+    const results = await Promise.all(procs)
+
+    // 崩溃也是本条的真实症状：破损版会在 readdir 与 statSync 之间被对方删掉文件而 ENOENT
+    const crashed = results.filter((x) => x.code !== 0)
+    assert.equal(
+      crashed.length,
+      0,
+      `第 ${r} 轮：并发备份不应崩溃；失败 ${crashed.length}/${N}，样例 stderr：\n${crashed[0]?.stderr ?? ''}`,
+    )
+    const left = fs.readdirSync(backupsDir).filter((f) => /^backup-.*\.db$/.test(f))
+    assert.equal(
+      left.length,
+      KEEP,
+      `🔴 第 ${r} 轮：${N} 进程并发备份后应精确剩 ${KEEP} 份，实际 ${left.length} 份` +
+        `（0 份＝互删光了，每个进程却都返回了成功路径）。目录：${JSON.stringify(fs.readdirSync(backupsDir))}`,
+    )
+  }
+})
+
+// 锁文件本身不得污染任何判据：不进轮转集、不被 latestBackupDay 当成「今天备过了」
+test('跨进程锁：.backup.lock 不进轮转集、不影响 latestBackupDay', async () => {
+  const { latestBackupDay } = await import('../lib/backup.ts')
+  const dir = fs.mkdtempSync(path.join(tmpDir, 'lockfile-'))
+  const { src, dbPath } = makeWalDb(dir, 1)
+  src.close()
+  const backupsDir = path.join(dir, 'backups')
+
+  backupDb(dbPath, backupsDir, 1, new Date('2026-07-24T09:00:00'))
+  assert.ok(fs.existsSync(path.join(backupsDir, '.backup.lock')), '锁文件应已建在备份目录里')
+  assert.equal(latestBackupDay(backupsDir), '2026-07-24', '锁文件不得被当成备份参与日判定')
+
+  // keep=1 再备一次：锁文件不占名额（占了的话真备份会被挤掉），且自己不被轮转删
+  const second = backupDb(dbPath, backupsDir, 1, new Date('2026-07-25T09:00:00'))
+  assert.ok(fs.existsSync(second), '轮转后本次备份应仍在')
+  assert.ok(fs.existsSync(path.join(backupsDir, '.backup.lock')), '锁文件不该被轮转删掉')
+  assert.deepEqual(
+    fs.readdirSync(backupsDir).filter((f) => /^backup-.*\.db$/.test(f)),
+    [path.basename(second)],
+    'keep=1 时应恰好剩最新那一份',
+  )
+})

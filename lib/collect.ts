@@ -201,6 +201,14 @@ export async function processPending(): Promise<{
   activated: number // 本轮入池数（对外仍叫 activated，保 worker/verify-now 调用方兼容）
   rejected: number // 本轮首检失败·退回数（删行释放唯一键）
   skipped?: boolean
+  // 🔴 本轮 cpa.inspect() 整体抛错（P6-R2 复审三轮第 2 条）：**只是给调用方的健康信号**，
+  //    不改收号语义（下面那处 catch 照旧把号跳过、绝不误退回——那是 PR #15 定的纪律）。
+  //    没有它的话，CPA 持续宕机时 processPending 一路返回 {checked:n,activated:0,rejected:0}
+  //    且不抛，worker 的 healthy 恒 true → dead-man 心跳照打，而收号链路实际是断的：
+  //    docs §6 承诺「心跳证明后台 worker 还在正常干活」，实测复现过这条假绿。
+  //    ⚠️ 只在**本轮真的需要 inspect**（有 codex 待首检号）且它抛了时才为 true；没有 codex 待检号
+  //    时压根不调 inspect，此时缺省 undefined ＝「本轮没有可观测到的 CPA 故障」，不能误报不健康。
+  inspectFailed?: boolean
 }> {
   if (running) return { checked: 0, activated: 0, rejected: 0, skipped: true }
   running = true
@@ -213,6 +221,7 @@ export async function processPending(): Promise<{
     const poolPriority = db.getPoolPriority()
     let pooled = 0 // 本轮入池数
     let rejected = 0 // 本轮首检失败·退回数
+    let inspectFailed = false // 本轮 inspect 是否整体抛错（仅作健康信号，不改收号语义）
 
     // 首检通过 → 入池：启用（setDisabled false）+ 设高优先级（best-effort）+ transition → pooled，
     //   此刻占用唯一键（§3.2）。限额/额度暂满（decision=retry）不算失败 → 一并入池等恢复
@@ -277,6 +286,7 @@ export async function processPending(): Promise<{
         probes = await cpa.inspect()
       } catch {
         probes = null
+        inspectFailed = true // 仅置健康信号；跳过语义原样不动（见返回类型上的说明）
       }
       if (probes !== null) {
         const byKey = new Map(probes.map((r) => [probeKey(r.provider, r.accountId), r]))
@@ -312,7 +322,7 @@ export async function processPending(): Promise<{
       await enterPool(c, c.plan)
     }
 
-    return { checked: pending.length, activated: pooled, rejected }
+    return { checked: pending.length, activated: pooled, rejected, inspectFailed }
   } finally {
     running = false
   }

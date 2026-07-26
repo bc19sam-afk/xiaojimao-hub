@@ -50,6 +50,19 @@ function resolveHeartbeatUrl(): string {
     console.warn('[env] HEARTBEAT_URL 不是 http:// 或 https:// 开头，已按未配置处理（心跳关闭）')
     return ''
   }
+  // 🔴 同一漏洞的第二个入口（P6-R2 复审二轮第 4 条）：`https://user:pw@host/<uuid>` 是**合法 URL**，
+  //    new URL() 照收，但 fetch 会拒绝 "Request cannot be constructed from a URL that includes
+  //    credentials: <整条 URL>"——明文密码与 uuid 段一起进了错误对象，又被 pingHeartbeat 的
+  //    console.warn(e) 打进日志。实测复现。心跳服务（healthchecks.io / uptime-kuma）的鉴权本就
+  //    在 URL 路径里的随机串，不需要 basic-auth，故配置期直接拒绝带凭证的 URL。
+  if (parsed.username || parsed.password) {
+    // 只说「带了凭证」，绝不回显任何片段（origin 也不打：主机名本身可能是内网标识）
+    console.warn(
+      '[env] HEARTBEAT_URL 含 basic-auth 凭证（user:pass@），已按未配置处理（心跳关闭）。' +
+        '心跳服务的鉴权应放在 URL 路径里的随机串，不要用 basic-auth。',
+    )
+    return ''
+  }
   return raw
 }
 
