@@ -152,7 +152,7 @@ DB_ABS="$(abspath "$DB")"
 # 🔴 快照 == 目标库：还原「自己盖自己」没有意义，且下面 install 会因 same file 报错（exit 64）而
 #    中止在半途（此时 app 已停、现场已存）。提前拒绝，给出清晰指引。
 if [ "$SNAPSHOT_ABS" = "$DB_ABS" ]; then
-  echo "❌ 快照就是当前库本身（$DB），还原它没有意义。" >&2
+  echo "❌ 快照就是当前库本身（${DB}），还原它没有意义。" >&2
   exit 2
 fi
 
@@ -210,7 +210,7 @@ docker compose stop app
 PRE_RESTORE="$BACKUP_DIR/pre-restore.db"
 RESTORE_SRC="$SNAPSHOT"   # 实际用来还原的路径，可能被下面改指到副本
 if [ -f "$DB" ]; then
-  echo "→ 存下当前现场：$PRE_RESTORE（覆盖上一次的同名文件）"
+  echo "→ 存下当前现场：${PRE_RESTORE}（覆盖上一次的同名文件）"
   # shellcheck disable=SC2086  # $OWN 需按词拆分成 -o 1000 -g 1000（或空）
   $SUDO install -d $OWN -m 700 "$BACKUP_DIR"
 
@@ -223,7 +223,7 @@ if [ -f "$DB" ]; then
   PRE_RESTORE_ABS="$(abspath "$PRE_RESTORE")"
   if [ "$SNAPSHOT_ABS" = "$PRE_RESTORE_ABS" ]; then
     RESTORE_SRC="$BACKUP_DIR/.restore-src.db"
-    echo "   ⚠️ 恢复源就是 $PRE_RESTORE，先复制一份到 $RESTORE_SRC 再用（否则会被本步覆盖）"
+    echo "   ⚠️ 恢复源就是 ${PRE_RESTORE}，先复制一份到 ${RESTORE_SRC} 再用（否则会被本步覆盖）"
     $SUDO rm -f "$RESTORE_SRC"
     $SUDO cp -- "$SNAPSHOT" "$RESTORE_SRC"   # 快照是静态文件（非活动库），cp 即可，无 WAL 问题
     $SUDO chmod 600 "$RESTORE_SRC"
@@ -258,12 +258,12 @@ if [ -f "$DB" ]; then
   $SUDO chmod 600 "$PRE_RESTORE.tmp"
   $SUDO mv -- "$PRE_RESTORE.tmp" "$PRE_RESTORE"   # 就位（同目录 mv 原子）
 else
-  echo "→ 当前无 $DB，跳过现场留存"
+  echo "→ 当前无 ${DB}，跳过现场留存"
 fi
 
 # 一条 install 完成 覆盖还原 + 属主 uid1000 + 权限 600（不用 cp：覆盖会保留目标原 mode，
 # 老部署那份 0644 收不紧、属主也不还原）
-echo "→ 还原快照为 $DB（0600 / uid1000）"
+echo "→ 还原快照为 ${DB}（0600 / uid1000）"
 # shellcheck disable=SC2086
 $SUDO install $OWN -m 600 "$RESTORE_SRC" "$DB"
 [ "$RESTORE_SRC" = "$SNAPSHOT" ] || $SUDO rm -f "$RESTORE_SRC"   # 清掉临时副本
