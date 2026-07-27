@@ -225,3 +225,21 @@ test('复审三轮3：节流 skipped（无 lockHeld）→ 判健康', async () =
   assert.equal(await pingHeartbeat(settleIsHealthy({ skipped: true }), 1_000_000, f), true)
   assert.deepEqual(calls, [HB_URL])
 })
+
+test('复审三轮②-consumer：inspectFailed=true → pendingIsHealthy 判不健康 → 不发心跳', async () => {
+  const { pendingIsHealthy } = await import('../lib/worker.ts')
+  assert.equal(pendingIsHealthy({ inspectFailed: true }), false, '🔴 CPA 挂了必须判不健康')
+  const { f, calls } = spyFetch()
+  assert.equal(await pingHeartbeat(pendingIsHealthy({ inspectFailed: true }), 1_000_000, f), false)
+  assert.deepEqual(calls, [], 'CPA 不可用时绝不能发心跳')
+})
+
+test('复审三轮②-consumer：空闲 tick（无 inspectFailed）→ pendingIsHealthy 判健康', async () => {
+  const { pendingIsHealthy } = await import('../lib/worker.ts')
+  assert.equal(pendingIsHealthy({}), true, '空闲 tick 或探活成功 → 健康')
+  assert.equal(pendingIsHealthy({ skipped: false }), true)
+  const { f, calls } = spyFetch()
+  assert.equal(await pingHeartbeat(pendingIsHealthy({}), 1_000_000, f), true)
+  assert.deepEqual(calls, [HB_URL])
+})
+
