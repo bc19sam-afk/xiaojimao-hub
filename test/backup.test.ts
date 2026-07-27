@@ -405,3 +405,67 @@ test('跨进程锁：.backup.lock 不进轮转集、不影响 latestBackupDay', 
     'keep=1 时应恰好剩最新那一份',
   )
 })
+
+// ============================================================================
+// R6-P2④（codex R5 终审）：发布阶段失败时清理 .tmp-backup-*
+//
+// 流程是「VACUUM 到 .tmp- 临时名 → 拿发布锁 → rename 成 backup-*.db + 轮转」。VACUUM 已有 catch
+// 清理，但**发布阶段**抛错（拿锁超时、锁文件打不开、rename 失败）修复前没有 catch → 一份完整大小的
+// 临时文件（约等于全库）留在备份目录里，且不匹配 BACKUP_RE / backupLocalDay，任何判据都看不见它，
+// 轮转永远清不掉 → 只能人工发现并手删。反复失败就是反复堆积，直到磁盘满。
+//
+// 修复：withPublishLock 外层加 catch → rmSync(tmp, {force:true}) 后重抛。
+// 下面两条分别注入「锁根本打不开」与「真实拿锁超时」，都断言：抛错 + 无 .tmp- 残留 + 已有备份完好。
+// ============================================================================
+
+function tmpLeftovers(dir: string): string[] {
+  return fs.readdirSync(dir).filter((f) => f.startsWith('.tmp-'))
+}
+
+test('R6-P2④：发布锁打不开 → 抛错且不留 .tmp- 残留，已有备份完好', async () => {
+  const { latestBackupDay } = await import('../lib/backup.ts')
+  const dir = fs.mkdtempSync(path.join(tmpDir, 'p2d-lockopen-'))
+  const { src, dbPath } = makeWalDb(dir, 20)
+  src.close()
+  const backupsDir = path.join(dir, 'backups')
+
+  // 先成功备一份，作为「已有备份不得被破坏」的参照
+  const good = backupDb(dbPath, backupsDir, 3, new Date('2026-07-26T09:00:00'))
+  fs.rmSync(path.join(backupsDir, '.backup.lock'), { force: true })
+  // 锁路径占成目录 → withPublishLock 的 new DatabaseSync 直接抛（实测 "unable to open database file"）。
+  // 这是「发布阶段在 rename 之前失败」的最快注入方式，且 VACUUM 此时已经成功、tmp 已落盘。
+  fs.mkdirSync(path.join(backupsDir, '.backup.lock'))
+
+  assert.throws(
+    () => backupDb(dbPath, backupsDir, 3, new Date('2026-07-27T09:00:00')),
+    /unable to open database file|备份发布锁/,
+    '发布阶段失败必须抛错，不能静默当成功',
+  )
+  assert.deepEqual(tmpLeftovers(backupsDir), [], '🔴 发布失败后不得留下 .tmp-backup-* 临时文件')
+  assert.ok(fs.existsSync(good), '🔴 已有备份不得被破坏')
+  assert.equal(latestBackupDay(backupsDir), '2026-07-26', '失败的这次不得被任何判据当成「已备份」')
+})
+
+test('R6-P2④：发布锁被别人持有到超时 → 抛错且不留 .tmp- 残留', () => {
+  const dir = fs.mkdtempSync(path.join(tmpDir, 'p2d-timeout-'))
+  const { src, dbPath } = makeWalDb(dir, 20)
+  src.close()
+  const backupsDir = path.join(dir, 'backups')
+  const good = backupDb(dbPath, backupsDir, 3, new Date('2026-07-26T09:00:00'))
+
+  // 真实占锁：另开一个连接对 .backup.lock 起 BEGIN IMMEDIATE（文件级 RESERVED 写锁）。
+  // 实测同进程两连接也互斥，故不必起子进程。backupDb 会在 busy_timeout(10s) 后抛「发布锁获取超时」。
+  const holder = new DatabaseSync(path.join(backupsDir, '.backup.lock'))
+  holder.exec('BEGIN IMMEDIATE')
+  try {
+    assert.throws(
+      () => backupDb(dbPath, backupsDir, 3, new Date('2026-07-27T09:00:00')),
+      /备份发布锁获取超时/,
+      '拿不到锁必须 fail-closed 抛错（绝不绕过锁去轮转）',
+    )
+    assert.deepEqual(tmpLeftovers(backupsDir), [], '🔴 拿锁超时后不得留下 .tmp-backup-* 临时文件')
+    assert.ok(fs.existsSync(good), '🔴 已有备份不得被破坏')
+  } finally {
+    holder.close()
+  }
+})

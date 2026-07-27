@@ -62,13 +62,50 @@ CONTAINER_DB_PATH=$(docker compose config app 2>/dev/null \
   | sed "s/^['\"]//; s/['\"]$//" \
   || echo "")
 
+# 🔴 R6-P1②（codex R5 终审）：非默认 DB_PATH 的手工恢复指引。
+#
+#    修复前两处守卫都写「直接 cp 快照文件到实际库路径」——这条指引本身会毁数据：
+#      ① 库跑 WAL 模式，app 还在跑时 cp 拷的是**撕裂的中间态**（主文件与 -wal 不一致）；
+#      ② 即便先停了 app，遗留的 `-wal`/`-shm` 属于**旧库**，新库一起来 SQLite 会把这些陈旧页
+#         当成自己的未提交事务重放 → 库直接 malformed，或悄悄混入旧数据；
+#      ③ cp 出来的文件权限/属主随操作账号（root:root 0644 之类），容器以 uid1000 跑 → 起来
+#         就是 "unable to open database file"，或世界可读地暴露全库。
+#    故这里输出**与脚本自身完全同款**的安全序列：停 app → 现场留存 → 原子就位 → 清 WAL 残留
+#    → 恢复权限属主 → 起 app → 校验。绝不给裸 cp。
+#    ⚠️ 下面步骤 b 的路径是容器内路径（docker run 里跑 node），c/d/e 的路径是**宿主**路径——
+#       两者未必一致（DB_PATH=/srv/xjm/db 在容器里用，宿主侧可能是 /mnt/volumes/xjm/db 挂进去）。
+#       运维需自行换算：容器路径照抄守卫输出的那条（已从容器配置读出），宿主路径按自己绑定的
+#       volume 源目录填（compose 的 `-v <host>:<container>`左边）。文档不可能自动算这个（没法从
+#       容器配置反推宿主真实挂载点——overlay/tmpfs/命名卷都不是文件系统路径），只提供模板。
+print_manual_steps() {
+  _target="$1"
+  cat >&2 <<EOF
+     ⚠️ 下面步骤 b 是容器内路径（${_target}），c/d/e 是宿主路径——按你的 volume 绑定换算。
+     a) 停 app（释放写锁，务必先做）：
+          docker compose stop app
+     b) 留存当前现场（🔴 用 VACUUM INTO，不能 cp——WAL 里的已提交数据 cp 不到）：
+          docker compose run --rm --no-deps -T --entrypoint node app -e \\
+            'const {DatabaseSync}=require("node:sqlite");const d=new DatabaseSync("${_target}");d.exec("VACUUM INTO \"${_target}.pre-restore\"");d.close()'
+     c) 原子就位（<宿主路径>，非容器路径；先写临时名再 mv，中途被杀不会留半截库冒充好库）：
+          cp -- <快照路径> '<宿主路径>.tmp' && mv -- '<宿主路径>.tmp' '<宿主路径>'
+     d) 🔴 删掉旧库的 WAL 残留（<宿主路径>；不删则新库启动时会重放陈旧页 → malformed 或混入旧数据）：
+          rm -f '<宿主路径>-wal' '<宿主路径>-shm' '${MARKER}'
+     e) 恢复权限与属主（<宿主路径>；容器以 uid1000 跑，属主不对会 unable to open database file）：
+          sudo chown 1000:1000 '<宿主路径>' && sudo chmod 600 '<宿主路径>'
+     f) 起 app 并校验：
+          docker compose start app
+          curl -fsS --connect-timeout 3 --max-time 5 ${APP_URL}/api/ready
+EOF
+}
+
 if [ -n "${DB_PATH:-}" ] && [ "$DB_PATH" != "data/app.db" ]; then
   echo "❌ restore.sh 不支持非默认 DB_PATH（宿主侧检测到 DB_PATH='$DB_PATH'）。" >&2
   echo "" >&2
   echo "本脚本硬编码假设库位于 data/app.db（与 docker-compose.yml / Dockerfile 默认一致）。" >&2
   echo "若运维环境已用 DB_PATH 覆盖库位置，请采用以下方案之一：" >&2
   echo "  1. 临时恢复默认：unset DB_PATH 后执行本脚本；或" >&2
-  echo "  2. 手动恢复：直接 cp 快照文件到实际库路径，验证后重启容器。" >&2
+  echo "  2. 手动恢复（照下面的顺序做，别直接 cp 到活库上）：" >&2
+  print_manual_steps "$DB_PATH"
   echo "" >&2
   echo "🔴 不可忽略本错误：强行执行会把快照恢复到错误位置，导致数据丢失。" >&2
   exit 2
@@ -82,7 +119,8 @@ if [ -n "$CONTAINER_DB_PATH" ] && [ "$CONTAINER_DB_PATH" != "data/app.db" ]; the
   echo "" >&2
   echo "请采用以下方案之一：" >&2
   echo "  1. 清空 .env / docker-compose.yml 里的 DB_PATH 配置，重新部署后执行本脚本；或" >&2
-  echo "  2. 手动恢复：直接 cp 快照文件到容器实际库路径（'$CONTAINER_DB_PATH'），验证后重启。" >&2
+  echo "  2. 手动恢复（照下面的顺序做，别直接 cp 到活库上）：" >&2
+  print_manual_steps "$CONTAINER_DB_PATH"
   echo "" >&2
   echo "🔴 不可忽略本错误：强行执行会导致数据丢失。" >&2
   exit 2
@@ -166,8 +204,28 @@ absdir() {
 
 # 把 <宿主快照文件>本身挂成容器内的 /snap.db（ro），跑 JS。
 # 挂**文件**而非所在目录：目录里可能还有别的库/密钥，没必要整个暴露给一次性容器。
+#
+# 🔴 R6-P2③（codex R5 终审）：这一步必须以 **root** 跑（`--user 0:0`）。
+#
+#    镜像里是 `USER node`（uid 1000）。Linux 的 bind-mount **保留宿主 uid/gid 与权限位**，不做
+#    任何映射：运维用 root 从异机 scp/rsync 下来的快照通常是 `root:root 0600`（sync-backups.sh
+#    的产物、docs §5.3 的异机备份都是这个形态），容器里的 uid1000 对它 **没有读权限** →
+#    `new DatabaseSync` 直接 EACCES → 下面的 `||` 分支把一份**完全合法**的快照报成「截断/损坏」。
+#    而这发生在「还没停 app」的阶段，表现是恢复流程根本起不了步：运维手里明明有好快照却被拒。
+#
+#    为什么这一步可以提权（三条一起成立，缺一不可）：
+#      ① 纯只读——挂载带 `:ro`（内核层面禁写，容器内 root 也写不进去），JS 侧再叠
+#         `?immutable=1` + `readOnly: true`，SQLite 连 -wal/-shm 都不建；
+#      ② 只碰快照这一个**文件**，不挂 DATA_DIR、碰不到活库 app.db，跑挂了也不改变任何现场；
+#      ③ 一次性容器（`--rm --no-deps`），跑完即销毁，不留下以 root 运行的长驻进程。
+#    对比另一条路「先 stage 一份容器可读的副本」：那要在宿主上多复制一份**全库**（磁盘可能不够、
+#    还得保证副本不世界可读且异常路径下也清理掉），比只读提权的风险面更大。故选 --user 0:0。
+#
+#    ⚠️ 只有这个函数提权。node_in_data 会**写** pre-restore.db，仍保持镜像默认的 uid1000
+#       ——产物属主必须是 1000，容器起来才读得到（见下面 install 的 -o 1000 -g 1000）。
 node_with_snapshot() {
   docker compose run --rm --no-deps -T \
+    --user 0:0 \
     -v "$1:/snap.db:ro" \
     --entrypoint node app -e "$2"
 }

@@ -356,6 +356,13 @@ let healthRunning = false
 // 轮询达 30s）＝持续满负荷。巡检该分钟级、比结算勤即可；此处限至少隔 5 分钟跑一次（now/force 供测试）。
 const HEALTH_INTERVAL_MS = 5 * 60_000
 let lastHealthAt = 0
+// 🔴 R6-P1①（codex R5 终审）：持久化 CPA 巡检失败状态，跨节流窗传播到后续 throttled tick。
+//    修复前：lastHealthAt 在 try 开头推进 → 失败后的下一轮（8s 后）被节流 early return、只回
+//    { skipped:true }、缺 inspectFailed → worker 判健康 → 持续故障期每 5 分钟窗只有首 tick 抑制
+//    心跳、后续 ~36 tick 照打 → dead-man 假绿。
+//    修复后：本轮真跑时更新此标志（成功清零、失败保持），throttled skip 时从这里传播 → 故障期
+//    所有 tick 都判不健康，直到下次真跑成功才清零 → 心跳在整个故障窗持续抑制。
+let lastInspectFailed = false
 
 export async function checkPooledHealth(
   now: number = Date.now(),
@@ -379,7 +386,10 @@ export async function checkPooledHealth(
   inspectFailed?: boolean
 }> {
   if (healthRunning) return { checked: 0, stopped: 0, skipped: true, lockHeld: true }
-  if (!opts.force && now - lastHealthAt < HEALTH_INTERVAL_MS) return { checked: 0, stopped: 0, skipped: true }
+  if (!opts.force && now - lastHealthAt < HEALTH_INTERVAL_MS) {
+    // 🔴 R6-P1①：节流 skip 时也传播上次真跑的巡检失败状态，防故障期每窗只有首 tick 抑心跳、其余照打
+    return { checked: 0, stopped: 0, skipped: true, inspectFailed: lastInspectFailed }
+  }
   healthRunning = true
   let inspectFailed = false // 本轮 CPA 巡检接口是否不可用（仅作健康信号，不改存活巡检语义）
   try {
@@ -455,6 +465,16 @@ export async function checkPooledHealth(
 
     return { checked: pooled.length, stopped, inspectFailed }
   } finally {
+    // 🔴 R6-P1①：本轮真跑完成 → 更新持久化的失败标志（成功清零/失败保持），供后续 throttled tick 传播。
+    //    放 finally 而非 return 前：`pooled.length === 0` 那条 early return 也要清零，否则「故障期间
+    //    池子恰好清空」会把 true 永久钉住、心跳再也不发（真跑成功却报不健康）。
+    lastInspectFailed = inspectFailed
     healthRunning = false
   }
+}
+
+// 测试用：清空存活巡检的时刻缓存与持久化失败标志（生产无调用方）
+export function __resetHealthThrottle(): void {
+  lastHealthAt = 0
+  lastInspectFailed = false
 }

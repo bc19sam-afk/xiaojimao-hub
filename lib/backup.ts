@@ -73,8 +73,9 @@ export function backupDb(dbPath: string, backupDir: string, keep: number, now: D
   //    rename 同目录内是原子的（不跨设备），故不存在「改到一半的文件名」。
   //    临时名以 `.tmp-` 打头：既不匹配 BACKUP_RE（不进轮转集），也不匹配 backupLocalDay 的文件名
   //    模式（不被当成「今天备过了」）——残缺产物再也影响不了任何判据。
-  //    ⚠️ 遗留清理：VACUUM 抛错（磁盘满等）由下面 catch 删掉临时文件；只有**硬杀**（SIGKILL/断电）
-  //    会留下一个 .tmp-backup-*.db。它无害（不进任何判据），手动删即可。故意不自动清扫同目录的
+  //    ⚠️ 遗留清理：VACUUM 抛错（磁盘满等）由下面 catch 删掉临时文件，发布阶段抛错（拿不到锁等）
+  //    由 withPublishLock 外层的 catch 删（见下）；只有**硬杀**（SIGKILL/断电）会留下一个
+  //    .tmp-backup-*.db。它无害（不进任何判据），手动删即可。故意不自动清扫同目录的
   //    .tmp-*：手动 `scripts/backup.ts` 与 worker 的每日备份是两个进程，扫一遍会误删对方正在写的那份。
   const tmp = path.resolve(backupDir, `.tmp-backup-${ts}-${rand}.db`)
 
@@ -92,22 +93,34 @@ export function backupDb(dbPath: string, backupDir: string, keep: number, now: D
   }
   fs.chmodSync(tmp, 0o600) // 先收权限再改名：发布出去的那一刻权限已经是 0600，没有 0644 的窗口
 
+  // 🔴 R6-P2④（codex R5 终审）：发布锁失败时清理临时文件。
+  //
+  //    VACUUM 成功 → tmp 已落盘 0600；接下来 withPublishLock 拿锁超时或 rename 失败（磁盘满等）
+  //    会抛错。修复前这里没 catch，tmp 留在目录里**占着磁盘空间**却不会被任何判据识别（不匹配
+  //    BACKUP_RE，轮转集看不见；不进 latestBackupDay）→ 只能手动清。
+  //    故发布锁失败路径也做 force:true 清理（同 VACUUM catch 一致）：操作已中止、产物不可用、留着无益。
+  //    ⚠️ 硬杀（SIGKILL/断电）仍会留 tmp——内核不给进程善终机会，无法从 JS 层清理。它是无害残留。
   // 🔴 发布 + 轮转必须在同一把跨进程锁内（见上面 withPublishLock）：rename 与「按 mtime 留 keep-1」
   //    之间若被另一个进程插进来发布，两边的 readdir 都看不到对方那份，就会各自把对方删掉。
   //    锁内先 rename 再 readdir，保证「读到的目录内容」与「自己已发布」是同一个瞬间的视图。
-  withPublishLock(backupDir, () => {
-    fs.renameSync(tmp, target)
+  try {
+    withPublishLock(backupDir, () => {
+      fs.renameSync(tmp, target)
 
-    // 保留策略：刚产出的这份必留，其余按 mtime 新→旧排序再留 keep-1 份，更旧的删掉
-    const others = fs
-      .readdirSync(backupDir)
-      .filter((f) => BACKUP_RE.test(f))
-      .map((f) => path.resolve(backupDir, f))
-      .filter((p) => p !== target)
-      .map((p) => ({ p, mtime: fs.statSync(p).mtimeMs }))
-      .sort((a, b) => b.mtime - a.mtime)
-    for (const old of others.slice(keep - 1)) fs.rmSync(old.p, { force: true })
-  })
+      // 保留策略：刚产出的这份必留，其余按 mtime 新→旧排序再留 keep-1 份，更旧的删掉
+      const others = fs
+        .readdirSync(backupDir)
+        .filter((f) => BACKUP_RE.test(f))
+        .map((f) => path.resolve(backupDir, f))
+        .filter((p) => p !== target)
+        .map((p) => ({ p, mtime: fs.statSync(p).mtimeMs }))
+        .sort((a, b) => b.mtime - a.mtime)
+      for (const old of others.slice(keep - 1)) fs.rmSync(old.p, { force: true })
+    })
+  } catch (err) {
+    fs.rmSync(tmp, { force: true }) // 发布失败，临时文件不再需要
+    throw err
+  }
 
   return target
 }

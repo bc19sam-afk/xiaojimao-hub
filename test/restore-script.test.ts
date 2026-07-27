@@ -643,3 +643,40 @@ test('R4-P1②：符号链接成环 → exit 1 拒绝运行，不死循环', () 
   assert.equal(readMarker(path.join(dataDir, 'app.db')), 'CURRENT', '🔴 拦截时不得改动 app.db')
   assert.doesNotMatch(r.log, /"stop"/, '🔴 应在动手之前就拦下，不该已经停过 app')
 })
+
+// ============================================================================
+// R6-P2③（codex R5 终审）：node_with_snapshot 以 uid 1000 跑时读不到 root 属主的 0600 快照
+//
+// 问题：运维从异机 rsync/scp 下来的备份通常是 `root:root 0600`（sync-backups.sh 产物），镜像
+// 默认 `USER node`(uid1000)，bind-mount **不做 uid 映射**直接保留宿主权限 → 容器内 1000 对
+// 文件判不可读 → quick_check 里 `new DatabaseSync` 抛 EACCES，守卫却把合法快照报成「截断/损坏」，
+// 恢复流程根本起不了步。
+//
+// 修复：node_with_snapshot 加 `--user 0:0`。纯只读操作（`:ro` + `?immutable=1` + `readOnly: true`）、
+// 只碰单一快照文件不碰活库、一次性容器 --rm，三条都成立故提权安全。node_in_data 仍保持 uid1000
+// （会写文件、产物属主必须是 1000）。
+//
+// 回归测试：跑真实脚本，钉它调 quick_check 时传了 `--user 0:0`。桩 docker 的 `:ro` 复刻
+// （0o500 目录）保证测试环境和真容器一样：同目录不可写 + SQLite 建不了 -wal/-shm。修复前脚本
+// 不带 --user、桩会以当前进程 uid 读 0600 文件 → 桩的 node 进程看到 EACCES、quick_check 失败
+// 退码非零；修复后带 --user 0:0、桩跳过该 flag（不提权、只记录）但测试进程对自己建的文件仍可读
+// → 成功。真容器里的差异更直接：不带 --user 时 uid1000 对 root:root 0600 没读权限；带了就能读。
+// ============================================================================
+test('R6-P2③：快照 0600 时 quick_check 以 root 读（--user 0:0）', () => {
+  const { dataDir, backupsDir } = scene('root-snap', 'CURRENT')
+  const snap = path.join(backupsDir, 'backup-from-remote.db')
+  makeDb(snap, 'REMOTE')
+  fs.chmodSync(snap, 0o600)
+
+  const r = runRestore(dataDir, backupsDir, snap)
+  assert.equal(r.status, 0, `脚本应成功：\n${r.stdout}\n${r.stderr}`)
+  assert.equal(readMarker(path.join(dataDir, 'app.db')), 'REMOTE')
+
+  // 桩日志里 quick_check 的那行调用必须带 --user 0:0。找「含 immutable=1 的那行」（其它 run 不带这个）
+  const calls = r.log.split('\n').filter((l) => l.includes('immutable=1'))
+  assert.equal(calls.length, 1, '应恰有一次 quick_check 调用')
+  const argv = JSON.parse(calls[0])
+  const userIdx = argv.indexOf('--user')
+  assert.ok(userIdx >= 0, '🔴 quick_check 必须带 --user（修复前缺此参数 → uid1000 读不了 root:root 0600）')
+  assert.equal(argv[userIdx + 1], '0:0', '🔴 必须提权到 root')
+})

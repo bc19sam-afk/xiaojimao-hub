@@ -335,3 +335,75 @@ test('R6③：首检无待检号（writeFailed 缺省 undefined）→ pendingIsH
   assert.deepEqual(calls, [HB_URL])
 })
 
+
+// ============================================================================
+// R6-P2⑤（codex R5 终审）：非 2xx 静默当成功
+//
+// fetch 只在网络层失败时 reject，HTTP 错误状态是正常 resolve 的（404/401/5xx 等）。修复前
+// 任何状态码都返回 true、日志一片祥和，而监视器根本没收到 ping（URL/token 错了/监视器自己挂了）。
+// 运维只会在监视器超时告警后来查日志、却看不到异常——因为本地恰恰按「发送成功」记的，完全误导。
+//
+// 修复：判 res.ok，非 2xx 记 warn + 返回 false。同时脱敏：只记状态码，不回显 URL 或响应体
+// （响应体可能复述 URL/token）。
+// ============================================================================
+
+test('R6-P2⑤：404 → 返回 false 且记 warn（不静默当成功）', async () => {
+  const { f } = spyFetch(async () => ({ ok: false, status: 404 }) as unknown as Response)
+  const logs: string[] = []
+  const origWarn = console.warn
+  console.warn = (...args: unknown[]) => logs.push(args.join(' '))
+  try {
+    assert.equal(await pingHeartbeat(true, 1_000_000, f), false, '🔴 非 2xx 必须返回 false')
+  } finally {
+    console.warn = origWarn
+  }
+  assert.equal(logs.length, 1, '必须记一条 warn')
+  assert.match(logs[0], /HTTP 404/, '🔴 状态码必须出现在日志里')
+  assert.doesNotMatch(logs[0], /uuid-placeholder/, '🔴 URL 不得泄漏（§8 脱敏）')
+})
+
+test('R6-P2⑤：500 → 返回 false 且记 warn', async () => {
+  const { f } = spyFetch(async () => ({ ok: false, status: 500 }) as unknown as Response)
+  const logs: string[] = []
+  const origWarn = console.warn
+  console.warn = (...args: unknown[]) => logs.push(args.join(' '))
+  try {
+    assert.equal(await pingHeartbeat(true, 1_000_000, f), false)
+  } finally {
+    console.warn = origWarn
+  }
+  assert.match(logs[0], /HTTP 500/)
+  assert.doesNotMatch(logs[0], /uuid-placeholder/)
+})
+
+test('R6-P2⑤：401 → 返回 false 且记 warn', async () => {
+  const { f } = spyFetch(async () => ({ ok: false, status: 401 }) as unknown as Response)
+  const logs: string[] = []
+  const origWarn = console.warn
+  console.warn = (...args: unknown[]) => logs.push(args.join(' '))
+  try {
+    assert.equal(await pingHeartbeat(true, 1_000_000, f), false)
+  } finally {
+    console.warn = origWarn
+  }
+  assert.match(logs[0], /HTTP 401/)
+})
+
+test('R6-P2⑤ 反向：200 → 返回 true 且不记 warn', async () => {
+  const { f, calls } = spyFetch(async () => ({ ok: true, status: 200 }) as unknown as Response)
+  const logs: string[] = []
+  const origWarn = console.warn
+  console.warn = (...args: unknown[]) => logs.push(args.join(' '))
+  try {
+    assert.equal(await pingHeartbeat(true, 1_000_000, f), true, '🔴 2xx 必须返回 true')
+  } finally {
+    console.warn = origWarn
+  }
+  assert.deepEqual(logs, [], '成功时不得记 warn')
+  assert.deepEqual(calls, [HB_URL])
+})
+
+test('R6-P2⑤ 反向：204 → 返回 true', async () => {
+  const { f } = spyFetch(async () => ({ ok: true, status: 204 }) as unknown as Response)
+  assert.equal(await pingHeartbeat(true, 1_000_000, f), true)
+})

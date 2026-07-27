@@ -85,7 +85,18 @@ export async function pingHeartbeat(
   const ac = new AbortController()
   const timer = setTimeout(() => ac.abort(), 5000) // 5s 超时：外部服务卡住不许拖住 tick
   try {
-    await fetchImpl(env.worker.heartbeatUrl, { method: 'GET', signal: ac.signal })
+    const res = await fetchImpl(env.worker.heartbeatUrl, { method: 'GET', signal: ac.signal })
+    // 🔴 R6-P2⑤（codex R5 终审）：非 2xx 不算发送成功。
+    //    fetch 只在网络层失败时 reject，HTTP 错误状态是**正常 resolve** 的——修复前 404（URL 里的
+    //    uuid 打错/心跳监视器被删）、401（token 失效）、5xx（监视服务自身故障）全都返回 true，
+    //    日志一声不响。而这类配置错恰恰是**静默的**：外部监视器收不到 ping → 到期告警，运维查
+    //    本地日志却看不到任何异常，只能反推。故按 res.ok 判定，非 2xx 记 warn 并返回 false。
+    //    ⚠️ 返回 false 只表示「这次心跳没送达」，不影响收号主链路（调用方只记日志，见 tick）。
+    if (!res.ok) {
+      // 🔴 §8：只记状态码，绝不回显心跳 URL（含 uuid 型密钥）或响应体（可能回显 URL/token）
+      console.warn(`[worker] 心跳发送失败（不影响巡检）：HTTP ${res.status}`)
+      return false
+    }
     return true
   } catch (e) {
     // 🔴 §8：只记「失败」与错误对象，绝不回显心跳 URL（含 uuid 型密钥）
