@@ -31,7 +31,11 @@ function backupPaths(): { dbPath: string; dir: string; keep: number } {
 // 进程内「今天已确认过」的本地日。**纯性能优化**：日未变就不 readdir（8s 一 tick，一天上万次）。
 // 权威判据始终是磁盘上的备份文件名（latestBackupDay）——重启后此变量清空，只是多 readdir 一次，
 // 不会多备一份。🔴 绝不能反过来「靠它判断该不该备」，那样崩溃循环会备出一堆。
+// 🔴 R6⑤（codex R5 指出）：缓存整天可能错过「今天备份被删/挂载点被换」→ 不创建替补 → 近一整天无快照。
+//    修复：1 小时后重验磁盘（lastCheckedAt），兜「外部操作破坏备份」的窄窗（性能开销可忽略：一天
+//    最多 24 次 readdir，远低于 10800 tick）。
 let lastCheckedDay = ''
+let lastCheckedAt = 0
 
 // 每日备份闸：返回本轮是否真的备了一份（供测试断言与日志）。now 注入以可测。
 //
@@ -45,16 +49,21 @@ export function runDailyBackup(now: Date = new Date()): boolean {
   const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(
     now.getDate(),
   ).padStart(2, '0')}`
-  if (lastCheckedDay === today) return false // 今天已确认过（本进程内），零成本跳过
+  const nowMs = now.getTime()
+  // R6⑤ 复查窗：即使今天已确认过，1 小时后也重新验盘（防「外部删除今天备份」窄窗）。
+  const REVERIFY_MS = 3600_000 // 1 小时
+  if (lastCheckedDay === today && nowMs - lastCheckedAt < REVERIFY_MS) return false
   const { dbPath, dir, keep } = backupPaths()
   const made = dailyBackupIfDue(now, dbPath, dir, keep)
-  lastCheckedDay = today // 磁盘已确认「今天有备份」（本轮备的或早先备的），今天不用再 readdir
+  lastCheckedDay = today
+  lastCheckedAt = nowMs
   return made
 }
 
 // 测试用：清空进程内的日缓存（生产无调用方）。不影响磁盘判据。
 export function __resetBackupDayCache(): void {
   lastCheckedDay = ''
+  lastCheckedAt = 0
 }
 
 // ===== dead-man 心跳（P6-R2）=====
@@ -114,18 +123,28 @@ export function __resetHeartbeatThrottle(): void {
 //    在这里消费：收号语义分毫未动，只是让 dead-man 能看见 CPA 挂了。
 //    ⚠️ 缺省 undefined ＝本轮压根没调 inspect（没有 codex 待检号）＝没有可观测到的 CPA 故障，
 //       按健康算——绝不能因为「本轮没活干」就误报不健康（那会让心跳恒不发）。
-export function pendingIsHealthy(r: { skipped?: boolean; inspectFailed?: boolean }): boolean {
-  return !r.skipped && !r.inspectFailed
+// 🔴 CPA 写失败也算不健康（P6-R2 R6③，codex R5 指出）：setDisabled/deleteAuthFile/setPriority
+//    抛错时 enterPool/rejectBack 内部 catch 住、留行待重试，**不抛**（收号纪律不变）。
+//    processPending 返回时只回传 activated/rejected 计数、无失败信号 → healthy 恒 true → 心跳照打，
+//    而 CPA 写端点故障会阻塞所有激活/拒绝（待检号堆积、零号入池）。同理额外传播 writeFailed 健康信号。
+export function pendingIsHealthy(r: { skipped?: boolean; inspectFailed?: boolean; writeFailed?: boolean }): boolean {
+  return !r.skipped && !r.inspectFailed && !r.writeFailed
 }
 
 // 存活巡检结果 → 本轮是否算「存活巡检链路正常」。抽成函数的理由同 pendingIsHealthy / settleIsHealthy：
 // tick 是闭包，不抽出来就没有入口能断言这条判据。
-// 🔴 只看 lockHeld，**不看 skipped**（P6-R2 R4②，同 settleDailyUsage 的 lockHeld 根因）：
+// 🔴 只看 lockHeld 和 inspectFailed，**不看 skipped**（P6-R2 R4② + R6②，codex R5 补全）：
 //    checkPooledHealth 的 skipped 有两个来源，只有 healthRunning 锁那一个代表「上一轮卡在某个
 //    await 没回来」（cpa.inspect / listAuthFiles 的无超时 fetch）；另一个（5 分钟节流）是正常行为，
 //    实测占 97% 的轮次——并进健康判据＝心跳几乎不发、恒定误报。
-export function healthIsHealthy(h: { skipped?: boolean; lockHeld?: boolean }): boolean {
-  return !h.lockHeld
+//    inspectFailed（R6②）与 processPending 的同名字段同根因：CPA 巡检接口（inspect / listAuthFiles）
+//    5xx/网络不通时 catch 块吞掉异常、跳过本轮所有号（存活巡检纪律：不可观测≠失效，绝不误停），
+//    **但不抛**。lastHealthAt 在 try 前已推进 → 后续 tick 被当正常节流 skip、继续发心跳，
+//    而存活巡检实际断了。故额外传播此健康信号。
+//    ⚠️ 缺省 undefined ＝本轮无 pooled 号/全是 codex 且 inspect 成功 → 按健康算，不能因
+//       「本轮没活干」就误报不健康（那会让心跳恒不发）。
+export function healthIsHealthy(h: { skipped?: boolean; lockHeld?: boolean; inspectFailed?: boolean }): boolean {
+  return !h.lockHeld && !h.inspectFailed
 }
 
 // 结算结果 → 本轮是否算「结算链路正常」。抽成函数的理由同 pendingIsHealthy：tick 是闭包，不抽出来
@@ -152,13 +171,13 @@ export function startWorker() {
     let healthy = true
     try {
       const r = await processPending()
-      // 两种「没抛但收号链路不正常」的情形都掐掉本轮心跳（理由见 pendingIsHealthy 上的说明）。
-      // 分开记日志：一条指向「worker 卡死」，一条指向「CPA 挂了」——排障方向完全不同，
-      // 合成一句话会把运维引到错的那一边。
+      // 三种「没抛但收号链路不正常」的情形都掐掉本轮心跳（理由见 pendingIsHealthy 上的说明）。
+      // 分开记日志：每条指向具体故障——排障方向完全不同，合成一句话会把运维引到错的那一边。
       if (!pendingIsHealthy(r)) {
         healthy = false
         if (r.skipped) console.warn('[worker] 首检被上一轮的锁挡住（可能卡死），本轮不发心跳')
         if (r.inspectFailed) console.warn('[worker] CPA 巡检接口不可用，待检号本轮全跳过，本轮不发心跳')
+        if (r.writeFailed) console.warn('[worker] CPA 写操作失败（setDisabled/deleteAuthFile/setPriority），激活/拒绝阻塞，本轮不发心跳')
       }
       if (r.activated || r.rejected) {
         console.log(`[worker] 巡检完成：通过 ${r.activated}，淘汰 ${r.rejected}`)
@@ -171,12 +190,15 @@ export function startWorker() {
     // 与首检共用同一 tick 周期、各自 running 锁防叠跑。放结算前：本轮先停失效号，再结历史日欠薪。
     try {
       const h = await checkPooledHealth()
-      // 🔴 只认 lockHeld，不认 skipped（P6-R2 R4②）：checkPooledHealth 的 skipped 有两个来源，
-      //    只有 healthRunning 锁那一个代表「上一轮卡在某个 await 没回来」。另一个（5 分钟节流）
+      // 🔴 只认 lockHeld 和 inspectFailed，不认 skipped（P6-R2 R4② + R6②）：checkPooledHealth 的 skipped
+      //    有两个来源，只有 healthRunning 锁那一个代表「上一轮卡在某个 await 没回来」。另一个（5 分钟节流）
       //    是正常节流，实测占 97% 的轮次——并进健康判据＝心跳几乎不发、恒定误报。
+      //    inspectFailed（R6②）与首检段同根因：CPA 巡检接口挂了，catch 块跳过本轮所有号但不抛 → 后续 tick
+      //    被当正常节流 skip、继续发心跳，而存活巡检实际断了。分开记日志便于排障。
       if (!healthIsHealthy(h)) {
         healthy = false
-        console.warn('[worker] 存活巡检被上一轮的锁挡住（可能卡死），本轮不发心跳')
+        if (h.lockHeld) console.warn('[worker] 存活巡检被上一轮的锁挡住（可能卡死），本轮不发心跳')
+        if (h.inspectFailed) console.warn('[worker] CPA 巡检接口（inspect/listAuthFiles）不可用，pooled 号本轮全跳过，本轮不发心跳')
       }
       if (h.stopped) {
         console.log(`[worker] 存活巡检：停用 ${h.stopped} 个失效号`)

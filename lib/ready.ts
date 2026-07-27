@@ -1,4 +1,3 @@
-import { db } from './db'
 import { LATEST_VERSION } from './migrate'
 
 // ============================================================================
@@ -9,20 +8,29 @@ import { LATEST_VERSION } from './migrate'
 //   readiness = 这个进程**现在能正常干活吗** → 不通应把流量摘掉/告警，**但不该重启**
 //               （schema 落后重启一万次也不会自己变好，只会进 churn 循环，故 HEALTHCHECK 不用它）。
 //
-// 判据两条，任一不满足即未就绪：
+// 判据两条,任一不满足即未就绪：
 //   ① 库连接还能跑只读语句（SELECT 1）+ 读出 schema 版本——连接已关闭、库已损坏到读不出版本行时抛错。
 //   ② schema 版本 === 代码要求的 LATEST_VERSION——落后（漏跑 migrate）或超前（代码回滚）都算未就绪。
 //      ⚠️ 与 assertSchemaCurrent 的差别：那个是**启动期**守卫、超前只 warn 放行（向后兼容纪律）；
 //      这里是**运行期**就绪信号，取严格相等——版本不一致时把流量摘走比继续服务安全，且这判断
 //      不重启容器、无 churn 风险。
 //
+// 🔴 R6④（codex R5 指出）：`import { db }` 在模块顶层会触发 db.ts 的 openDb()，而 openDb 在
+//    MOCK=false 时调 assertSchemaCurrent() ——那个在 schema 落后时**抛错**，导致本模块加载失败，
+//    /api/ready 端点根本到不了「返回 503 {ok:false}」那步。修复：延迟导入 db，让 checkReady
+//    能在 schema 落后时正常返回 false 而非模块加载崩溃。
+//
 // 🔴 §8 脱敏：本函数只返回布尔，绝不把版本号/路径/配置回给调用方；细节只进服务端日志。
 // ============================================================================
 
-// 就绪返回 true；任何异常（库坏、表缺、schema_version 多行抛错）一律 false 且不外抛——
+// 就绪返回 true；任何异常（库坏、表缺、schema_version 多行抛错、**模块加载失败**）一律 false 且不外抛——
 // 探针自身绝不能因为被探测对象坏了而 500。
-export function checkReady(): boolean {
+export async function checkReady(): Promise<boolean> {
   try {
+    // 🔴 延迟导入（R6④）：放函数内、不放模块顶层 → 在 MOCK=false 且 schema 落后时，import 本身会抛
+    //   （openDb→assertSchemaCurrent），被本 try/catch 住、返回 false ✅；若在顶层 import，
+    //   那个抛错会打断模块加载、/api/ready 路由注册不上 → 404 而非 503 {ok:false}。
+    const { db } = await import('./db')
     const { alive, schemaVersion } = db.readyProbe()
     // ⚠️ 这条分支**实测打不到**（P6-R2 复审第 8 条）：`SELECT 1` 是常量表达式，SQLite 压根不碰
     //    库文件，只要连接没关就恒返回 1。实测六种坏法的真实去向（细节见 lib/db.ts readyProbe 注释）：

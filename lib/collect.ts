@@ -209,6 +209,14 @@ export async function processPending(): Promise<{
   //    ⚠️ 只在**本轮真的需要 inspect**（有 codex 待首检号）且它抛了时才为 true；没有 codex 待检号
   //    时压根不调 inspect，此时缺省 undefined ＝「本轮没有可观测到的 CPA 故障」，不能误报不健康。
   inspectFailed?: boolean
+  // 🔴 本轮 CPA 写操作（setDisabled/deleteAuthFile/setPriority）失败（P6-R2 R6③，codex R5 指出）：
+  //    **只是给调用方的健康信号**，收号语义分毫未动（enterPool / rejectBack 的 catch 块原样保留号、
+  //    下轮重试）。与 inspectFailed 同根因：CPA 写端点 5xx/网络不通时 catch 块吞掉异常、保留行待重试，
+  //    **但不抛**。processPending 返回时只回传 activated/rejected 计数、无失败信号 → worker 的
+  //    healthy 恒 true → 心跳照打，而 CPA 写端点故障会阻塞所有激活/拒绝（待检号堆积在 first_check、
+  //    零号入池）。故额外传播此健康信号。
+  //    ⚠️ 缺省 undefined ＝本轮无待检号/所有写操作成功 → 按健康算，不能因「本轮没活干」就误报不健康。
+  writeFailed?: boolean
 }> {
   if (running) return { checked: 0, activated: 0, rejected: 0, skipped: true }
   running = true
@@ -222,6 +230,7 @@ export async function processPending(): Promise<{
     let pooled = 0 // 本轮入池数
     let rejected = 0 // 本轮首检失败·退回数
     let inspectFailed = false // 本轮 inspect 是否整体抛错（仅作健康信号，不改收号语义）
+    let writeFailed = false // 本轮 CPA 写操作（setDisabled/deleteAuthFile/setPriority）是否失败（P6-R2 R6③）
 
     // 首检通过 → 入池：启用（setDisabled false）+ 设高优先级（best-effort）+ transition → pooled，
     //   此刻占用唯一键（§3.2）。限额/额度暂满（decision=retry）不算失败 → 一并入池等恢复
@@ -234,11 +243,13 @@ export async function processPending(): Promise<{
       try {
         await cpa.setDisabled(c.authFileName, false) // 首检通过→启用
       } catch {
+        writeFailed = true // 仅置健康信号；重试语义原样不动
         return // 启用失败：不入池，保持原态下轮重试
       }
       try {
         await cpa.setPriority(c.authFileName, poolPriority) // 入池设高优先级（§2.5，缺省 10、后台可调）
       } catch {
+        writeFailed = true // 仅置健康信号（R6③）
         // best-effort：号已启用能计量，优先级设失败仅损号主上浮、不挡入池（挡入池=号主零收益、更糟）。
         // 号已 pooled 后 processPending 只扫 submitted/first_check → 本轮不重设、无自动补设。残余窄窗：
         // 管理员调高优先级后恰逢瞬时失败 → 该号停在缺省 10（=cpamp 上游默认，失败无害）无自动重试；
@@ -260,6 +271,7 @@ export async function processPending(): Promise<{
       try {
         await cpa.deleteAuthFile(c.authFileName)
       } catch {
+        writeFailed = true // 仅置健康信号（R6③）
         db.transition(c.id, ['submitted'], 'first_check') // 文件还在：保留行下轮重试，不释放唯一键
         return
       }
@@ -322,7 +334,7 @@ export async function processPending(): Promise<{
       await enterPool(c, c.plan)
     }
 
-    return { checked: pending.length, activated: pooled, rejected, inspectFailed }
+    return { checked: pending.length, activated: pooled, rejected, inspectFailed, writeFailed }
   } finally {
     running = false
   }
@@ -358,10 +370,18 @@ export async function checkPooledHealth(
   //    只看 stopped、healthy 保持 true → 心跳照打，而存活巡检实际已卡死。
   //    ⚠️ 节流 skip（now - lastHealthAt < INTERVAL）是正常行为，不能并进健康判据，故单列标志。
   lockHeld?: boolean
+  // 🔴 本轮 CPA 巡检接口（inspect / listAuthFiles）不可用（P6-R2 R6②，codex R5 指出）：
+  //    与 processPending 的 inspectFailed 同根因——CPA 5xx/网络不通时 catch 块吞掉异常、跳过
+  //    本轮所有号（存活巡检纪律：不可观测≠失效，绝不误停），**但不抛**。lastHealthAt 在
+  //    try 前已推进 → 后续 tick 被当正常节流 skip、继续发心跳，而存活巡检实际断了。
+  //    ⚠️ 缺省 undefined ＝本轮无 pooled 号/全是 codex 且 inspect 成功 → 按健康算，不能因
+  //       「本轮没活干」或「部分 provider 成功」就误报不健康。
+  inspectFailed?: boolean
 }> {
   if (healthRunning) return { checked: 0, stopped: 0, skipped: true, lockHeld: true }
   if (!opts.force && now - lastHealthAt < HEALTH_INTERVAL_MS) return { checked: 0, stopped: 0, skipped: true }
   healthRunning = true
+  let inspectFailed = false // 本轮 CPA 巡检接口是否不可用（仅作健康信号，不改存活巡检语义）
   try {
     lastHealthAt = now
     const pooled = db.byVerifyStatus(['pooled'])
@@ -376,6 +396,7 @@ export async function checkPooledHealth(
         probes = await cpa.inspect()
       } catch {
         probes = null // 不可观测：本轮跳过所有 codex，绝不误判死
+        inspectFailed = true // 仅置健康信号；跳过语义原样不动
       }
       if (probes !== null) {
         const byKey = new Map(probes.map((r) => [probeKey(r.provider, r.accountId), r]))
@@ -402,6 +423,7 @@ export async function checkPooledHealth(
         files = await cpa.listAuthFiles()
       } catch {
         files = null // 拉不到号池清单：本轮跳过，绝不误判死
+        inspectFailed = true // 仅置健康信号；跳过语义原样不动
       }
       // ⚠️ 空清单保护（codex xhigh 于 PR #18 指出）：real client 把缺失 files 字段归一为 []，一次 200
       // 空响应（如 {}）会让下面把**整个** claude/grok 池判失效停用（stopped 无恢复路径 + 锁唯一键）。
@@ -423,7 +445,7 @@ export async function checkPooledHealth(
       }
     }
 
-    return { checked: pooled.length, stopped }
+    return { checked: pooled.length, stopped, inspectFailed }
   } finally {
     healthRunning = false
   }

@@ -272,3 +272,66 @@ test('R4②：存活巡检节流 skipped（无 lockHeld）→ healthIsHealthy �
   assert.deepEqual(calls, [HB_URL])
 })
 
+// ============================================================================
+// P6-R2 R6② 存活巡检 CPA 失败未传导到心跳
+// ============================================================================
+
+test('R6②：存活巡检 inspectFailed=true → healthIsHealthy 判不健康 → 不发心跳', async () => {
+  const { healthIsHealthy } = await import('../lib/worker.ts')
+  assert.equal(
+    healthIsHealthy({ inspectFailed: true }),
+    false,
+    '🔴 CPA 巡检接口故障必须判不健康',
+  )
+  const { f, calls } = spyFetch()
+  assert.equal(await pingHeartbeat(healthIsHealthy({ inspectFailed: true }), 1_000_000, f), false)
+  assert.deepEqual(calls, [], 'CPA 巡检接口故障期间绝不能发心跳')
+})
+
+test('R6②：存活巡检无 pooled 号（inspectFailed 缺省 undefined）→ healthIsHealthy 判健康', async () => {
+  const { healthIsHealthy } = await import('../lib/worker.ts')
+  assert.equal(
+    healthIsHealthy({ skipped: false }),
+    true,
+    '🔴 本轮无 pooled 号（inspectFailed 缺省）≠ 不健康，误报会让心跳恒不发',
+  )
+  assert.equal(healthIsHealthy({}), true)
+  const { f, calls } = spyFetch()
+  assert.equal(await pingHeartbeat(healthIsHealthy({}), 1_000_000, f), true)
+  assert.deepEqual(calls, [HB_URL])
+})
+
+// ============================================================================
+// P6-R2 R6③ 回归（codex R5）：CPA 写操作失败未判不健康
+//
+// setDisabled/deleteAuthFile/setPriority 抛错时，enterPool/rejectBack 内部 catch 住、留行待重试，
+// **不抛**（收号纪律不变）。processPending 此前只回传 activated/rejected 计数、无失败信号 →
+// worker 的 healthy 恒 true → 心跳照打，而 CPA 写端点故障会阻塞所有激活/拒绝。
+// 修复：额外传播 writeFailed 健康信号，pendingIsHealthy 判据据此掐心跳。
+// ============================================================================
+
+test('R6③：writeFailed=true → pendingIsHealthy 判不健康 → 不发心跳', async () => {
+  const { pendingIsHealthy } = await import('../lib/worker.ts')
+  assert.equal(
+    pendingIsHealthy({ writeFailed: true }),
+    false,
+    '🔴 CPA 写操作失败必须判不健康',
+  )
+  const { f, calls } = spyFetch()
+  assert.equal(await pingHeartbeat(pendingIsHealthy({ writeFailed: true }), 1_000_000, f), false)
+  assert.deepEqual(calls, [], 'CPA 写操作故障期间绝不能发心跳')
+})
+
+test('R6③：首检无待检号（writeFailed 缺省 undefined）→ pendingIsHealthy 判健康', async () => {
+  const { pendingIsHealthy } = await import('../lib/worker.ts')
+  assert.equal(
+    pendingIsHealthy({ skipped: false }),
+    true,
+    '🔴 本轮无待检号（writeFailed 缺省）≠ 不健康，误报会让心跳恒不发',
+  )
+  assert.equal(pendingIsHealthy({}), true)
+  const { f, calls } = spyFetch()
+  assert.equal(await pingHeartbeat(pendingIsHealthy({}), 1_000_000, f), true)
+  assert.deepEqual(calls, [HB_URL])
+})
+

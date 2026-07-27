@@ -289,15 +289,18 @@ test('建议5：BACKUP_DIR 覆盖到非默认位置时，pre-restore.db 真落�
 })
 
 // ============================================================================
-// P6-R2 复审三轮第 1 条回归：DB_PATH 覆盖 fail-closed 守卫
+// P6-R2 复审三轮第 1 条 + R6① 回归：DB_PATH 覆盖 fail-closed 守卫
 //
 // backupPaths 尊重 DB_PATH，但 restore.sh 此前硬编码 `DB="$DATA_DIR/app.db"`，在 DB_PATH
 // 覆盖时要么恢复到错误位置、要么 realpath 失败崩。解析 DB_PATH 的通用逻辑需要处理符号链接/相对
 // 路径/cwd 不定/多级 ../，脚本层做不到以 Node 同样逻辑归一 → fail-closed 简单守卫：检测到
 // DB_PATH≠默认值 → 拒绝运行 + 清晰报错。
+//
+// R6① 增强（codex R5）：宿主侧 DB_PATH 只能看 export 的值，漏了「容器内 .env/compose 配置、
+// 宿主未 export」的正常运维场景。增强：从运行中容器读实际生效值，两侧任一非默认就拒绝。
 // ============================================================================
 
-test('复审三轮1：DB_PATH 覆盖且≠默认值 → fail-closed 拒绝运行', () => {
+test('复审三轮1：DB_PATH 覆盖且≠默认值（宿主侧）→ fail-closed 拒绝运行', () => {
   const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'restore-dbpath-'))
   const dataDir = path.join(tmpRoot, 'data')
   const backupsDir = path.join(dataDir, 'backups')
@@ -320,13 +323,63 @@ test('复审三轮1：DB_PATH 覆盖且≠默认值 → fail-closed 拒绝运行
       },
       encoding: 'utf8',
     })
-    assert.equal(r.status, 2, '🔴 检测到非默认 DB_PATH 必须以 exit 2 拒绝')
+    assert.equal(r.status, 2, '🔴 检测到非默认 DB_PATH（宿主侧）必须以 exit 2 拒绝')
     assert.match(r.stderr, /不支持非默认 DB_PATH/, '🔴 必须清晰说明原因')
     assert.match(r.stderr, /不可忽略本错误/, '🔴 必须警告强行执行后果')
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true })
   }
 })
+
+test('R6①：容器内 DB_PATH≠默认值（宿主未 export）→ fail-closed 拒绝运行', () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'restore-container-dbpath-'))
+  const dataDir = path.join(tmpRoot, 'data')
+  const backupsDir = path.join(dataDir, 'backups')
+  fs.mkdirSync(backupsDir, { recursive: true })
+  const snap = path.join(backupsDir, 'backup-2026-01-01T12-00-00.000Z.db')
+  fs.writeFileSync(snap, '')
+  const logFile = path.join(tmpRoot, 'stub.log')
+  fs.writeFileSync(logFile, '')
+
+  const binDir = path.join(tmpRoot, 'bin')
+  fs.mkdirSync(binDir)
+  // 桩 docker compose：ps 报容器 Up，exec printenv DB_PATH 返回非默认值
+  const dockerStub = path.join(binDir, 'docker')
+  fs.writeFileSync(
+    dockerStub,
+    `#!/bin/sh
+if [ "$1" = "compose" ] && [ "$2" = "ps" ]; then
+  echo "NAME   IMAGE   STATUS"
+  echo "app    img     Up"
+elif [ "$1" = "compose" ] && [ "$2" = "exec" ] && [ "$5" = "printenv" ]; then
+  echo "/custom/container.db"
+fi
+exit 0
+`,
+    { mode: 0o755 },
+  )
+
+  try {
+    const r = spawnSync('sh', [RESTORE_SH, 'backup-2026-01-01T12-00-00.000Z.db'], {
+      cwd: REPO,
+      env: {
+        ...process.env,
+        PATH: `${binDir}:${process.env.PATH}`,
+        SUDO: '',
+        DATA_DIR: dataDir,
+        BACKUP_DIR: backupsDir,
+        // 🔴 宿主侧 DB_PATH 未 export（即 R3① 守卫看不见），但容器内有非默认值
+      },
+      encoding: 'utf8',
+    })
+    assert.equal(r.status, 2, '🔴 检测到容器内非默认 DB_PATH 必须以 exit 2 拒绝')
+    assert.match(r.stderr, /容器内检测到 DB_PATH=/, '🔴 必须说明来源（容器侧）')
+    assert.match(r.stderr, /不可忽略本错误/, '🔴 必须警告强行执行后果')
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true })
+  }
+})
+
 
 test('复审三轮1：DB_PATH 未设置或=默认值 → 正常通过', () => {
   const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'restore-dbpath-ok-'))

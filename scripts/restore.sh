@@ -27,7 +27,7 @@ APP_URL="${APP_URL:-http://127.0.0.1:3000}"
 MARKER="$DATA_DIR/.upgrade-in-progress"
 DB="$DATA_DIR/app.db"
 
-# 🔴 P6-R2 复审三轮第 1 条：DB_PATH 覆盖 fail-closed 守卫（与 lib/worker.ts backupPaths() 对齐）
+# 🔴 P6-R2 复审三轮第 1 条 + R6①：DB_PATH 覆盖 fail-closed 守卫（与 lib/worker.ts backupPaths() 对齐）
 #
 # backupPaths 尊重 DB_PATH（默认 `data/app.db`）——即备份的是**用户实际指定的库**。但 restore.sh
 # 此前**硬编码** `DB="$DATA_DIR/app.db"`，在 DB_PATH≠默认值时：① 运行会静默恢复到错误位置（宿主
@@ -39,9 +39,18 @@ DB="$DATA_DIR/app.db"
 #    （backupDb 用的是 `db.ts` 里已 open 的连接，应用层传给它的 dbPath 早已是 DatabaseSync 吃下去的
 #    **whatever works**，Node 处理了所有复杂形式）。脚本层**做不到**以同样逻辑归一，且即便写出来也是
 #    一堆未经测试的 corner-case 陷阱。
-# 🔴 Fail-closed 守卫：检测到 DB_PATH≠默认值 → 拒绝运行 + 清晰报错，引导操作员显式用回默认或手动处理。
+#
+# 🔴 Fail-closed 守卫（R6① 增强）：除了检测已 export 的 DB_PATH，还要从**运行中容器读实际生效值**
+#    （codex R5 指出：DB_PATH 仅在 .env 或 Compose 配置、宿主未 export 时，R3① 守卫会被跳过）。
+#    容器未运行时只能看宿主环境变量；容器运行时两边都查，任一侧≠默认值就拒绝。
+CONTAINER_DB_PATH=""
+if docker compose ps app | grep -q "Up"; then
+  # 容器在运行：读容器内的 DB_PATH 实际生效值（可能来自 .env / compose environment）
+  CONTAINER_DB_PATH=$(docker compose exec -T app printenv DB_PATH 2>/dev/null || echo "")
+fi
+
 if [ -n "${DB_PATH:-}" ] && [ "$DB_PATH" != "data/app.db" ]; then
-  echo "❌ restore.sh 不支持非默认 DB_PATH（检测到 DB_PATH='$DB_PATH'）。" >&2
+  echo "❌ restore.sh 不支持非默认 DB_PATH（宿主侧检测到 DB_PATH='$DB_PATH'）。" >&2
   echo "" >&2
   echo "本脚本硬编码假设库位于 data/app.db（与 docker-compose.yml / Dockerfile 默认一致）。" >&2
   echo "若运维环境已用 DB_PATH 覆盖库位置，请采用以下方案之一：" >&2
@@ -49,6 +58,20 @@ if [ -n "${DB_PATH:-}" ] && [ "$DB_PATH" != "data/app.db" ]; then
   echo "  2. 手动恢复：直接 cp 快照文件到实际库路径，验证后重启容器。" >&2
   echo "" >&2
   echo "🔴 不可忽略本错误：强行执行会把快照恢复到错误位置，导致数据丢失。" >&2
+  exit 2
+fi
+
+if [ -n "$CONTAINER_DB_PATH" ] && [ "$CONTAINER_DB_PATH" != "data/app.db" ]; then
+  echo "❌ restore.sh 不支持非默认 DB_PATH（容器内检测到 DB_PATH='$CONTAINER_DB_PATH'）。" >&2
+  echo "" >&2
+  echo "运行中的 app 容器配置了非默认数据库路径（可能来自 .env 或 docker-compose.yml 的 environment）。" >&2
+  echo "本脚本硬编码假设库位于 data/app.db，继续执行会把快照恢复到错误位置。" >&2
+  echo "" >&2
+  echo "请采用以下方案之一：" >&2
+  echo "  1. 停止容器，清空容器内 DB_PATH 配置，重新部署后执行本脚本；或" >&2
+  echo "  2. 手动恢复：直接 cp 快照文件到容器实际库路径（'$CONTAINER_DB_PATH'），验证后重启。" >&2
+  echo "" >&2
+  echo "🔴 不可忽略本错误：强行执行会导致数据丢失。" >&2
   exit 2
 fi
 

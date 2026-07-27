@@ -1,5 +1,6 @@
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
+import { execSync } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -186,4 +187,108 @@ test('命名契约：backupDb 真实产出的文件名能被 latestBackupDay 解
     today.getDate(),
   ).padStart(2, '0')}`
   assert.equal(latestBackupDay(backups), expect)
+})
+
+// ============================================================================
+// R6-⑤（codex R5）：备份缓存日期不复查磁盘
+//
+// runDailyBackup 首次成功后缓存 lastCheckedDay 整天。若今天备份被删 / 挂载点被换 →
+// 此快速路径不 readdir → 不创建替补、不记日志，近一整天无快照。修复：1 小时后重验盘。
+// ============================================================================
+
+test('R6⑤：首轮备份后立刻再调 → 缓存命中 → 不重复备份', async () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'backup-cache-'))
+  const dbPath = path.join(tmpRoot, 'app.db')
+  const dir = path.join(tmpRoot, 'backups')
+  fs.mkdirSync(dir, { recursive: true })
+  fs.writeFileSync(dbPath, '')
+  execSync(`sqlite3 "${dbPath}" "CREATE TABLE t(x); INSERT INTO t VALUES(1)"`, { stdio: 'ignore' })
+  const { runDailyBackup, __resetBackupDayCache } = await import('../lib/worker.ts')
+  __resetBackupDayCache()
+  process.env.DB_PATH = dbPath
+  process.env.BACKUP_DIR = dir
+  process.env.BACKUP_KEEP = '7'
+  try {
+    const now = new Date('2026-07-27T12:00:00Z')
+    const first = runDailyBackup(now)
+    assert.strictEqual(first, true, '首轮应该备份')
+    const files1 = fs.readdirSync(dir).filter((f) => f.startsWith('backup-'))
+    assert.strictEqual(files1.length, 1)
+    // 立刻再调（同一毫秒）→ 缓存命中
+    const second = runDailyBackup(now)
+    assert.strictEqual(second, false, '缓存命中应该跳过')
+    const files2 = fs.readdirSync(dir).filter((f) => f.startsWith('backup-'))
+    assert.strictEqual(files2.length, 1, '不应产生第二份')
+  } finally {
+    delete process.env.DB_PATH
+    delete process.env.BACKUP_DIR
+    delete process.env.BACKUP_KEEP
+    fs.rmSync(tmpRoot, { recursive: true, force: true })
+  }
+})
+
+test('R6⑤：首轮备份后 < 1 小时 → 缓存仍有效 → 不重验盘', async () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'backup-reverify-'))
+  const dbPath = path.join(tmpRoot, 'app.db')
+  const dir = path.join(tmpRoot, 'backups')
+  fs.mkdirSync(dir, { recursive: true })
+  fs.writeFileSync(dbPath, '')
+  execSync(`sqlite3 "${dbPath}" "CREATE TABLE t(x); INSERT INTO t VALUES(1)"`, { stdio: 'ignore' })
+  const { runDailyBackup, __resetBackupDayCache } = await import('../lib/worker.ts')
+  __resetBackupDayCache()
+  process.env.DB_PATH = dbPath
+  process.env.BACKUP_DIR = dir
+  process.env.BACKUP_KEEP = '7'
+  try {
+    const t0 = new Date('2026-07-27T12:00:00Z')
+    runDailyBackup(t0)
+    const files1 = fs.readdirSync(dir).filter((f) => f.startsWith('backup-'))
+    assert.strictEqual(files1.length, 1)
+    // 外部删除今天的备份（模拟挂载点被换 / 误删）
+    fs.rmSync(path.join(dir, files1[0]!))
+    // 59 分钟后再调 → 缓存窗内，不重验盘 → 不创建替补
+    const t1 = new Date(t0.getTime() + 59 * 60_000)
+    const second = runDailyBackup(t1)
+    assert.strictEqual(second, false, '缓存窗内应跳过')
+    const files2 = fs.readdirSync(dir).filter((f) => f.startsWith('backup-'))
+    assert.strictEqual(files2.length, 0, '不应创建替补')
+  } finally {
+    delete process.env.DB_PATH
+    delete process.env.BACKUP_DIR
+    delete process.env.BACKUP_KEEP
+    fs.rmSync(tmpRoot, { recursive: true, force: true })
+  }
+})
+
+test('R6⑤：首轮备份后 ≥ 1 小时 → 复查磁盘 → 发现今天备份被删 → 创建替补', async () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'backup-replacement-'))
+  const dbPath = path.join(tmpRoot, 'app.db')
+  const dir = path.join(tmpRoot, 'backups')
+  fs.mkdirSync(dir, { recursive: true })
+  fs.writeFileSync(dbPath, '')
+  execSync(`sqlite3 "${dbPath}" "CREATE TABLE t(x); INSERT INTO t VALUES(1)"`, { stdio: 'ignore' })
+  const { runDailyBackup, __resetBackupDayCache } = await import('../lib/worker.ts')
+  __resetBackupDayCache()
+  process.env.DB_PATH = dbPath
+  process.env.BACKUP_DIR = dir
+  process.env.BACKUP_KEEP = '7'
+  try {
+    const t0 = new Date('2026-07-27T12:00:00Z')
+    runDailyBackup(t0)
+    const files1 = fs.readdirSync(dir).filter((f) => f.startsWith('backup-'))
+    assert.strictEqual(files1.length, 1)
+    // 外部删除今天的备份
+    fs.rmSync(path.join(dir, files1[0]!))
+    // 1 小时后再调 → 超过复查窗 → 重验盘 → 发现今天无备份 → 创建替补
+    const t1 = new Date(t0.getTime() + 3600_000)
+    const second = runDailyBackup(t1)
+    assert.strictEqual(second, true, '应创建替补备份')
+    const files2 = fs.readdirSync(dir).filter((f) => f.startsWith('backup-'))
+    assert.strictEqual(files2.length, 1, '应有一份替补')
+  } finally {
+    delete process.env.DB_PATH
+    delete process.env.BACKUP_DIR
+    delete process.env.BACKUP_KEEP
+    fs.rmSync(tmpRoot, { recursive: true, force: true })
+  }
 })

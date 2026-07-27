@@ -10,6 +10,6 @@ import { checkReady } from '@/lib/ready'
 export const dynamic = 'force-dynamic' // 防静态化：每次请求都真实命中进程
 
 export async function GET() {
-  const ok = checkReady()
+  const ok = await checkReady()
   return NextResponse.json({ ok }, { status: ok ? 200 : 503 })
 }
