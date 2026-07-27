@@ -176,7 +176,7 @@ export function startWorker() {
       //    只有 running 锁那一个代表「上一轮卡在某个 await 没回来」。另两个（日切 grace 窗 / 今天已结过）
       //    是正常节流，实测占 99.99% 的轮次——并进健康判据＝心跳一天最多 1 次、恒定误报。详见 settle.ts
       //    返回类型上的说明。
-      if (s.lockHeld) {
+      if (!settleIsHealthy(s)) {
         healthy = false
         console.warn('[worker] 结算被上一轮的锁挡住（可能卡死），本轮不发心跳')
       }

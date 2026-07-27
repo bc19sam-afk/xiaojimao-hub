@@ -27,6 +27,31 @@ APP_URL="${APP_URL:-http://127.0.0.1:3000}"
 MARKER="$DATA_DIR/.upgrade-in-progress"
 DB="$DATA_DIR/app.db"
 
+# 🔴 P6-R2 复审三轮第 1 条：DB_PATH 覆盖 fail-closed 守卫（与 lib/worker.ts backupPaths() 对齐）
+#
+# backupPaths 尊重 DB_PATH（默认 `data/app.db`）——即备份的是**用户实际指定的库**。但 restore.sh
+# 此前**硬编码** `DB="$DATA_DIR/app.db"`，在 DB_PATH≠默认值时：① 运行会静默恢复到错误位置（宿主
+# 实际库不在 `data/app.db`，脚本却往那里写）；② 下面的路径归一 `realpath` 拿着错误路径去算，若恰好
+# `data/app.db` 不存在 → `realpath` 报错脚本崩；③ 若 `data/app.db` 存在且**不同于实际库**、归一
+# 通过，那恢复快照后重启容器会启动一个**全新**空库（DB_PATH 指向的那个位置没被改）＝静默数据丢失。
+#
+# 🔴 **不做路径解析大工程**：解析 DB_PATH 要处理符号链接、相对路径、cwd 不定、可能不存在、多级 ../ 等
+#    （backupDb 用的是 `db.ts` 里已 open 的连接，应用层传给它的 dbPath 早已是 DatabaseSync 吃下去的
+#    **whatever works**，Node 处理了所有复杂形式）。脚本层**做不到**以同样逻辑归一，且即便写出来也是
+#    一堆未经测试的 corner-case 陷阱。
+# 🔴 Fail-closed 守卫：检测到 DB_PATH≠默认值 → 拒绝运行 + 清晰报错，引导操作员显式用回默认或手动处理。
+if [ -n "${DB_PATH:-}" ] && [ "$DB_PATH" != "data/app.db" ]; then
+  echo "❌ restore.sh 不支持非默认 DB_PATH（检测到 DB_PATH='$DB_PATH'）。" >&2
+  echo "" >&2
+  echo "本脚本硬编码假设库位于 data/app.db（与 docker-compose.yml / Dockerfile 默认一致）。" >&2
+  echo "若运维环境已用 DB_PATH 覆盖库位置，请采用以下方案之一：" >&2
+  echo "  1. 临时恢复默认：unset DB_PATH 后执行本脚本；或" >&2
+  echo "  2. 手动恢复：直接 cp 快照文件到实际库路径，验证后重启容器。" >&2
+  echo "" >&2
+  echo "🔴 不可忽略本错误：强行执行会把快照恢复到错误位置，导致数据丢失。" >&2
+  exit 2
+fi
+
 # 路径归一：docker -v 只认绝对路径（相对路径会被当成**命名卷**静默建一个空卷，
 # 于是容器看到的是空目录、脚本却以为在读宿主的库）。同时用于判断两个路径是否指向同一文件。
 #

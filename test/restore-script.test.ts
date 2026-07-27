@@ -287,3 +287,84 @@ test('建议5：BACKUP_DIR 覆盖到非默认位置时，pre-restore.db 真落�
   )
   assert.equal(readMarker(path.join(backupsDir, 'pre-restore.db')), 'CURRENT')
 })
+
+// ============================================================================
+// P6-R2 复审三轮第 1 条回归：DB_PATH 覆盖 fail-closed 守卫
+//
+// backupPaths 尊重 DB_PATH，但 restore.sh 此前硬编码 `DB="$DATA_DIR/app.db"`，在 DB_PATH
+// 覆盖时要么恢复到错误位置、要么 realpath 失败崩。解析 DB_PATH 的通用逻辑需要处理符号链接/相对
+// 路径/cwd 不定/多级 ../，脚本层做不到以 Node 同样逻辑归一 → fail-closed 简单守卫：检测到
+// DB_PATH≠默认值 → 拒绝运行 + 清晰报错。
+// ============================================================================
+
+test('复审三轮1：DB_PATH 覆盖且≠默认值 → fail-closed 拒绝运行', () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'restore-dbpath-'))
+  const dataDir = path.join(tmpRoot, 'data')
+  const backupsDir = path.join(dataDir, 'backups')
+  fs.mkdirSync(backupsDir, { recursive: true })
+  const snap = path.join(backupsDir, 'backup-2026-01-01T12-00-00.000Z.db')
+  fs.writeFileSync(snap, '')
+  const logFile = path.join(tmpRoot, 'stub.log')
+  fs.writeFileSync(logFile, '')
+  try {
+    const r = spawnSync('sh', [RESTORE_SH, 'backup-2026-01-01T12-00-00.000Z.db'], {
+      cwd: REPO,
+      env: {
+        ...process.env,
+        PATH: `${binDir}:${process.env.PATH}`,
+        STUB_LOG: logFile,
+        SUDO: '',
+        DATA_DIR: dataDir,
+        BACKUP_DIR: backupsDir,
+        DB_PATH: '/custom/path/to/app.db', // 🔴 覆盖值≠默认
+      },
+      encoding: 'utf8',
+    })
+    assert.equal(r.status, 2, '🔴 检测到非默认 DB_PATH 必须以 exit 2 拒绝')
+    assert.match(r.stderr, /不支持非默认 DB_PATH/, '🔴 必须清晰说明原因')
+    assert.match(r.stderr, /不可忽略本错误/, '🔴 必须警告强行执行后果')
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true })
+  }
+})
+
+test('复审三轮1：DB_PATH 未设置或=默认值 → 正常通过', () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'restore-dbpath-ok-'))
+  const dataDir = path.join(tmpRoot, 'data')
+  const backupsDir = path.join(dataDir, 'backups')
+  fs.mkdirSync(backupsDir, { recursive: true })
+  const snap = path.join(backupsDir, 'backup-2026-01-01T12-00-00.000Z.db')
+  const db = path.join(dataDir, 'app.db')
+  // 🔴 本质是守卫逻辑测试，不是端到端恢复流程测试——后者需要真 docker 容器跑 VACUUM INTO。
+  //    只需证明 DB_PATH=默认值时脚本**没被守卫挡住**；在没有真 docker 的沙箱里，脚本确实会在
+  //    node_in_data 阶段 exit 125（$? 来自 spawnSync 转 docker compose 的退出码），但在那之前
+  //    已经通过了守卫区（没打 ❌ 守卫文案、也不是 exit 2）。故只要「exit≠2 且 stderr 不含守卫
+  //    拒绝文案」即可判断守卫放行。
+  fs.writeFileSync(snap, 'SQLite format 3\x00SNAP')
+  fs.writeFileSync(db, 'SQLite format 3\x00CURRENT')
+  const logFile = path.join(tmpRoot, 'stub.log')
+  fs.writeFileSync(logFile, '')
+  try {
+    // DB_PATH=默认值（等价于未设置）
+    const r1 = spawnSync('sh', [RESTORE_SH, snap], {
+      cwd: REPO,
+      env: {
+        ...process.env,
+        PATH: `${binDir}:${process.env.PATH}`,
+        STUB_LOG: logFile,
+        SUDO: '',
+        DATA_DIR: dataDir,
+        BACKUP_DIR: backupsDir,
+        DB_PATH: 'data/app.db', // 🔴 显式传默认值
+      },
+      encoding: 'utf8',
+    })
+    assert.notEqual(r1.status, 2, '🔴 DB_PATH=默认值不应被守卫拒绝（exit 2）')
+    assert.ok(
+      !r1.stderr.includes('不支持非默认 DB_PATH'),
+      '🔴 DB_PATH=默认值不应触发守卫报错文案',
+    )
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true })
+  }
+})
