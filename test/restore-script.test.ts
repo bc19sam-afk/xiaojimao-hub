@@ -40,6 +40,14 @@ const args = process.argv.slice(2)
 fs.appendFileSync(process.env.STUB_LOG, JSON.stringify(args) + '\\n')
 if (args[0] !== 'compose') process.exit(0)
 if (args[1] === 'stop' || args[1] === 'start') process.exit(0)
+if (args[1] === 'config') {
+  // R4-P1①：restore.sh 改用 docker compose config app 读容器内 DB_PATH。
+  // 桩默认不输出 DB_PATH 行（模拟未设 DB_PATH 的默认配置）；测试可通过 TEST_CONTAINER_DB_PATH
+  // 注入非默认值触发守卫。真 config 会展开 env_file、引号剥离、插值等，桩只输最终形式。
+  const inject = process.env.TEST_CONTAINER_DB_PATH || ''
+  if (inject) console.log(\`      DB_PATH: \${inject}\`)
+  process.exit(0)
+}
 if (args[1] !== 'run') process.exit(0)
 
 const mounts = []
@@ -331,48 +339,63 @@ test('复审三轮1：DB_PATH 覆盖且≠默认值（宿主侧）→ fail-close
   }
 })
 
-test('R6①：容器内 DB_PATH≠默认值（宿主未 export）→ fail-closed 拒绝运行', () => {
+// R6① + R4-P1①：容器配置里的 DB_PATH（宿主未 export）→ fail-closed 拒绝运行。
+//
+// 🔴 R4-P1①（codex R6 指出）：R5 的修复用 `docker compose ps app | grep Up` 判断容器是否运行，
+//    只在运行态才读配置。但**恢复场景的常态恰恰是容器已停/崩溃循环**（库坏了才要恢复），那时守卫
+//    读不到配置 → 静默恢复到 data/app.db，而重启后的 app 仍读它自己那个 DB_PATH 库 → 用户以为
+//    恢复成功（脚本 ✅、/api/ready 甚至也过，因为那个库本身是健康的），实际一个字节都没换。
+//    修复：改用 `docker compose config app` 静态解析，与容器运行态无关。
+//    本测试的桩**不提供 ps/exec**、只应答 config，即「容器根本没在跑」——钉住这个场景。
+test('R4-P1①：容器停机时也须从 compose 配置读出 DB_PATH → fail-closed 拒绝运行', () => {
   const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'restore-container-dbpath-'))
   const dataDir = path.join(tmpRoot, 'data')
   const backupsDir = path.join(dataDir, 'backups')
   fs.mkdirSync(backupsDir, { recursive: true })
   const snap = path.join(backupsDir, 'backup-2026-01-01T12-00-00.000Z.db')
   fs.writeFileSync(snap, '')
-  const logFile = path.join(tmpRoot, 'stub.log')
-  fs.writeFileSync(logFile, '')
 
-  const binDir = path.join(tmpRoot, 'bin')
-  fs.mkdirSync(binDir)
-  // 桩 docker compose：ps 报容器 Up，exec printenv DB_PATH 返回非默认值
-  const dockerStub = path.join(binDir, 'docker')
+  const binDir2 = path.join(tmpRoot, 'bin')
+  fs.mkdirSync(binDir2)
+  // 桩 docker：只应答 `compose config app`，吐真 compose config 那样的 YAML 片段。
+  // 🔴 ps 显式报「没有运行中的容器」、exec 直接失败——证明新守卫不依赖运行态容器。
   fs.writeFileSync(
-    dockerStub,
+    path.join(binDir2, 'docker'),
     `#!/bin/sh
-if [ "$1" = "compose" ] && [ "$2" = "ps" ]; then
-  echo "NAME   IMAGE   STATUS"
-  echo "app    img     Up"
-elif [ "$1" = "compose" ] && [ "$2" = "exec" ] && [ "$5" = "printenv" ]; then
-  echo "/custom/container.db"
+if [ "$1" = "compose" ] && [ "$2" = "config" ]; then
+  echo "services:"
+  echo "  app:"
+  echo "    environment:"
+  echo "      DB_PATH: /custom/container.db"
+  echo "      TZ: Asia/Shanghai"
+  exit 0
 fi
+if [ "$1" = "compose" ] && [ "$2" = "ps" ]; then exit 0; fi   # 无运行中容器
+if [ "$1" = "compose" ] && [ "$2" = "exec" ]; then exit 1; fi # 容器停了，exec 必失败
 exit 0
 `,
     { mode: 0o755 },
   )
 
+  // 🔴 宿主侧 DB_PATH 必须真的**不存在**（即 R3① 守卫看不见），配置里却有非默认值。
+  //    不能写 `DB_PATH: undefined`——spawnSync 会把它字符串化成 "undefined"，那会去触发宿主侧
+  //    那条守卫，测试就变成假绿（拦下了但拦的是另一条）。故显式 delete。
+  const envNoDbPath = {
+    ...process.env,
+    PATH: `${binDir2}:${process.env.PATH}`,
+    SUDO: '',
+    DATA_DIR: dataDir,
+    BACKUP_DIR: backupsDir,
+  }
+  delete envNoDbPath.DB_PATH
+
   try {
     const r = spawnSync('sh', [RESTORE_SH, 'backup-2026-01-01T12-00-00.000Z.db'], {
       cwd: REPO,
-      env: {
-        ...process.env,
-        PATH: `${binDir}:${process.env.PATH}`,
-        SUDO: '',
-        DATA_DIR: dataDir,
-        BACKUP_DIR: backupsDir,
-        // 🔴 宿主侧 DB_PATH 未 export（即 R3① 守卫看不见），但容器内有非默认值
-      },
+      env: envNoDbPath,
       encoding: 'utf8',
     })
-    assert.equal(r.status, 2, '🔴 检测到容器内非默认 DB_PATH 必须以 exit 2 拒绝')
+    assert.equal(r.status, 2, '🔴 检测到容器配置里的非默认 DB_PATH 必须以 exit 2 拒绝')
     assert.match(r.stderr, /容器内检测到 DB_PATH=/, '🔴 必须说明来源（容器侧）')
     assert.match(r.stderr, /不可忽略本错误/, '🔴 必须警告强行执行后果')
   } finally {
@@ -522,3 +545,101 @@ test('R4④：还原用 .tmp 临时文件 + mv 原子就位（非原地覆盖）
 })
 
 
+
+// ============================================================================
+// R4-P1②：abspath() 符号链接归一（codex R4 指出）
+//
+// 必修① 的防御是「SNAPSHOT_ABS == PRE_RESTORE_ABS 时跳过现场留存」，靠 abspath 归一后的字符串
+// 相等。修复前 abspath 只做 `cd $(dirname) && pwd` + basename 拼接、不追踪符号链接：快照若是
+// 指向 pre-restore.db 的**符号链接**（`ln -s pre-restore.db snap.db`），两侧算出 `.../snap.db`
+// 与 `.../pre-restore.db`，不相等 → 守卫放行 → 现场留存把当前 app.db 写进 pre-restore.db 真身
+// → 必修① 修掉的那个「静默丢掉唯一回滚点」原样复发。
+//
+// 修复：`cd -P` 走目录段，basename 段**循环** readlink 到底（32 层上限兜住成环）。
+// 判据统一为 `log 不含 "run"`：守卫命中时整段现场留存被跳过，桩 docker 收不到 run。
+// ============================================================================
+
+// ① 单层相对目标：snap.db -> pre-restore.db
+test('R4-P1②：快照是 pre-restore.db 的符号链接 → 守卫识别为同一文件，先拷副本再还原', () => {
+  const { dataDir, backupsDir } = scene('symlink-1hop', 'CURRENT-BROKEN')
+  makeDb(path.join(backupsDir, 'pre-restore.db'), 'ORIGINAL')
+  const snap = path.join(backupsDir, 'snap.db')
+  fs.symlinkSync('pre-restore.db', snap)
+
+  const r = runRestore(dataDir, backupsDir, snap)
+  assert.equal(r.status, 0, `脚本应成功：\n${r.stdout}\n${r.stderr}`)
+  assert.equal(readMarker(path.join(dataDir, 'app.db')), 'ORIGINAL', '还原内容必须是快照真身')
+  // 🔴 修复前：守卫放行 → 现场留存段用当前 app.db 直接覆盖 pre-restore.db 真身，
+  //    后续 install 读到的是刚覆盖进去的 CURRENT-BROKEN，ORIGINAL 静默丢失。
+  //    修复后：`SNAPSHOT_ABS == PRE_RESTORE_ABS` 守卫命中 → 先 cp 到 .restore-src.db 副本，
+  //    现场留存照常跑（把 CURRENT-BROKEN 写进 pre-restore.db·给下次反悔），但 install 读副本。
+  assert.equal(
+    readMarker(path.join(backupsDir, 'pre-restore.db')),
+    'CURRENT-BROKEN',
+    '🔴 pre-restore.db 应更新为本次还原前的现场（给下一次反悔）',
+  )
+  assert.ok(
+    !fs.existsSync(path.join(backupsDir, '.restore-src.db')),
+    '临时副本应在还原完成后被清理',
+  )
+})
+
+// ② 多层链：mid.db -> snap.db -> pre-restore.db（只解一层会停在 mid.db → 守卫仍失效）
+test('R4-P1②：快照是两层符号链接 → 循环追踪到底，仍能拦下', () => {
+  const { dataDir, backupsDir } = scene('symlink-2hop', 'CURRENT')
+  makeDb(path.join(backupsDir, 'pre-restore.db'), 'ORIGINAL')
+  fs.symlinkSync('pre-restore.db', path.join(backupsDir, 'snap.db'))
+  fs.symlinkSync('snap.db', path.join(backupsDir, 'mid.db'))
+
+  const r = runRestore(dataDir, backupsDir, path.join(backupsDir, 'mid.db'))
+  assert.equal(r.status, 0, `脚本应成功：\n${r.stdout}\n${r.stderr}`)
+  assert.equal(readMarker(path.join(dataDir, 'app.db')), 'ORIGINAL')
+  assert.equal(readMarker(path.join(backupsDir, 'pre-restore.db')), 'CURRENT')
+  assert.ok(!fs.existsSync(path.join(backupsDir, '.restore-src.db')), '临时副本应被清理')
+})
+
+// ③ 符号链接目标是绝对路径（readlink 返回 /... 时走的另一条分支）
+test('R4-P1②：符号链接目标为绝对路径 → 守卫同样识别', () => {
+  const { dataDir, backupsDir } = scene('symlink-abs', 'CURRENT')
+  const preRestore = path.join(backupsDir, 'pre-restore.db')
+  makeDb(preRestore, 'ORIGINAL')
+  const snap = path.join(backupsDir, 'absl.db')
+  fs.symlinkSync(preRestore, snap)
+
+  const r = runRestore(dataDir, backupsDir, snap)
+  assert.equal(r.status, 0, `脚本应成功：\n${r.stdout}\n${r.stderr}`)
+  assert.equal(readMarker(path.join(dataDir, 'app.db')), 'ORIGINAL')
+  assert.equal(readMarker(preRestore), 'CURRENT')
+  assert.ok(!fs.existsSync(path.join(backupsDir, '.restore-src.db')))
+})
+
+// ④ 反向回归：普通快照不能被新逻辑误当成 pre-restore.db 拦下（否则现场留存整段失效）
+test('R4-P1② 回归：普通备份文件仍走现场留存（不误拦）', () => {
+  const { dataDir, backupsDir } = scene('symlink-none', 'CURRENT')
+  const snap = path.join(backupsDir, 'backup-2026-07-27T00-00-00-xyz123.db')
+  makeDb(snap, 'SNAPSHOT')
+
+  const r = runRestore(dataDir, backupsDir, snap)
+  assert.equal(r.status, 0, `脚本应成功：\n${r.stdout}\n${r.stderr}`)
+  assert.equal(readMarker(path.join(dataDir, 'app.db')), 'SNAPSHOT')
+  assert.equal(readMarker(path.join(backupsDir, 'pre-restore.db')), 'CURRENT', '现场应被留存')
+  assert.match(r.log, /"run"/, '🔴 普通快照必须借容器跑 VACUUM INTO 留存现场')
+})
+
+// ⑤ 成环：脚本必须拒绝、不能死循环
+//
+// ⚠️ 实测澄清：成环的链接根本走不到 abspath——`[ -f "$SNAPSHOT" ]` 就已经判否（`-f` 会 stat
+//    最终目标，成环时 stat 返 ELOOP，故不是「常规文件」），脚本在入口校验就以「快照不存在」exit 1。
+//    这本身是正确的 fail-closed，所以本测试钉的是**行为**（exit 1 + 未动库 + 未停 app），
+//    不钉具体文案。abspath 里那 32 层上限因此是够不到的纵深防御（防将来有人挪动/放宽入口校验，
+//    以及 -f 判真但链中段成环的边角），保留但不在此断言其文案。
+test('R4-P1②：符号链接成环 → exit 1 拒绝运行，不死循环', () => {
+  const { dataDir, backupsDir } = scene('symlink-cycle', 'CURRENT')
+  fs.symlinkSync('cyc_b', path.join(backupsDir, 'cyc_a'))
+  fs.symlinkSync('cyc_a', path.join(backupsDir, 'cyc_b'))
+
+  const r = runRestore(dataDir, backupsDir, path.join(backupsDir, 'cyc_a'))
+  assert.equal(r.status, 1, `成环应以 1 退出（且不得挂住）：\n${r.stdout}\n${r.stderr}`)
+  assert.equal(readMarker(path.join(dataDir, 'app.db')), 'CURRENT', '🔴 拦截时不得改动 app.db')
+  assert.doesNotMatch(r.log, /"stop"/, '🔴 应在动手之前就拦下，不该已经停过 app')
+})

@@ -40,14 +40,27 @@ DB="$DATA_DIR/app.db"
 #    **whatever works**，Node 处理了所有复杂形式）。脚本层**做不到**以同样逻辑归一，且即便写出来也是
 #    一堆未经测试的 corner-case 陷阱。
 #
-# 🔴 Fail-closed 守卫（R6① 增强）：除了检测已 export 的 DB_PATH，还要从**运行中容器读实际生效值**
-#    （codex R5 指出：DB_PATH 仅在 .env 或 Compose 配置、宿主未 export 时，R3① 守卫会被跳过）。
-#    容器未运行时只能看宿主环境变量；容器运行时两边都查，任一侧≠默认值就拒绝。
-CONTAINER_DB_PATH=""
-if docker compose ps app | grep -q "Up"; then
-  # 容器在运行：读容器内的 DB_PATH 实际生效值（可能来自 .env / compose environment）
-  CONTAINER_DB_PATH=$(docker compose exec -T app printenv DB_PATH 2>/dev/null || echo "")
-fi
+# 🔴 Fail-closed 守卫（R6① 增强 + R4-P1① 修复）：除了已 export 的 DB_PATH，还要从**容器配置读
+#    实际生效值**（codex R5 指出：DB_PATH 仅在 .env 或 Compose 配置、宿主未 export 时，R3① 守卫
+#    会被跳过；R6 codex 指出：R5 修复用的 `ps | grep Up` 只能检测运行态容器，**容器停机/崩溃
+#    循环——正是恢复场景常态**时无法读取配置，守卫漏洞仍在）。
+#
+#    R4-P1① 修复：改用 `docker compose config app` 静态解析容器配置（展开 env_file、插值
+#    environment 里的 `${TZ:-...}` 等、合并多来源），无论容器运行/停止/根本不存在都能解出 DB_PATH
+#    实际生效值，且不依赖 daemon（纯本地文件解析）—— config 比 exec/ps 稳定、比自己手工解析
+#    .env/.yml 安全（不会踩 YAML 引号/插值/多来源合并的坑）。
+#
+#    ⚠️ 解析失败时（.env 缺失、compose 文件损坏）config 退 1 → $(…) 取空、下面 [ -n ... ] 判否、
+#       CONTAINER_DB_PATH 守卫不拦、**只看宿主那条**。这是安全的：config 失败⊆run/exec 全失败
+#      （实测缺 .env 时 config rc=1、run rc=1、stop rc=0），脚本到 node_with_snapshot / node_in_data
+#       阶段一定挂，不会悄悄跳过守卫并恢复到错误位置。唯一丢失的是「容器停机且 config 解不出时
+#       的错误提示质量」（报 docker run 的通用错而非 DB_PATH 专属提示），可接受。
+CONTAINER_DB_PATH=$(docker compose config app 2>/dev/null \
+  | grep -E '^ +DB_PATH:' \
+  | head -1 \
+  | sed 's/^[^:]*:[[:space:]]*//' \
+  | sed "s/^['\"]//; s/['\"]$//" \
+  || echo "")
 
 if [ -n "${DB_PATH:-}" ] && [ "$DB_PATH" != "data/app.db" ]; then
   echo "❌ restore.sh 不支持非默认 DB_PATH（宿主侧检测到 DB_PATH='$DB_PATH'）。" >&2
@@ -64,11 +77,11 @@ fi
 if [ -n "$CONTAINER_DB_PATH" ] && [ "$CONTAINER_DB_PATH" != "data/app.db" ]; then
   echo "❌ restore.sh 不支持非默认 DB_PATH（容器内检测到 DB_PATH='$CONTAINER_DB_PATH'）。" >&2
   echo "" >&2
-  echo "运行中的 app 容器配置了非默认数据库路径（可能来自 .env 或 docker-compose.yml 的 environment）。" >&2
+  echo "app 容器配置了非默认数据库路径（来自 .env 或 docker-compose.yml 的 environment）。" >&2
   echo "本脚本硬编码假设库位于 data/app.db，继续执行会把快照恢复到错误位置。" >&2
   echo "" >&2
   echo "请采用以下方案之一：" >&2
-  echo "  1. 停止容器，清空容器内 DB_PATH 配置，重新部署后执行本脚本；或" >&2
+  echo "  1. 清空 .env / docker-compose.yml 里的 DB_PATH 配置，重新部署后执行本脚本；或" >&2
   echo "  2. 手动恢复：直接 cp 快照文件到容器实际库路径（'$CONTAINER_DB_PATH'），验证后重启。" >&2
   echo "" >&2
   echo "🔴 不可忽略本错误：强行执行会导致数据丢失。" >&2
@@ -82,14 +95,49 @@ fi
 #    **看着像绝对路径的垃圾**——拿它当 `-v` 源就等于把宿主根目录 `/` 挂进容器。而这不是理论情形：
 #    `data/backups` 按 §2 是 0700 且属主 uid1000，操作账号不是 1000 时 `cd` 必然 Permission denied。
 #    故显式判空并中止。
+# 🔴 R4-P1②：路径归一时解符号链接，否则快照是 pre-restore.db 的符号链接时守卫失效。
+#
+# 必修① 的核心防御是「快照==pre-restore.db 时跳过现场留存（不去覆盖快照本身）」，用 abspath 归一
+# 后的路径相等性判断。修复前 abspath 只做 `cd $(dirname) && pwd` + basename 拼接，碰到符号链接
+# 时不追踪——若快照是指向 pre-restore.db 的**符号链接**（如 `ln -s pre-restore.db snap.db` 后
+# 给脚本传 snap.db），abspath 算出的路径分别是 `.../snap.db` 与 `.../pre-restore.db`，**不相等**，
+# 守卫放行，现场留存段用当前 app.db **覆盖**掉 pre-restore.db 真身 → 二次反悔回滚点静默丢失。
+#
+# R4-P1② 修复：`cd -P` 追踪目录段的符号链接，再对 basename 段**循环** readlink 直到不再是链接。
+# 必须是循环而不是解一层：`snap.db -> mid.db -> pre-restore.db` 这种链只解一层会停在 mid.db，
+# 守卫照样放行。readlink 给相对目标时按其所在目录解析；给绝对目标时直接接着走下一轮。
+# 32 层上限用于兜住成环（`a -> b -> a`）——没有上限就是死循环，脚本挂在这里比误覆盖更糟。
+# 断链/不存在：`-L` 在下一轮为假 → 直接返回已拼好的绝对路径（后续 head -c 15 / quick_check
+# 会拒绝不存在/不可读的文件，不归 abspath 管）。
 abspath() {
-  _d=$(cd -- "$(dirname -- "$1")" 2>/dev/null && pwd) || _d=""
-  if [ -z "$_d" ]; then
-    echo "❌ 无法解析路径（目录不存在或无权进入）：$1" >&2
-    echo "   $DATA_DIR 按 docs §2 是 0700/属主 uid1000；操作账号不是 1000 时请用 sudo 跑本脚本。" >&2
-    exit 1
-  fi
-  printf '%s/%s\n' "$_d" "$(basename -- "$1")"
+  _p="$1"
+  _hops=0
+  while :; do
+    _d=$(cd -P -- "$(dirname -- "$_p")" 2>/dev/null && pwd) || _d=""
+    if [ -z "$_d" ]; then
+      echo "❌ 无法解析路径（目录不存在或无权进入）：$1" >&2
+      echo "   $DATA_DIR 按 docs §2 是 0700/属主 uid1000；操作账号不是 1000 时请用 sudo 跑本脚本。" >&2
+      exit 1
+    fi
+    _p="$_d/$(basename -- "$_p")"
+    # 不是符号链接（含断链指向的不存在路径）→ 已归一到底，收工
+    [ -L "$_p" ] || break
+    _hops=$((_hops + 1))
+    if [ "$_hops" -gt 32 ]; then
+      echo "❌ 符号链接层级过深或成环，拒绝继续：$1" >&2
+      exit 1
+    fi
+    _t=$(readlink -- "$_p" 2>/dev/null) || _t=""
+    if [ -z "$_t" ]; then
+      echo "❌ 无法读取符号链接目标：$_p" >&2
+      exit 1
+    fi
+    case "$_t" in
+      /*) _p="$_t" ;;
+      *) _p="$_d/$_t" ;;
+    esac
+  done
+  printf '%s\n' "$_p"
 }
 
 # 目录版：直接 cd 进目标目录本身。abspath 只验证**父目录**存在，用它解析目录会让
@@ -310,9 +358,13 @@ docker compose start app
 # 校验：先 liveness（进程起来了吗），再 readiness（库能读、schema 版本对得上吗）。
 # readiness 才是「恢复成功」的判据——liveness 通过但 schema 不匹配说明还原错了版本的快照。
 echo "→ 校验 $APP_URL/api/health 与 /api/ready（最多等 60s）"
+# 🔴 单次请求必须有界（R4-P2④，codex R6 指出）：APP_URL 能建连但**永不返回响应**时（进程卡在
+#    某个 await、反代挂起），无超时的 curl 会在一次迭代里无限阻塞——上面承诺的 60s 上限失效，
+#    EXIT trap 也进不去、app 停在停止态。--connect-timeout 3 + --max-time 5 ⇒ 单轮最多 5s，
+#    30 轮 × (≤5s + 2s sleep) 仍以有界时间收敛到下面的排查提示。
 i=0
 while [ "$i" -lt 30 ]; do
-  if curl -fsS -o /dev/null "$APP_URL/api/ready" 2>/dev/null; then
+  if curl -fsS --connect-timeout 3 --max-time 5 -o /dev/null "$APP_URL/api/ready" 2>/dev/null; then
     echo "✅ 恢复完成：/api/ready 通过（库可读 + schema 版本匹配）"
     trap - EXIT  # 清 trap：readiness 通过 = 恢复成功，正常退出不用再 start
     exit 0

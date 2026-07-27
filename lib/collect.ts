@@ -429,6 +429,14 @@ export async function checkPooledHealth(
       // 空响应（如 {}）会让下面把**整个** claude/grok 池判失效停用（stopped 无恢复路径 + 锁唯一键）。
       // 空清单更可能是 cpamp glitch（正巡检的这些号至少该在池里）→ 视为不可观测、本轮跳过、不停用。
       // 真「号池全空」极罕见，宁可漏停也不错停整池。（连续多轮确认缺失可留后续单细化。）
+      // 🔴 R4-P2③（codex R6 指出）：这条空清单分支与上面的 catch **同属「本轮不可观测」**，健康信号
+      //    必须一并置位。此前 inspectFailed 只在 catch 里置 → 200 空响应这条路径上，存活巡检实际
+      //    全跳过、却一路报健康 → dead-man 心跳照打，运维看不见「巡检已瘫」。
+      //    ⚠️ 只在**有 pooled claude/grok 号**时才算异常（本分支已在 otherPooled.length > 0 内）；
+      //       池里压根没这类号时不会走到这里，不会误报。
+      if (files !== null && files.length === 0) {
+        inspectFailed = true // 仅置健康信号；跳过语义原样不动（绝不误停整池）
+      }
       if (files !== null && files.length > 0) {
         // 现存号身份集（provider+accountId）：只认能识别 provider 且有稳定 id 的文件。'\0' 作分隔符
         // （不会出现在 provider/id 里），与 settle.ts 同款按 (provider, accountId) 划界。

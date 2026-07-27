@@ -73,6 +73,8 @@ let shortAccountLabel: typeof import('../lib/db.ts').shortAccountLabel
 let collect: typeof import('../lib/collect.ts')
 let settle: typeof import('../lib/settle.ts')
 let cpa: typeof import('../lib/cpa.ts').cpa
+// worker.ts 值导入同样会拉 db.ts（破隔离），故与上面几个一样走 before() 的动态 import 赋值
+let workerHealthIsHealthy: typeof import('../lib/worker.ts').healthIsHealthy
 let tmpDir: string
 
 function makeContribution(over: Partial<Contribution>): Contribution {
@@ -152,6 +154,8 @@ before(async () => {
   collect = await import('../lib/collect.ts')
   settle = await import('../lib/settle.ts')
   ;({ cpa } = await import('../lib/cpa.ts'))
+  // R4-P2③ 新测试需要 healthIsHealthy，也必须动态 import（顶部值导入会拉 db.ts 破隔离）
+  ;({ healthIsHealthy: workerHealthIsHealthy } = await import('../lib/worker.ts'))
 })
 
 after(() => {
@@ -390,6 +394,30 @@ test('空清单保护：listAuthFiles 空 → pooled claude/grok 保持（不误
   db.insertUnique(makeContribution({ id, provider: 'grok', accountId: 'h-empty-acc', plan: 'super', linuxdoId: 8250 }))
   await withCpa({ files: [] }, () => collect.checkPooledHealth(undefined, { force: true }))
   assert.equal(statusOf(id), 'pooled') // 空清单视为不可观测、跳过，绝不停用
+})
+
+// R4-P2③（codex R6 指出）：空清单的**跳过语义**上面那条已钉住，但健康信号此前漏置——
+// listAuthFiles 返回 200 + [] 时存活巡检实际全跳过，checkPooledHealth 却不置 inspectFailed，
+// healthIsHealthy 于是判健康、dead-man 心跳照打 → 「巡检已瘫」在运维侧完全不可见（静默失明）。
+// 修复只动健康信号，跳过语义原样保留（上面那条测试同时锁住「不误停整池」不回退）。
+test('R4-P2③：listAuthFiles 空清单 → inspectFailed=true（心跳须察觉巡检不可观测）', async () => {
+  const id = 'h-empty-signal'
+  db.insertUnique(makeContribution({ id, provider: 'grok', accountId: 'h-empty-sig-acc', plan: 'super', linuxdoId: 8251 }))
+  const r = await withCpa({ files: [] }, () => collect.checkPooledHealth(undefined, { force: true }))
+  assert.equal(r.inspectFailed, true, '🔴 空清单＝本轮不可观测，必须置健康信号')
+  assert.equal(workerHealthIsHealthy(r), false, '🔴 消费侧须据此判不健康 → 本轮不发心跳')
+  assert.equal(statusOf(id), 'pooled', '🔴 跳过语义不得回退：仍然绝不误停整池')
+})
+
+// 反向：非空清单（巡检正常在干活）不得置信号，否则心跳恒发不出去
+test('R4-P2③ 反向：非空清单 → inspectFailed 不为真（不误报不健康）', async () => {
+  const id = 'h-nonempty-signal'
+  db.insertUnique(makeContribution({ id, provider: 'grok', accountId: 'h-ne-sig-acc', plan: 'super', linuxdoId: 8252 }))
+  const r = await withCpa({ files: [authFile('grok', 'h-ne-sig-acc')] }, () =>
+    collect.checkPooledHealth(undefined, { force: true }),
+  )
+  assert.ok(!r.inspectFailed, '🔴 巡检正常时置信号会让心跳永远发不出去')
+  assert.equal(workerHealthIsHealthy(r), true)
 })
 
 // 存活巡检节流：默认（非 force）同窗口内第二次调用 skip，不重复全量 inspect（防 8s tick 满负荷）
