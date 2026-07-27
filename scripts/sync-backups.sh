@@ -32,7 +32,10 @@ fi
 
 command -v rsync >/dev/null 2>&1 || { echo "❌ 未找到 rsync，请先安装" >&2; exit 1; }
 
-# -a 保权限属主时间戳（备份文件是 0600，别在传输中放宽）；-z 压缩；--partial 断点续传
+# -a 保权限属主时间戳（备份文件是 0600，别在传输中放宽）；-z 压缩；
+# --partial-dir=.rsync-partial：断点续传时，未完成文件落在隐藏子目录 .rsync-partial/ 下，
+# 传输完成后才原子移到最终名 backup-*.db（P6-R2 R4③）。旧行为 --partial 会把半截文件直接留在
+# 最终名下 → rsync 中断时异机目录里躺着「看起来像备份的残缺库」→ 恢复时误选风险。
 # 结尾斜杠：同步**目录内容**到远端目录下。含 preupgrade.db / pre-restore.db（钉住的回滚点，一并异机保存）。
 #
 # --exclude '.tmp-*'：`lib/backup.ts` 的原子发布会先写 `.tmp-backup-*.db`，正常路径下写完即 rename，
@@ -41,5 +44,5 @@ command -v rsync >/dev/null 2>&1 || { echo "❌ 未找到 rsync，请先安装" 
 # 但异机目录里躺着「看起来像备份的残缺库」本身就是恢复时的误选风险，故排除。
 # 也顺带避开「正在写的那一份」——同步与备份撞车时传半截文件毫无意义。
 echo "→ 同步 $BACKUP_DIR/ → $REMOTE"
-rsync -az --partial --exclude '.tmp-*' "$BACKUP_DIR/" "$REMOTE"
+rsync -az --partial-dir=.rsync-partial --exclude '.tmp-*' "$BACKUP_DIR/" "$REMOTE"
 echo "✅ 同步完成（未启用 --delete：远端只增不减，清理策略见 docs/deploy.md §5.3）"

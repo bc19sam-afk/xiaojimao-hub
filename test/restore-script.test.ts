@@ -368,3 +368,104 @@ test('复审三轮1：DB_PATH 未设置或=默认值 → 正常通过', () => {
     fs.rmSync(tmpRoot, { recursive: true, force: true })
   }
 })
+
+test('R3-新② trap 陷阱：install 失败后 app 仍被重启', () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'xjm-restore-trap-'))
+  try {
+    const dataDir = path.join(tmpRoot, 'data')
+    const backupsDir = path.join(dataDir, 'backups')
+    fs.mkdirSync(backupsDir, { recursive: true, mode: 0o700 })
+    const dbPath = path.join(dataDir, 'app.db')
+    const snapshotPath = path.join(backupsDir, 'backup-2026-01-01T00-00-00-abcdef.db')
+    const logFile = path.join(tmpRoot, 'stub.log')
+
+    // 造一个小库作快照
+    const snap = new DatabaseSync(snapshotPath)
+    snap.exec('CREATE TABLE t(x); INSERT INTO t VALUES (42)')
+    snap.close()
+
+    // 造当前库
+    const live = new DatabaseSync(dbPath)
+    live.exec('CREATE TABLE t(x); INSERT INTO t VALUES (99)')
+    live.close()
+
+    // 🔴 把 DATA_DIR 改成只读，install 必然失败（Permission denied）
+    fs.chmodSync(dataDir, 0o500)
+
+    const r = spawnSync(RESTORE_SH, [snapshotPath], {
+      cwd: REPO,
+      env: {
+        ...process.env,
+        PATH: `${binDir}:${process.env.PATH}`,
+        STUB_LOG: logFile,
+        SUDO: '',
+        DATA_DIR: dataDir,
+        BACKUP_DIR: backupsDir,
+        APP_URL: 'http://stub', // curl 桩恒成功
+      },
+      encoding: 'utf8',
+    })
+
+    // install 因 Permission denied 失败 → 脚本非零退出
+    assert.notEqual(r.status, 0, 'install 失败应非零退出')
+
+    // trap 触发：即便失败，docker compose start app 也被调用过
+    const log = fs.readFileSync(logFile, 'utf8')
+    const calls = log.trim().split('\n').filter(Boolean).map(JSON.parse)
+    const startCalls = calls.filter((c) => c[0] === 'compose' && c[1] === 'start')
+    assert.ok(startCalls.length >= 1, `trap 应调用 start app（实际 start 调用 ${startCalls.length} 次）`)
+  } finally {
+    // 恢复权限再删
+    try { fs.chmodSync(path.join(tmpRoot, 'data'), 0o700) } catch {}
+    fs.rmSync(tmpRoot, { recursive: true, force: true })
+  }
+})
+
+test('R4④：还原用 .tmp 临时文件 + mv 原子就位（非原地覆盖）', () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'xjm-restore-atomic-'))
+  try {
+    const dataDir = path.join(tmpRoot, 'data')
+    const backupsDir = path.join(dataDir, 'backups')
+    fs.mkdirSync(backupsDir, { recursive: true, mode: 0o700 })
+    const dbPath = path.join(dataDir, 'app.db')
+    const snapshotPath = path.join(backupsDir, 'backup-2026-01-01T00-00-00-abcdef.db')
+    const logFile = path.join(tmpRoot, 'stub.log')
+
+    // 造快照
+    const snap = new DatabaseSync(snapshotPath)
+    snap.exec('CREATE TABLE t(x); INSERT INTO t VALUES (42)')
+    snap.close()
+
+    // 造当前库
+    const live = new DatabaseSync(dbPath)
+    live.exec('CREATE TABLE t(x); INSERT INTO t VALUES (99)')
+    live.close()
+
+    const r = spawnSync(RESTORE_SH, [snapshotPath], {
+      cwd: REPO,
+      env: {
+        ...process.env,
+        PATH: `${binDir}:${process.env.PATH}`,
+        STUB_LOG: logFile,
+        SUDO: '',
+        DATA_DIR: dataDir,
+        BACKUP_DIR: backupsDir,
+        APP_URL: 'http://stub',
+      },
+      encoding: 'utf8',
+    })
+
+    assert.equal(r.status, 0, `脚本应成功退出（stderr: ${r.stderr})`)
+    // 验证不存在 .tmp 残留（成功时应已 mv 就位并清理）
+    assert.ok(!fs.existsSync(path.join(dataDir, 'app.db.tmp')), '成功后不应留 .tmp 残留')
+    // 验证还原内容正确
+    const restored = new DatabaseSync(dbPath)
+    const val = restored.prepare('SELECT x FROM t').get() as { x: number }
+    restored.close()
+    assert.equal(val.x, 42, '还原内容应是快照的值（42），不是原库的值（99）')
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true })
+  }
+})
+
+

@@ -118,6 +118,16 @@ export function pendingIsHealthy(r: { skipped?: boolean; inspectFailed?: boolean
   return !r.skipped && !r.inspectFailed
 }
 
+// 存活巡检结果 → 本轮是否算「存活巡检链路正常」。抽成函数的理由同 pendingIsHealthy / settleIsHealthy：
+// tick 是闭包，不抽出来就没有入口能断言这条判据。
+// 🔴 只看 lockHeld，**不看 skipped**（P6-R2 R4②，同 settleDailyUsage 的 lockHeld 根因）：
+//    checkPooledHealth 的 skipped 有两个来源，只有 healthRunning 锁那一个代表「上一轮卡在某个
+//    await 没回来」（cpa.inspect / listAuthFiles 的无超时 fetch）；另一个（5 分钟节流）是正常行为，
+//    实测占 97% 的轮次——并进健康判据＝心跳几乎不发、恒定误报。
+export function healthIsHealthy(h: { skipped?: boolean; lockHeld?: boolean }): boolean {
+  return !h.lockHeld
+}
+
 // 结算结果 → 本轮是否算「结算链路正常」。抽成函数的理由同 pendingIsHealthy：tick 是闭包，不抽出来
 // 就没有入口能断言这条判据。
 // 🔴 只看 lockHeld，**不看 skipped**（P6-R2 复审三轮第 3 条）：settleDailyUsage 的 skipped 有三个
@@ -161,6 +171,13 @@ export function startWorker() {
     // 与首检共用同一 tick 周期、各自 running 锁防叠跑。放结算前：本轮先停失效号，再结历史日欠薪。
     try {
       const h = await checkPooledHealth()
+      // 🔴 只认 lockHeld，不认 skipped（P6-R2 R4②）：checkPooledHealth 的 skipped 有两个来源，
+      //    只有 healthRunning 锁那一个代表「上一轮卡在某个 await 没回来」。另一个（5 分钟节流）
+      //    是正常节流，实测占 97% 的轮次——并进健康判据＝心跳几乎不发、恒定误报。
+      if (!healthIsHealthy(h)) {
+        healthy = false
+        console.warn('[worker] 存活巡检被上一轮的锁挡住（可能卡死），本轮不发心跳')
+      }
       if (h.stopped) {
         console.log(`[worker] 存活巡检：停用 ${h.stopped} 个失效号`)
       }

@@ -205,6 +205,12 @@ node_with_snapshot "$SNAPSHOT_ABS" '
 echo "→ 停 app（释放对 app.db 的写锁）"
 docker compose stop app
 
+# 🔴 退出陷阱（P6-R2 R3 总指挥发现）：stop 后任一步骤失败（VACUUM/install/start/readiness 超时）
+#    时 set -e 直接退出 → 服务保持停止状态。库虽保住（fail-closed）但 app 没起来 → 不必要停机。
+#    trap 兜底：无论脚本怎么退出（正常/报错/kill），EXIT 时都试图重启 app，确保「最坏情况下服务
+#    也能恢复到还原前的运行态」——readiness 可能不通过（换错版本快照），但至少进程活着、能排查。
+trap 'docker compose start app >/dev/null 2>&1 || true' EXIT
+
 # 现场先存一份：单文件覆盖式，仿 preupgrade.db 的钉住模式——文件名不匹配 ^backup-.*\.db$，
 # 故不进 BACKUP_KEEP 轮转集，也不会被 latestBackupDay 误当成「今天的日常备份」。
 PRE_RESTORE="$BACKUP_DIR/pre-restore.db"
@@ -261,11 +267,13 @@ else
   echo "→ 当前无 ${DB}，跳过现场留存"
 fi
 
-# 一条 install 完成 覆盖还原 + 属主 uid1000 + 权限 600（不用 cp：覆盖会保留目标原 mode，
-# 老部署那份 0644 收不紧、属主也不还原）
+# 🔴 原子还原（P6-R2 R4④）：先 install 到临时名，成功后 mv 原子就位——仿 pre-restore.db.tmp 纪律。
+#    原行为 `install $RESTORE_SRC $DB` 是原地覆盖：中途断电/磁盘满会留下截断的 app.db，需手动恢复。
+#    同目录 mv 是原子操作（单 inode 改名），失败不会破坏目标、成功则瞬间完成。
 echo "→ 还原快照为 ${DB}（0600 / uid1000）"
 # shellcheck disable=SC2086
-$SUDO install $OWN -m 600 "$RESTORE_SRC" "$DB"
+$SUDO install $OWN -m 600 "$RESTORE_SRC" "$DB.tmp"
+$SUDO mv -- "$DB.tmp" "$DB"  # 就位（同目录 mv 原子）
 [ "$RESTORE_SRC" = "$SNAPSHOT" ] || $SUDO rm -f "$RESTORE_SRC"   # 清掉临时副本
 
 # -wal/-shm 是旧库的 WAL 副本，换整库快照时必须一并删除；
@@ -283,6 +291,7 @@ i=0
 while [ "$i" -lt 30 ]; do
   if curl -fsS -o /dev/null "$APP_URL/api/ready" 2>/dev/null; then
     echo "✅ 恢复完成：/api/ready 通过（库可读 + schema 版本匹配）"
+    trap - EXIT  # 清 trap：readiness 通过 = 恢复成功，正常退出不用再 start
     exit 0
   fi
   i=$((i + 1))

@@ -352,8 +352,14 @@ export async function checkPooledHealth(
   checked: number // 本轮巡检的 pooled 号数
   stopped: number // 本轮判失效停用数
   skipped?: boolean
+  // 🔴 本轮被 **healthRunning 锁** 挡住（P6-R2 R4②）：**只是给调用方的健康信号**，存活巡检
+  //    语义分毫未动。与 settleDailyUsage 的 lockHeld 同根因：上一轮卡在 cpa.inspect() 或
+  //    listAuthFiles() 的无超时 fetch 里没回来 → 后续 tick 拿到 skipped=true 但 worker.ts
+  //    只看 stopped、healthy 保持 true → 心跳照打，而存活巡检实际已卡死。
+  //    ⚠️ 节流 skip（now - lastHealthAt < INTERVAL）是正常行为，不能并进健康判据，故单列标志。
+  lockHeld?: boolean
 }> {
-  if (healthRunning) return { checked: 0, stopped: 0, skipped: true }
+  if (healthRunning) return { checked: 0, stopped: 0, skipped: true, lockHeld: true }
   if (!opts.force && now - lastHealthAt < HEALTH_INTERVAL_MS) return { checked: 0, stopped: 0, skipped: true }
   healthRunning = true
   try {

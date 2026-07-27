@@ -243,3 +243,32 @@ test('复审三轮②-consumer：空闲 tick（无 inspectFailed）→ pendingIs
   assert.deepEqual(calls, [HB_URL])
 })
 
+// ============================================================================
+// P6-R2 R4② 存活巡检锁未传导到心跳
+// ============================================================================
+
+test('R4②：存活巡检 lockHeld=true → healthIsHealthy 判不健康 → 不发心跳', async () => {
+  const { healthIsHealthy } = await import('../lib/worker.ts')
+  assert.equal(
+    healthIsHealthy({ skipped: true, lockHeld: true }),
+    false,
+    '🔴 存活巡检锁卡死必须判不健康',
+  )
+  const { f, calls } = spyFetch()
+  assert.equal(await pingHeartbeat(healthIsHealthy({ lockHeld: true }), 1_000_000, f), false)
+  assert.deepEqual(calls, [], '存活巡检卡死期间绝不能发心跳')
+})
+
+test('R4②：存活巡检节流 skipped（无 lockHeld）→ healthIsHealthy 判健康', async () => {
+  const { healthIsHealthy } = await import('../lib/worker.ts')
+  assert.equal(
+    healthIsHealthy({ skipped: true }),
+    true,
+    '🔴 节流 skip（5 分钟节流）≠ 卡死，误报会让心跳恒不发',
+  )
+  assert.equal(healthIsHealthy({ skipped: true, lockHeld: false }), true)
+  const { f, calls } = spyFetch()
+  assert.equal(await pingHeartbeat(healthIsHealthy({ skipped: true }), 1_000_000, f), true)
+  assert.deepEqual(calls, [HB_URL])
+})
+
