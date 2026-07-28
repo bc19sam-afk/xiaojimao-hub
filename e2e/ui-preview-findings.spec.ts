@@ -2,6 +2,7 @@ import { expect, test, type Page, type Route } from '@playwright/test'
 import { DatabaseSync } from 'node:sqlite'
 import net from 'node:net'
 import os from 'node:os'
+import { migrate } from '../lib/migrate'
 
 const reviewRow = {
   id: 'review-ui-r1',
@@ -18,6 +19,7 @@ function withE2eDb<T>(run: (db: DatabaseSync) => T): T {
   if (!dbPath) throw new Error('XJM_UI_E2E_DB_PATH 未设置')
   const db = new DatabaseSync(dbPath)
   db.exec('PRAGMA busy_timeout = 5000')
+  migrate(db)
   try {
     return run(db)
   } finally {
@@ -147,6 +149,11 @@ test('provider options remain fully visible and keyboard operable at mobile and 
         return { left: rect.left, right: rect.right, width: rect.width }
       }),
     )
+    const providerSubtexts = [
+      ['codex', 'ChatGPT', 'Plus / Pro / Team / K12'],
+      ['claude', 'Claude', 'Claude 订阅'],
+      ['grok', 'Grok', 'SuperGrok'],
+    ] as const
     const pageWidth = await page.evaluate(() => document.documentElement.clientWidth)
     const scrollWidth = await page.evaluate(() => document.documentElement.scrollWidth)
     const contributionsScroller = page.getByRole('table').locator('..')
@@ -165,6 +172,19 @@ test('provider options remain fully visible and keyboard operable at mobile and 
       expect(rect.width).toBeGreaterThan(0)
       expect(rect.left).toBeGreaterThanOrEqual(0)
       expect(rect.right).toBeLessThanOrEqual(pageWidth + 1)
+    }
+    for (const [id, name, subtext] of providerSubtexts) {
+      const option = page.locator(`[data-provider-option="${id}"]`)
+      await expect(option).toContainText(name)
+      const sub = option.getByText(subtext, { exact: true })
+      await expect(sub).toBeVisible()
+      const subBounds = await sub.evaluate((node) => {
+        const rect = node.getBoundingClientRect()
+        return { left: rect.left, right: rect.right, clientWidth: node.clientWidth, scrollWidth: node.scrollWidth }
+      })
+      expect(subBounds.left).toBeGreaterThanOrEqual(0)
+      expect(subBounds.right).toBeLessThanOrEqual(pageWidth + 1)
+      expect(subBounds.scrollWidth).toBeLessThanOrEqual(subBounds.clientWidth + 1)
     }
     expect(scrollerBounds.left).toBeGreaterThanOrEqual(0)
     expect(scrollerBounds.right).toBeLessThanOrEqual(pageWidth + 1)
@@ -188,6 +208,61 @@ test('Playwright web server listens only on loopback', async ({ request }) => {
     if (await canConnect(address, 3211)) reachable.push(address)
   }
   expect(reachable, `测试服务不应通过非 loopback 地址访问：${reachable.join(', ')}`).toEqual([])
+})
+
+test('real long CDK result reflows inside the dashboard at every mobile viewport', async ({ page }) => {
+  test.setTimeout(60_000)
+  await login(page)
+  const itemName = `真实长码商品-${Date.now()}`
+  const longCode = `CDK-${'A'.repeat(500)}`
+  const itemId = withE2eDb((db) => {
+    const created = db.prepare(
+      `INSERT INTO redeem_items
+       (name, description, cost, kind, enabled, sort, config, fulfillment, per_user_limit)
+       VALUES (?,?,?,?,?,?,?,?,?)`,
+    ).run(itemName, 'long code layout fixture', 10, 'timed_quota', 1, 999, '{}', 'cdk', 0)
+    const id = Number(created.lastInsertRowid)
+    db.prepare(
+      'INSERT INTO cdk_codes (item_id, code, status, created_at) VALUES (?, ?, \'available\', ?)',
+    ).run(id, longCode, Date.now())
+    db.prepare(
+      'INSERT INTO point_ledger (linuxdo_id, delta, reason, ref, created_at) VALUES (?,?,?,?,?)',
+    ).run(1, 100, 'contribution', `e2e-long-cdk:${id}`, Date.now())
+    return id
+  })
+
+  try {
+    for (const width of [320, 375, 390, 430, 1440]) {
+      await page.setViewportSize({ width, height: 900 })
+      await page.reload()
+      const itemRow = page.getByText(itemName, { exact: true }).first().locator('../..')
+      await expect(itemRow).toBeVisible()
+      if (width === 320) {
+        await itemRow.getByRole('button').click()
+        await expect(page.getByText(`已兑换「${itemName}」：${longCode}`, { exact: true })).toBeVisible()
+      }
+      const pageWidth = await page.evaluate(() => document.documentElement.clientWidth)
+      const scrollWidth = await page.evaluate(() => document.documentElement.scrollWidth)
+      expect(scrollWidth, `${width}px 长 CDK 页面不应横向溢出`).toBeLessThanOrEqual(pageWidth + 1)
+      const result = page.getByRole('button', { name: `复制兑换码 ${longCode}` })
+      await expect(result).toBeVisible()
+      const resultBounds = await result.evaluate((node) => {
+        const rect = node.getBoundingClientRect()
+        return { left: rect.left, right: rect.right, clientWidth: node.clientWidth, scrollWidth: node.scrollWidth }
+      })
+      expect(resultBounds.left).toBeGreaterThanOrEqual(0)
+      expect(resultBounds.right).toBeLessThanOrEqual(pageWidth + 1)
+      expect(resultBounds.scrollWidth).toBeLessThanOrEqual(resultBounds.clientWidth + 1)
+    }
+  } finally {
+    withE2eDb((db) => {
+      db.prepare("DELETE FROM point_ledger WHERE reason='redeem' AND ref IN (SELECT id FROM redemptions WHERE item_id=?)").run(itemId)
+      db.prepare('DELETE FROM redemptions WHERE item_id=?').run(itemId)
+      db.prepare('DELETE FROM cdk_codes WHERE item_id=?').run(itemId)
+      db.prepare('DELETE FROM redeem_items WHERE id=?').run(itemId)
+      db.prepare('DELETE FROM point_ledger WHERE ref=?').run(`e2e-long-cdk:${itemId}`)
+    })
+  }
 })
 
 test('delete actions and both review actions require confirmation; cancel and Escape send no request', async ({ page }) => {
@@ -237,51 +312,182 @@ test('delete actions and both review actions require confirmation; cancel and Es
 
 test('confirmation submits once while pending and failed actions stay retryable', async ({ page }) => {
   let reviewPosts = 0
+  let releaseReview!: () => void
+  const reviewGate = new Promise<void>((resolve) => { releaseReview = resolve })
   await mockReviewQueue(page, async (route) => {
     reviewPosts += 1
-    await new Promise((resolve) => setTimeout(resolve, 800))
+    await reviewGate
     await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true, review: [] }) })
   })
   let deletePosts = 0
+  let releaseDelete!: () => void
+  const deleteGate = new Promise<void>((resolve) => { releaseDelete = resolve })
   await page.route('**/api/admin/redeem-items*', async (route) => {
     if (route.request().method() !== 'DELETE') {
       await route.fallback()
       return
     }
     deletePosts += 1
+    await deleteGate
     await route.fulfill({
       status: 503,
       contentType: 'application/json',
-      body: JSON.stringify({ error: '暂时无法删除，请稍后重试' }),
+      body: JSON.stringify({
+        ok: false,
+        code: 'REDEEM_ITEM_DELETE_FAILED',
+        error: 'SQLITE path=/private/db.sqlite token=delete-secret stack=internal-host',
+      }),
     })
   })
 
   await openAdmin(page)
+  const failureItemName = `E2E retryable delete ${Date.now()}`
+  const failureItemId = withE2eDb((db) => Number(db.prepare(
+    `INSERT INTO redeem_items
+     (name, description, cost, kind, enabled, sort, config, fulfillment, per_user_limit)
+     VALUES (?,?,?,?,?,?,?,?,?)`,
+  ).run(failureItemName, 'failure focus fixture', 1, 'timed_quota', 1, 997, '{}', 'placeholder', 0).lastInsertRowid))
+  await page.reload()
 
-  await page.getByRole('button', { name: /终止人工复核/ }).click()
-  const terminateDialog = page.getByRole('dialog', { name: /确认终止/ })
-  const confirmTerminate = terminateDialog.getByTestId('confirm-action-button')
-  await confirmTerminate.evaluate((button: HTMLButtonElement) => {
-    button.click()
-    button.click()
+  try {
+    await page.getByRole('button', { name: /终止人工复核/ }).click()
+    const terminateDialog = page.getByRole('dialog', { name: /确认终止/ })
+    const confirmTerminate = terminateDialog.getByTestId('confirm-action-button')
+    await confirmTerminate.evaluate((button: HTMLButtonElement) => {
+      button.click()
+      button.click()
+    })
+    await expect(confirmTerminate).toBeDisabled()
+    expect(await page.evaluate(() => document.activeElement?.closest('dialog') !== null)).toBe(true)
+    releaseReview()
+    await expect(terminateDialog).toBeHidden()
+    expect(reviewPosts).toBe(1)
+
+    const deleteTrigger = page.getByRole('button', { name: `删除兑换项 ${failureItemName}` })
+    await deleteTrigger.click()
+    const deleteDialog = page.getByRole('dialog', { name: /确认删除兑换项/ })
+    const confirmDelete = deleteDialog.getByTestId('confirm-action-button')
+    await confirmDelete.click()
+    await expect(confirmDelete).toBeDisabled()
+    expect(await page.evaluate(() => document.activeElement?.closest('dialog') !== null)).toBe(true)
+    releaseDelete()
+    await expect(deleteDialog.getByRole('alert')).toHaveText('删除兑换项失败，请重试')
+    await expect(deleteDialog.getByRole('alert')).toBeFocused()
+    for (const secret of ['SQLITE path=', '/private/db.sqlite', 'delete-secret', 'internal-host']) {
+      await expect(page.getByText(secret, { exact: false })).toHaveCount(0)
+    }
+    await expect(deleteDialog).toBeVisible()
+    await expect(confirmDelete).toBeEnabled()
+    await expect(deleteTrigger).toBeVisible()
+    expect(deletePosts).toBe(1)
+    await confirmDelete.click()
+    await expect(deleteDialog.getByRole('alert')).toHaveText('删除兑换项失败，请重试')
+    await expect(deleteDialog.getByRole('alert')).toBeFocused()
+    expect(deletePosts).toBe(2)
+  } finally {
+    releaseReview()
+    releaseDelete()
+    withE2eDb((db) => db.prepare('DELETE FROM redeem_items WHERE id=?').run(failureItemId))
+  }
+})
+
+test('dangerous action failures use public allowlisted messages and never echo API internals', async ({ page }) => {
+  await mockReviewQueue(page, async (route) => {
+    await route.fulfill({ status: 503, contentType: 'text/html', body: '<html>stack=/srv/app.db token=review-secret</html>' })
   })
-  await expect(confirmTerminate).toBeDisabled()
-  await expect(terminateDialog).toBeHidden()
-  expect(reviewPosts).toBe(1)
+  const dangerousRoutes = [
+    ['point-rules', 'POINT_RULE_DELETE_FAILED', '删除发分规则', '删除发分规则失败，请重试', 'point-secret'],
+    ['usage-rates', 'UNTRUSTED_INTERNAL_CODE', '删除折算规则', '删除折算规则失败，请重试', 'rate-secret'],
+    ['redeem-items', 'UNTRUSTED_INTERNAL_CODE', '删除兑换项', '删除兑换项失败，请重试', 'item-secret'],
+  ] as const
+  for (const [endpoint, code, title, message, secret] of dangerousRoutes) {
+    await page.route(`**/api/admin/${endpoint}*`, async (route) => {
+      if (route.request().method() !== 'DELETE') {
+        await route.fallback()
+        return
+      }
+      await route.fulfill({
+        status: 500,
+        contentType: 'application/json',
+        body: JSON.stringify({ ok: false, code, error: `SQLITE path=/private/${secret}.db token=${secret} stack=internal-host` }),
+      })
+    })
+  }
 
-  const deleteTrigger = page.getByRole('button', { name: /删除兑换项/ }).first()
-  await deleteTrigger.click()
-  const deleteDialog = page.getByRole('dialog', { name: /确认删除兑换项/ })
-  const confirmDelete = deleteDialog.getByRole('button', { name: /确认删除/ })
-  await confirmDelete.click()
-  await expect(deleteDialog.getByRole('alert')).toContainText('暂时无法删除，请稍后重试')
-  await expect(deleteDialog).toBeVisible()
-  await expect(confirmDelete).toBeEnabled()
-  await expect(deleteTrigger).toBeVisible()
-  expect(deletePosts).toBe(1)
-  await confirmDelete.click()
-  await expect(deleteDialog.getByRole('alert')).toContainText('暂时无法删除，请稍后重试')
-  expect(deletePosts).toBe(2)
+  await openAdmin(page)
+  for (const [endpoint, _code, title, message] of dangerousRoutes) {
+    const trigger = page.getByRole('button', { name: new RegExp(title) }).first()
+    await trigger.click()
+    const dialog = page.getByRole('dialog')
+    await dialog.getByTestId('confirm-action-button').click()
+    await expect(dialog.getByRole('alert')).toHaveText(message)
+    await expect(dialog.getByRole('alert')).toBeFocused()
+    await dialog.getByRole('button', { name: '取消' }).click()
+    await expect(dialog).toBeHidden()
+    void endpoint
+  }
+
+  const reviewTrigger = page.getByRole('button', { name: /重试人工复核/ })
+  await reviewTrigger.click()
+  const reviewDialog = page.getByRole('dialog', { name: /确认重试/ })
+  await reviewDialog.getByTestId('confirm-action-button').click()
+  await expect(reviewDialog.getByRole('alert')).toHaveText('人工复核操作失败，请重试')
+  await expect(reviewDialog.getByRole('alert')).toBeFocused()
+  await reviewDialog.getByRole('button', { name: '取消' }).click()
+  await expect(reviewDialog).toBeHidden()
+
+  for (const secret of ['point-secret', 'rate-secret', 'item-secret', 'review-secret', '/private/']) {
+    await expect(page.getByText(secret, { exact: false })).toHaveCount(0)
+  }
+})
+
+test('dangerous admin routes return fixed public JSON when SQLite operations fail', async ({ page }) => {
+  await openAdmin(page)
+  await expect(page.getByTestId('readiness-status')).toContainText('可用')
+  const suffix = Date.now()
+  const cases = [
+    {
+      table: 'point_rules',
+      broken: `__e2e_point_rules_${suffix}`,
+      request: () => page.request.delete('/api/admin/point-rules?id=1'),
+      body: { ok: false, code: 'POINT_RULE_DELETE_FAILED', error: '删除发分规则失败，请重试' },
+    },
+    {
+      table: 'usage_rates',
+      broken: `__e2e_usage_rates_${suffix}`,
+      request: () => page.request.delete('/api/admin/usage-rates?id=1'),
+      body: { ok: false, code: 'USAGE_RATE_DELETE_FAILED', error: '删除折算规则失败，请重试' },
+    },
+    {
+      table: 'redeem_items',
+      broken: `__e2e_redeem_items_${suffix}`,
+      request: () => page.request.delete('/api/admin/redeem-items?id=1'),
+      body: { ok: false, code: 'REDEEM_ITEM_DELETE_FAILED', error: '删除兑换项失败，请重试' },
+    },
+    {
+      table: 'contributions',
+      broken: `__e2e_contributions_${suffix}`,
+      request: () => page.request.post('/api/admin/review', { data: { id: 'not-present', action: 'retry' } }),
+      body: { ok: false, code: 'REVIEW_ACTION_FAILED', error: '人工复核操作失败，请重试' },
+    },
+  ]
+
+  for (const entry of cases) {
+    withE2eDb((db) => db.exec(`ALTER TABLE "${entry.table}" RENAME TO "${entry.broken}"`))
+    try {
+      const response = await entry.request()
+      expect(response.status()).toBe(500)
+      expect(response.headers()['content-type']).toContain('application/json')
+      const body = await response.json()
+      expect(body).toEqual(entry.body)
+      const serialized = JSON.stringify(body)
+      for (const internal of [entry.table, process.cwd(), 'SQLITE', 'stack', 'token=']) {
+        expect(serialized).not.toContain(internal)
+      }
+    } finally {
+      withE2eDb((db) => db.exec(`ALTER TABLE "${entry.broken}" RENAME TO "${entry.table}"`))
+    }
+  }
 })
 
 test('successful delete, retry, and terminate use exact targets, persist audit state, and restore stable focus', async ({ page }) => {
@@ -379,6 +585,72 @@ test('successful delete, retry, and terminate use exact targets, persist audit s
   expect(terminated.audit.newValue).toContain('stopped')
 })
 
+test('successful point-rule and usage-rate deletes use exact IDs, DB state, audit, and stable focus', async ({ page }) => {
+  await openAdmin(page)
+  const plan = `e2e-delete-${Date.now()}`
+  const created = await page.evaluate(async (planName) => {
+    const ruleResponse = await fetch('/api/admin/point-rules', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ provider: 'grok', plan: planName, points: 17, label: 'E2E delete rule', enabled: true }),
+    })
+    const rateResponse = await fetch('/api/admin/usage-rates', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ provider: 'grok', plan: planName, pointsPerCall: 1.7, label: 'E2E delete rate', enabled: true }),
+    })
+    return { rule: await ruleResponse.json(), rate: await rateResponse.json() }
+  }, plan)
+  const ruleId = Number(created.rule.pointRules.find((row: { provider: string; plan: string }) => row.provider === 'grok' && row.plan === plan)?.id)
+  const rateId = Number(created.rate.usageRates.find((row: { provider: string; plan: string }) => row.provider === 'grok' && row.plan === plan)?.id)
+  expect(ruleId).toBeGreaterThan(0)
+  expect(rateId).toBeGreaterThan(0)
+
+  try {
+    await page.reload()
+    const ruleRequestPromise = page.waitForRequest((request) =>
+      request.method() === 'DELETE' && request.url().includes('/api/admin/point-rules?'))
+    await page.getByRole('button', { name: `删除发分规则 grok ${plan}` }).click()
+    const ruleDialog = page.getByRole('dialog', { name: /确认删除发分规则/ })
+    await ruleDialog.getByTestId('confirm-action-button').click()
+    const ruleRequest = await ruleRequestPromise
+    expect(new URL(ruleRequest.url()).searchParams.get('id')).toBe(String(ruleId))
+    await expect(ruleDialog).toBeHidden()
+    await expect(page.getByRole('heading', { name: '发分规则', level: 2 })).toBeFocused()
+    const deletedRule = withE2eDb((db) => ({
+      row: db.prepare('SELECT id FROM point_rules WHERE id=?').get(ruleId),
+      audit: db.prepare(
+        "SELECT action, target FROM audit_log WHERE action='point_rule.delete' AND target=? ORDER BY id DESC LIMIT 1",
+      ).get(`grok/${plan}`) as { action: string; target: string },
+    }))
+    expect(deletedRule.row).toBeUndefined()
+    expect(deletedRule.audit).toEqual({ action: 'point_rule.delete', target: `grok/${plan}` })
+
+    const rateRequestPromise = page.waitForRequest((request) =>
+      request.method() === 'DELETE' && request.url().includes('/api/admin/usage-rates?'))
+    await page.getByRole('button', { name: `删除折算规则 grok ${plan}` }).click()
+    const rateDialog = page.getByRole('dialog', { name: /确认删除折算规则/ })
+    await rateDialog.getByTestId('confirm-action-button').click()
+    const rateRequest = await rateRequestPromise
+    expect(new URL(rateRequest.url()).searchParams.get('id')).toBe(String(rateId))
+    await expect(rateDialog).toBeHidden()
+    await expect(page.getByRole('heading', { name: '折算规则（按次单价）', level: 2 })).toBeFocused()
+    const deletedRate = withE2eDb((db) => ({
+      row: db.prepare('SELECT id FROM usage_rates WHERE id=?').get(rateId),
+      audit: db.prepare(
+        "SELECT action, target FROM audit_log WHERE action='usage_rate.delete' AND target=? ORDER BY id DESC LIMIT 1",
+      ).get(`grok/${plan}`) as { action: string; target: string },
+    }))
+    expect(deletedRate.row).toBeUndefined()
+    expect(deletedRate.audit).toEqual({ action: 'usage_rate.delete', target: `grok/${plan}` })
+  } finally {
+    withE2eDb((db) => {
+      db.prepare('DELETE FROM point_rules WHERE id=?').run(ruleId)
+      db.prepare('DELETE FROM usage_rates WHERE id=?').run(rateId)
+    })
+  }
+})
+
 test('saving an item updates the enabled-item overview from the persisted database state', async ({ page }) => {
   await openAdmin(page)
   const item = withE2eDb((db) => db.prepare(
@@ -406,6 +678,55 @@ test('saving an item updates the enabled-item overview from the persisted databa
     expect(persisted).toEqual({ enabled: 0, count: before - 1 })
   } finally {
     withE2eDb((db) => db.prepare('UPDATE redeem_items SET enabled=1 WHERE id=?').run(item.id))
+  }
+})
+
+test('deleting an item applies the DELETE overview and ignores a stale config refresh', async ({ page }) => {
+  await openAdmin(page)
+  const itemName = `E2E DELETE overview ${Date.now()}`
+  const created = await page.evaluate(async (name) => {
+    const response = await fetch('/api/admin/redeem-items', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, description: 'delete overview fixture', cost: 1, kind: 'timed_quota', enabled: true, sort: 998 }),
+    })
+    return await response.json()
+  }, itemName)
+  const itemId = Number(created.redeemItems.find((item: { name: string }) => item.name === itemName)?.id)
+  expect(itemId).toBeGreaterThan(0)
+  await page.reload()
+  const before = withE2eDb((db) => (db.prepare(
+    'SELECT COUNT(*) AS n FROM redeem_items WHERE enabled=1',
+  ).get() as { n: number }).n)
+  const overviewValue = page.getByText('已启用商品', { exact: true }).locator('..').locator('dd')
+  await expect(overviewValue).toHaveText(String(before))
+
+  let staleConfigCalls = 0
+  await page.route('**/api/admin/config', async (route) => {
+    staleConfigCalls += 1
+    const response = await route.fetch()
+    const body = await response.json()
+    body.overview.enabledRedeemItems = before
+    await route.fulfill({ response, body: JSON.stringify(body) })
+  })
+
+  try {
+    const deleteRequestPromise = page.waitForRequest((request) =>
+      request.method() === 'DELETE' && request.url().includes('/api/admin/redeem-items?'))
+    await page.getByRole('button', { name: `删除兑换项 ${itemName}` }).click()
+    const dialog = page.getByRole('dialog', { name: /确认删除兑换项/ })
+    await dialog.getByTestId('confirm-action-button').click()
+    const request = await deleteRequestPromise
+    expect(new URL(request.url()).searchParams.get('id')).toBe(String(itemId))
+    await expect(dialog).toBeHidden()
+    await expect(overviewValue).toHaveText(String(before - 1))
+    expect(staleConfigCalls).toBe(0)
+    expect(withE2eDb((db) => ({
+      item: db.prepare('SELECT id FROM redeem_items WHERE id=?').get(itemId),
+      count: (db.prepare('SELECT COUNT(*) AS n FROM redeem_items WHERE enabled=1').get() as { n: number }).n,
+    }))).toEqual({ item: undefined, count: before - 1 })
+  } finally {
+    withE2eDb((db) => db.prepare('DELETE FROM redeem_items WHERE id=?').run(itemId))
   }
 })
 

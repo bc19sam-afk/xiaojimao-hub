@@ -3,6 +3,12 @@ import { getAdminActor } from '@/lib/admin'
 import { db } from '@/lib/db'
 import { auditPointRuleUpsert, auditPointRuleDelete } from '@/lib/audit'
 
+const POINT_RULE_DELETE_FAILURE = {
+  ok: false,
+  code: 'POINT_RULE_DELETE_FAILED',
+  error: '删除发分规则失败，请重试',
+} as const
+
 // 新增/更新发分规则
 export async function PUT(req: NextRequest) {
   const actor = await getAdminActor()
@@ -25,8 +31,12 @@ export async function DELETE(req: NextRequest) {
   if (!actor) return NextResponse.json({ error: '无权限' }, { status: 403 })
   const id = Number(new URL(req.url).searchParams.get('id'))
   if (!id) return NextResponse.json({ error: '缺 id' }, { status: 400 })
-  const old = db.listPointRules().find((r) => r.id === id)
-  db.deletePointRule(id)
-  db.recordAudit(actor, auditPointRuleDelete(old, id))
-  return NextResponse.json({ ok: true, pointRules: db.listPointRules() })
+  try {
+    const old = db.listPointRules().find((r) => r.id === id)
+    db.deletePointRule(id)
+    db.recordAudit(actor, auditPointRuleDelete(old, id))
+    return NextResponse.json({ ok: true, pointRules: db.listPointRules() })
+  } catch {
+    return NextResponse.json(POINT_RULE_DELETE_FAILURE, { status: 500 })
+  }
 }

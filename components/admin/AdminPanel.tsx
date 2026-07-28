@@ -109,6 +109,25 @@ interface PendingConfirmation extends ConfirmDialogRequest {
   fallbackFocus: () => HTMLElement | null
 }
 
+const PUBLIC_DELETE_ERRORS = {
+  pointRule: '删除发分规则失败，请重试',
+  usageRate: '删除折算规则失败，请重试',
+  redeemItem: '删除兑换项失败，请重试',
+  review: '人工复核操作失败，请重试',
+} as const
+
+const PUBLIC_ACTION_ERRORS_BY_CODE = {
+  POINT_RULE_DELETE_FAILED: PUBLIC_DELETE_ERRORS.pointRule,
+  USAGE_RATE_DELETE_FAILED: PUBLIC_DELETE_ERRORS.usageRate,
+  REDEEM_ITEM_DELETE_FAILED: PUBLIC_DELETE_ERRORS.redeemItem,
+  REVIEW_ACTION_FAILED: PUBLIC_DELETE_ERRORS.review,
+} as const
+
+function publicActionError(code: unknown, expectedCode: keyof typeof PUBLIC_ACTION_ERRORS_BY_CODE, fallback: string) {
+  if (code !== expectedCode) return fallback
+  return PUBLIC_ACTION_ERRORS_BY_CODE[expectedCode]
+}
+
 const KINDS = [
   { v: 'timed_quota', t: '限时额度' },
   { v: 'permanent_quota', t: '永久额度' },
@@ -335,10 +354,12 @@ export default function AdminPanel() {
   async function delRule(id: number) {
     const res = await fetch('/api/admin/point-rules?id=' + id, { method: 'DELETE' })
     const d = await res.json().catch(() => ({}))
-    if (!res.ok || !d.ok || !Array.isArray(d.pointRules)) throw new Error(d.error || '删除发分规则失败，请重试')
+    if (!res.ok || !d.ok || !Array.isArray(d.pointRules)) {
+      throw new Error(publicActionError(d.code, 'POINT_RULE_DELETE_FAILED', PUBLIC_DELETE_ERRORS.pointRule))
+    }
     setRules(d.pointRules)
     flash('已删除')
-    loadAudit()
+    void loadAudit().catch(() => {})
   }
   async function saveRate(r: Partial<UsageRate>) {
     const res = await fetch('/api/admin/usage-rates', {
@@ -356,10 +377,12 @@ export default function AdminPanel() {
   async function delRate(id: number) {
     const res = await fetch('/api/admin/usage-rates?id=' + id, { method: 'DELETE' })
     const d = await res.json().catch(() => ({}))
-    if (!res.ok || !d.ok || !Array.isArray(d.usageRates)) throw new Error(d.error || '删除折算规则失败，请重试')
+    if (!res.ok || !d.ok || !Array.isArray(d.usageRates)) {
+      throw new Error(publicActionError(d.code, 'USAGE_RATE_DELETE_FAILED', PUBLIC_DELETE_ERRORS.usageRate))
+    }
     setRates(d.usageRates)
     flash('已删除')
-    loadAudit()
+    void loadAudit().catch(() => {})
   }
   async function saveItem(it: Partial<RedeemItem>) {
     const res = await fetch('/api/admin/redeem-items', {
@@ -377,11 +400,13 @@ export default function AdminPanel() {
   async function delItem(id: number) {
     const res = await fetch('/api/admin/redeem-items?id=' + id, { method: 'DELETE' })
     const d = await res.json().catch(() => ({}))
-    if (!res.ok || !d.ok || !Array.isArray(d.redeemItems)) throw new Error(d.error || '删除兑换项失败，请重试')
+    if (!res.ok || !d.ok || !Array.isArray(d.redeemItems) || !d.overview) {
+      throw new Error(publicActionError(d.code, 'REDEEM_ITEM_DELETE_FAILED', PUBLIC_DELETE_ERRORS.redeemItem))
+    }
     setItems(d.redeemItems)
+    setOverview(d.overview)
     flash('已删除')
-    loadAudit()
-    load()
+    void loadAudit().catch(() => {})
   }
 
   // 人工复核处理（P4-R3，§7.4）：重试（按是否入过池分叉：未入过→回首检 / 入过→直接回池）/ 终止（→ 停用）。
@@ -393,14 +418,14 @@ export default function AdminPanel() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ id, action }),
     })
-    const d = await res.json()
+    const d = await res.json().catch(() => ({}))
     if (res.ok && d.ok) {
       setReview(d.review ?? [])
       flash(action === 'retry' ? '已重试' : '已终止')
-      loadAudit()
-      loadContributions()
-      load()
-    } else throw new Error(d.error || '人工复核操作失败，请重试')
+      void loadAudit().catch(() => {})
+      void loadContributions().catch(() => {})
+      void load().catch(() => {})
+    } else throw new Error(publicActionError(d.code, 'REVIEW_ACTION_FAILED', PUBLIC_DELETE_ERRORS.review))
   }
 
   function confirmRuleDelete(rule: PointRule) {
@@ -1002,7 +1027,11 @@ function CdkImport({
   return (
     <div className="space-y-3">
       <div className="flex flex-wrap items-center gap-2">
-        <select className={field} value={itemId} onChange={(e) => setItemId(Number(e.target.value))}>
+        <select
+          className={field + ' min-w-0 w-full max-w-full sm:w-auto'}
+          value={itemId}
+          onChange={(e) => setItemId(Number(e.target.value))}
+        >
           <option value={0}>选择兑换项…</option>
           {items.map((i) => (
             <option key={i.id} value={i.id}>

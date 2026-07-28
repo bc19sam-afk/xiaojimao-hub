@@ -3,6 +3,12 @@ import { getAdminActor } from '@/lib/admin'
 import { db } from '@/lib/db'
 import { auditUsageRateUpsert, auditUsageRateDelete } from '@/lib/audit'
 
+const USAGE_RATE_DELETE_FAILURE = {
+  ok: false,
+  code: 'USAGE_RATE_DELETE_FAILED',
+  error: '删除折算规则失败，请重试',
+} as const
+
 // 折算规则（按次单价）读/改/删（P4-R2 §3.4）：仿 point-rules，唯一差异＝单价可小数（points_per_call REAL）。
 // GET 供 AdminPanel 初始加载（point-rules 走 /api/admin/config；usage-rates 自包含）。
 export async function GET() {
@@ -41,8 +47,12 @@ export async function DELETE(req: NextRequest) {
   if (!actor) return NextResponse.json({ error: '无权限' }, { status: 403 })
   const id = Number(new URL(req.url).searchParams.get('id'))
   if (!id) return NextResponse.json({ error: '缺 id' }, { status: 400 })
-  const old = db.listUsageRates().find((r) => r.id === id)
-  db.deleteUsageRate(id)
-  db.recordAudit(actor, auditUsageRateDelete(old, id))
-  return NextResponse.json({ ok: true, usageRates: db.listUsageRates() })
+  try {
+    const old = db.listUsageRates().find((r) => r.id === id)
+    db.deleteUsageRate(id)
+    db.recordAudit(actor, auditUsageRateDelete(old, id))
+    return NextResponse.json({ ok: true, usageRates: db.listUsageRates() })
+  } catch {
+    return NextResponse.json(USAGE_RATE_DELETE_FAILURE, { status: 500 })
+  }
 }

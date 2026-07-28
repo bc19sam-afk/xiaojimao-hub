@@ -3,6 +3,12 @@ import { getAdminActor } from '@/lib/admin'
 import { db } from '@/lib/db'
 import { auditRedeemItemUpsert, auditRedeemItemDelete } from '@/lib/audit'
 
+const REDEEM_ITEM_DELETE_FAILURE = {
+  ok: false,
+  code: 'REDEEM_ITEM_DELETE_FAILED',
+  error: '删除兑换项失败，请重试',
+} as const
+
 // 新增/更新兑换项
 export async function PUT(req: NextRequest) {
   const actor = await getAdminActor()
@@ -44,12 +50,16 @@ export async function DELETE(req: NextRequest) {
   if (!actor) return NextResponse.json({ error: '无权限' }, { status: 403 })
   const id = Number(new URL(req.url).searchParams.get('id'))
   if (!id) return NextResponse.json({ error: '缺 id' }, { status: 400 })
-  const old = db.getRedeemItem(id)
-  db.deleteRedeemItem(id)
-  db.recordAudit(actor, auditRedeemItemDelete(old, id))
-  return NextResponse.json({
-    ok: true,
-    redeemItems: db.listRedeemItems(false),
-    overview: db.adminOverview(),
-  })
+  try {
+    const old = db.getRedeemItem(id)
+    db.deleteRedeemItem(id)
+    db.recordAudit(actor, auditRedeemItemDelete(old, id))
+    return NextResponse.json({
+      ok: true,
+      redeemItems: db.listRedeemItems(false),
+      overview: db.adminOverview(),
+    })
+  } catch {
+    return NextResponse.json(REDEEM_ITEM_DELETE_FAILURE, { status: 500 })
+  }
 }

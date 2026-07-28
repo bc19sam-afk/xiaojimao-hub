@@ -147,18 +147,18 @@ export default function RedeemStore({ refreshKey, onRedeemed }: { refreshKey: nu
 
       {toast && (
         <div
-          className={`mt-3 rounded-lg px-3 py-2 text-xs ${
+          className={`mt-3 min-w-0 max-w-full rounded-lg px-3 py-2 text-xs [overflow-wrap:anywhere] ${
             toast.ok ? 'bg-emerald-500/10 text-emerald-300' : 'bg-rose-500/10 text-rose-300'
           }`}
         >
-          {toast.text}
+          <span className="block min-w-0 max-w-full [overflow-wrap:anywhere]">{toast.text}</span>
         </div>
       )}
 
       {redemptions.length > 0 && (
-        <div className="mt-4 border-t border-white/10 pt-3">
+        <div className="mt-4 min-w-0 max-w-full border-t border-white/10 pt-3">
           <div className="mb-2 text-[11px] text-neutral-500">兑换记录</div>
-          <ul className="space-y-2">
+          <ul className="min-w-0 max-w-full space-y-2">
             {redemptions.slice(0, 5).map((r) => {
               const status = redemptionStatusView(r.status)
               // 码类结果（CDK / 占位邀请码）为可打印 ASCII → 显示可复制码（§5.3「响应丢失可在兑换记录找回」）；
@@ -173,8 +173,8 @@ export default function RedeemStore({ refreshKey, onRedeemed }: { refreshKey: nu
                       ? 'border-amber-300/25 bg-amber-400/10 text-amber-200'
                       : 'border-white/15 bg-white/5 text-neutral-300'
               return (
-                <li key={r.id} className="rounded-xl border border-white/10 bg-white/[0.02] px-3 py-2.5 text-xs">
-                  <div className="flex flex-wrap items-start justify-between gap-2">
+                <li key={r.id} className="min-w-0 max-w-full rounded-xl border border-white/10 bg-white/[0.02] px-3 py-2.5 text-xs">
+                  <div className="flex min-w-0 max-w-full flex-wrap items-start justify-between gap-2">
                     <span className="min-w-0 break-words text-neutral-200">{r.itemName}</span>
                     <span
                       aria-label={`兑换状态：${status.label}`}
@@ -184,7 +184,7 @@ export default function RedeemStore({ refreshKey, onRedeemed }: { refreshKey: nu
                       {status.label}
                     </span>
                   </div>
-                  <div className="mt-2 flex flex-wrap items-center justify-between gap-2 text-neutral-500">
+                  <div className="mt-2 flex min-w-0 max-w-full flex-wrap items-center justify-between gap-2 text-neutral-500">
                     <span className="mono">−{r.cost} 积分</span>
                     {isCode && (
                       <button
@@ -192,7 +192,7 @@ export default function RedeemStore({ refreshKey, onRedeemed }: { refreshKey: nu
                         onClick={() => copyCode(r.result)}
                         aria-label={`复制兑换码 ${r.result}`}
                         title="点击复制"
-                        className="mono max-w-full break-all rounded bg-[var(--brand)]/15 px-2 py-1 text-left text-[var(--brand-bright)] hover:bg-[var(--brand)]/25 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400"
+                        className="mono min-w-0 max-w-full break-all whitespace-normal rounded bg-[var(--brand)]/15 px-2 py-1 text-left text-[var(--brand-bright)] [overflow-wrap:anywhere] hover:bg-[var(--brand)]/25 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400"
                       >
                         {r.result}
                       </button>

@@ -22,6 +22,7 @@ export default function ConfirmDialog({
 }) {
   const dialogRef = useRef<HTMLDialogElement>(null)
   const cancelRef = useRef<HTMLButtonElement>(null)
+  const alertRef = useRef<HTMLDivElement>(null)
   const returnFocusRef = useRef<HTMLElement | null>(null)
   const inFlightRef = useRef(false)
   const [busy, setBusy] = useState(false)
@@ -43,6 +44,19 @@ export default function ConfirmDialog({
     }
   }, [fallbackFocus])
 
+  // A disabled focused button is blurred by the browser. Keep focus inside the
+  // modal while the mutation is pending; native <dialog> inerting keeps the
+  // background unavailable to keyboard users.
+  useEffect(() => {
+    if (busy) dialogRef.current?.focus()
+  }, [busy])
+
+  // Focus the public error so keyboard users immediately know the action failed
+  // and can retry without falling back to document.body.
+  useEffect(() => {
+    if (error) alertRef.current?.focus()
+  }, [error])
+
   async function confirm() {
     if (inFlightRef.current) return
     inFlightRef.current = true
@@ -61,6 +75,7 @@ export default function ConfirmDialog({
   return (
     <dialog
       ref={dialogRef}
+      tabIndex={-1}
       aria-labelledby={titleId}
       aria-describedby={descriptionId}
       onCancel={(event) => {
@@ -82,7 +97,13 @@ export default function ConfirmDialog({
         </div>
 
         {error && (
-          <div role="alert" className="mt-4 rounded-xl border border-rose-400/25 bg-rose-500/10 px-3 py-2 text-sm text-rose-200">
+          <div
+            ref={alertRef}
+            role="alert"
+            tabIndex={-1}
+            aria-live="assertive"
+            className="mt-4 rounded-xl border border-rose-400/25 bg-rose-500/10 px-3 py-2 text-sm text-rose-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-300"
+          >
             {error}
           </div>
         )}
