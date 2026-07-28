@@ -1325,7 +1325,11 @@ export const db = {
   // Readiness：验证连接、canonical schema/唯一约束与主库写锁；仅代表本地 SQLite 可供当前代码读写。
   // 只抛异常给 /api/ready 转成脱敏 503，不把路径、SQL 或内部错误透给 UI。
   assertReady(): void {
-    assertDatabaseReady(conn)
+    // 业务连接保留 5s busy_timeout 以覆盖正常启动/种子并发；readiness 的写探针必须
+    // 使用独立短超时连接，否则外部 BEGIN IMMEDIATE 会同步冻结 liveness。
+    const inMemory = DB_PATH === ':memory:' || DB_PATH.startsWith('file::memory:')
+    const probe = inMemory ? undefined : () => new DatabaseSync(DB_PATH)
+    assertDatabaseReady(conn, probe)
   },
 
   // ===== 人工复核处理（P4-R3，§7.4）=====

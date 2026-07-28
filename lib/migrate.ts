@@ -618,6 +618,7 @@ interface SchemaColumnSignature {
 interface TableSchemaSignature {
   columns: Map<string, SchemaColumnSignature>
   indexes: string[]
+  autoIncrement: boolean
 }
 
 type CanonicalSchemaManifest = Map<string, TableSchemaSignature>
@@ -654,6 +655,11 @@ function schemaManifest(db: DatabaseSync): CanonicalSchemaManifest {
     .all() as unknown as { name: string }[]
   const manifest: CanonicalSchemaManifest = new Map()
   for (const { name } of tables) {
+    const tableSql = (
+      db.prepare("SELECT sql FROM sqlite_schema WHERE type='table' AND name=?").get(name) as {
+        sql: string | null
+      }
+    ).sql
     const columns = db
       .prepare(`PRAGMA table_info(${quotedIdentifier(name)})`)
       .all() as unknown as {
@@ -698,6 +704,10 @@ function schemaManifest(db: DatabaseSync): CanonicalSchemaManifest {
     manifest.set(name, {
       columns: new Map(columns.map((row) => [row.name, normalizedColumn(row)])),
       indexes: indexSignatures,
+      // The migration contract relies on the INTEGER primary-key allocator's
+      // no-reuse guarantee. Match the key definition itself, not an arbitrary
+      // occurrence of the keyword elsewhere in a table declaration.
+      autoIncrement: /\bid\s+INTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT\b/i.test(tableSql ?? ''),
     })
   }
   return manifest
@@ -734,6 +744,9 @@ export function assertSchemaMatchesMigrations(db: DatabaseSync): void {
       ) {
         throw new Error(`[db] schema ${tableName}.${columnName} 列签名与迁移定义不一致`)
       }
+    }
+    if (actualTable.autoIncrement !== expectedTable.autoIncrement) {
+      throw new Error(`[db] schema ${tableName} AUTOINCREMENT 约束与迁移定义不一致`)
     }
     const remainingIndexes = [...actualTable.indexes]
     for (const expectedIndex of expectedTable.indexes) {

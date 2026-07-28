@@ -35,6 +35,20 @@ function removeUniqueConstraint(db: DatabaseSync, tableName: string, constraint:
   for (const sql of indexSql) db.exec(sql)
 }
 
+function removeAutoincrement(db: DatabaseSync, tableName: string): void {
+  const tableSql = (db.prepare(
+    "SELECT sql FROM sqlite_schema WHERE type='table' AND name=?",
+  ).get(tableName) as { sql: string }).sql
+  const indexSql = (db.prepare(
+    "SELECT sql FROM sqlite_schema WHERE type='index' AND tbl_name=? AND sql IS NOT NULL ORDER BY name",
+  ).all(tableName) as { sql: string }[]).map((row) => row.sql)
+  const brokenSql = tableSql.replace(/\bAUTOINCREMENT\b/gi, '')
+  assert.notEqual(brokenSql, tableSql, `前置：${tableName} 应包含 AUTOINCREMENT`)
+  db.exec(`DROP TABLE "${tableName}"`)
+  db.exec(brokenSql)
+  for (const sql of indexSql) db.exec(sql)
+}
+
 test('readiness：健康库验证 canonical schema + 主库写能力且不留探针或业务残留', () => {
   withDatabase((db) => {
     const tableCountBefore = (db.prepare(
@@ -102,6 +116,36 @@ test('readiness：缺表、缺列与落后 schema 均 fail closed', async (t) =>
     withDatabase((db) => {
       removeUniqueConstraint(db, 'point_ledger', /,\s*UNIQUE\s*\(reason,\s*ref\)/i)
       assert.throws(() => assertDatabaseReady(db), /point_ledger.*索引|唯一约束/i)
+    })
+  })
+
+  await t.test('关键表缺 AUTOINCREMENT 且会复用旧 CDK 归属时 fail closed', () => {
+    withDatabase((db) => {
+      removeAutoincrement(db, 'redeem_items')
+
+      const first = db.prepare(
+        `INSERT INTO redeem_items
+         (name, description, cost, kind, enabled, sort, config, fulfillment, per_user_limit)
+         VALUES (?,?,?,?,?,?,?,?,?)`,
+      ).run('旧商品', '', 1, 'timed_quota', 1, 1, '{}', 'cdk', 0)
+      const firstId = Number(first.lastInsertRowid)
+      db.prepare(
+        'INSERT INTO cdk_codes (item_id, code, status, created_at) VALUES (?, ?, \'available\', ?)',
+      ).run(firstId, 'LEGACY-CDK-MUST-NOT-REAPPEAR', Date.now())
+      db.prepare('DELETE FROM redeem_items WHERE id=?').run(firstId)
+
+      const second = db.prepare(
+        `INSERT INTO redeem_items
+         (name, description, cost, kind, enabled, sort, config, fulfillment, per_user_limit)
+         VALUES (?,?,?,?,?,?,?,?,?)`,
+      ).run('新商品', '', 1, 'timed_quota', 1, 1, '{}', 'cdk', 0)
+      const secondId = Number(second.lastInsertRowid)
+      assert.equal(secondId, firstId, '无 AUTOINCREMENT 的损坏库会复用被删除的商品 ID')
+      assert.equal(
+        (db.prepare('SELECT code FROM cdk_codes WHERE item_id=?').get(secondId) as { code: string }).code,
+        'LEGACY-CDK-MUST-NOT-REAPPEAR',
+      )
+      assert.throws(() => assertDatabaseReady(db), /AUTOINCREMENT|自增|redeem_items/i)
     })
   })
 })

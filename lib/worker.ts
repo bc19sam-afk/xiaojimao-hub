@@ -1,5 +1,3 @@
-import { checkPooledHealth, processPending } from './collect'
-import { settleDailyUsage } from './settle'
 import { env } from './env'
 
 // ============================================================================
@@ -23,6 +21,24 @@ export function startWorker() {
   started = true
 
   const tick = async () => {
+    // 延迟加载 DB 依赖：服务监听与 liveness/readiness 不应被坏库的模块求值阻断。
+    // 模块成功加载后由 ESM cache 复用，不会每轮重新执行文件。
+    let processPending: typeof import('./collect').processPending
+    let checkPooledHealth: typeof import('./collect').checkPooledHealth
+    let settleDailyUsage: typeof import('./settle').settleDailyUsage
+    try {
+      ;({ processPending, checkPooledHealth } = await import('./collect'))
+    } catch {
+      console.error('[worker] 收号模块加载失败（后台巡检本轮跳过）')
+      return
+    }
+    try {
+      ;({ settleDailyUsage } = await import('./settle'))
+    } catch {
+      console.error('[worker] 结算模块加载失败（后台巡检本轮跳过）')
+      return
+    }
+
     try {
       const r = await processPending()
       if (r.activated || r.rejected) {
