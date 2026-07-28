@@ -12,6 +12,21 @@ import path from 'node:path'
 // ============================================================================
 
 const BACKUP_RE = /^backup-.*\.db$/
+const DEFAULT_BACKUP_KEEP = 7
+
+// 手动备份与 worker 自动备份共用同一严格解析器。仅“未配置/空字符串”使用默认 7；任何非空脏值
+// 都必须在 VACUUM、发布锁与轮转之前失败，绝不能 parseInt 截断或静默回退后删除既有备份。
+export function parseBackupKeep(raw: string | undefined): number {
+  if (raw == null || raw === '') return DEFAULT_BACKUP_KEEP
+  if (!/^[1-9][0-9]*$/.test(raw)) {
+    throw new Error(`BACKUP_KEEP 必须是 >=1 的十进制整数，得到：${JSON.stringify(raw)}`)
+  }
+  const keep = Number(raw)
+  if (!Number.isSafeInteger(keep)) {
+    throw new Error(`BACKUP_KEEP 必须是安全整数，得到：${JSON.stringify(raw)}`)
+  }
+  return keep
+}
 
 // ============================================================================
 // 跨进程发布锁（P6-R2 复审三轮第 5 条）

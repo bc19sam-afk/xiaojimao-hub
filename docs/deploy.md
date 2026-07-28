@@ -136,7 +136,7 @@ docker compose logs -f app   # 有迁移：[schema-check] 需迁移 → [backup]
 
 ### 5.1 备份机制
 
-`scripts/backup.ts` 用 SQLite `VACUUM INTO` 产出 **WAL 安全的一致性单文件快照**（对源库只读、不打断在线写入），先写唯一 `.tmp-backup-*` 再原子发布为 `data/backups/backup-<时间戳>-<随机>.db`，并按 `BACKUP_KEEP`（默认 7）只保留最新 N 份。临时库在 VACUUM 写入前就以 0600 原子创建；即使 SIGKILL 来不及清理，敏感内容也不会短暂落成 0644。
+`scripts/backup.ts` 用 SQLite `VACUUM INTO` 产出 **WAL 安全的一致性单文件快照**（对源库只读、不打断在线写入），先写唯一 `.tmp-backup-*` 再原子发布为 `data/backups/backup-<时间戳>-<随机>.db`，并按 `BACKUP_KEEP`（默认 7）只保留最新 N 份。`BACKUP_KEEP` 仅在未配置或空值时取默认值；非空值必须是 `>=1` 的十进制安全整数，否则手动/自动入口都会在 VACUUM 与轮转前失败，绝不静默回退后删旧备份。临时库在 VACUUM 写入前就以 0600 原子创建；即使 SIGKILL 来不及清理，敏感内容也不会短暂落成 0644。
 
 - **升级期自动**：容器启动时若 `schema-check` 判定**有待迁移**才备份（schema 已最新则跳过）；未完结升级的重试（含中途换目标版本）由 `.upgrade-in-progress` 标记去重，标记记录升级前快照（备份后钉成 `data/backups/preupgrade.db`、改名移出 `backup-*.db` 轮转集，不被 `BACKUP_KEEP`/手动备份轮转掉）的绝对路径、**验证快照仍在才跳过备份**（快照丢失则重新备份当前状态），保住迁移前唯一回滚点，迁移成功即清标记；备份失败即中止启动（fail-closed）。详见 §4。
 - **每日自动**（P6-R2）：worker 每轮巡检末尾检查「今天（服务器本地日）是否已有备份」，没有就备一份。升级期备份只在有待迁移时才跑——不升级的日子，上次升级以来的数据本来没有任何快照，这条补上。
@@ -317,12 +317,14 @@ ${APP_BASE_URL}/api/auth/linuxdo/callback
 
 | | `GET /api/health`（liveness） | `GET /api/ready`（readiness） |
 |---|---|---|
-| 判什么 | 进程活着 | 库能读 + schema 版本 === 代码要求 |
+| 判什么 | 进程活着 | 常驻连接可读 + `DB_PATH` 仍是启动时 dev/inode + fresh 磁盘连接可读 + 两侧 schema 版本 === 代码要求 |
 | 响应 | 恒 `200 {"ok":true}` | `200 {"ok":true}` / `503 {"ok":false}` |
 | 不通该做什么 | **重启容器** | **摘流量 + 告警，别重启** |
 | 谁在用 | 镜像 `HEALTHCHECK`、反代存活判断 | 外部拨测、反代 upstream 摘除、恢复校验 |
 
 两者都无鉴权、无副作用，响应体只有 `ok` 字段——不带版本/路径/配置/账号信息（§8）。不就绪的具体原因（schema 版本差多少等）只进服务端日志：`[ready] 未就绪：...`。
+
+> readiness 不是全库 `quick_check`：它能发现路径被 unlink/换 inode、磁盘 schema 不可读或版本不匹配，但不承诺识别任意业务数据页损坏。完整快照校验仍由恢复流程里的 `PRAGMA quick_check` 承担。
 
 > 🔴 **`HEALTHCHECK` 故意仍用 liveness**：schema 落后时重启容器修不好问题（迁移是部署步骤，不是启动时自动跑），只会让容器反复重启进 churn 循环。readiness 的用途是让人/监控知道「这实例现在不该接流量」。
 

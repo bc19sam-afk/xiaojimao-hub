@@ -1,11 +1,11 @@
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
-import { execSync } from 'node:child_process'
+import { execSync, spawnSync } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
-import { backupDb, dailyBackupIfDue, latestBackupDay } from '../lib/backup.ts'
+import { backupDb, dailyBackupIfDue, latestBackupDay, parseBackupKeep } from '../lib/backup.ts'
 
 // ============================================================================
 // P6-R2 ②：每日自动备份（lib/backup.ts）
@@ -52,6 +52,47 @@ function fakeBackupAtLocal(dir: string, localIso: string, tag: string): string {
   fs.writeFileSync(path.join(dir, name), 'stub')
   return name
 }
+
+test('parseBackupKeep：仅未配置/空值时默认 7，非空脏值与不安全整数全部拒绝', () => {
+  assert.equal(parseBackupKeep(undefined), 7)
+  assert.equal(parseBackupKeep(''), 7)
+  assert.equal(parseBackupKeep('1'), 1)
+  assert.equal(parseBackupKeep('30'), 30)
+  for (const raw of ['0', '-1', '1.5', 'abc', '7abc', ' 7', '7 ', '999999999999999999999999']) {
+    assert.throws(() => parseBackupKeep(raw), /BACKUP_KEEP/)
+  }
+})
+
+test('scripts/backup.ts：部分可解析脏值 7abc 也必须在轮转前拒绝', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'backup-script-invalid-keep-'))
+  try {
+    const dbPath = makeDb(root)
+    const dir = path.join(root, 'backups')
+    for (const day of ['01', '02', '03', '04', '05', '06', '07', '08']) {
+      fakeBackupAtLocal(dir, `2026-07-${day}T09:00:00`, `script${day}`)
+    }
+    const before = fs.readdirSync(dir).sort()
+    const result = spawnSync(
+      process.execPath,
+      [path.resolve(import.meta.dirname, '../scripts/backup.ts')],
+      {
+        cwd: path.resolve(import.meta.dirname, '..'),
+        env: {
+          ...process.env,
+          DB_PATH: dbPath,
+          BACKUP_DIR: dir,
+          BACKUP_KEEP: '7abc',
+        },
+        encoding: 'utf8',
+      },
+    )
+    assert.notEqual(result.status, 0)
+    assert.match(result.stderr, /BACKUP_KEEP/)
+    assert.deepEqual(fs.readdirSync(dir).sort(), before, '手动入口也不得创建新备份或删除既有备份')
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
 
 // ===== latestBackupDay =====
 
@@ -290,5 +331,40 @@ test('R6⑤：首轮备份后 ≥ 1 小时 → 复查磁盘 → 发现今天备�
     delete process.env.BACKUP_DIR
     delete process.env.BACKUP_KEEP
     fs.rmSync(tmpRoot, { recursive: true, force: true })
+  }
+})
+
+test('P6-R2 fail-closed：非空非法 BACKUP_KEEP 不得创建新备份或轮转删除既有备份', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'backup-invalid-keep-'))
+  const dbPath = makeDb(root)
+  const dir = path.join(root, 'backups')
+  for (const day of ['01', '02', '03', '04', '05', '06', '07', '08']) {
+    fakeBackupAtLocal(dir, `2026-07-${day}T09:00:00`, `keep${day}`)
+  }
+  const before = fs.readdirSync(dir).sort()
+  const { runDailyBackup, __resetBackupDayCache } = await import('../lib/worker.ts')
+  __resetBackupDayCache()
+  process.env.DB_PATH = dbPath
+  process.env.BACKUP_DIR = dir
+  process.env.BACKUP_KEEP = 'abc'
+  let thrown: unknown
+  try {
+    try {
+      runDailyBackup(new Date('2026-07-09T09:00:00'))
+    } catch (err) {
+      thrown = err
+    }
+    assert.deepEqual(
+      fs.readdirSync(dir).sort(),
+      before,
+      '🔴 配置非法时必须在 VACUUM/rename/轮转前失败，既有备份一个都不能删',
+    )
+    assert.match(String(thrown), /BACKUP_KEEP.*(?:>= ?1|正整数|十进制)/)
+  } finally {
+    __resetBackupDayCache()
+    delete process.env.DB_PATH
+    delete process.env.BACKUP_DIR
+    delete process.env.BACKUP_KEEP
+    fs.rmSync(root, { recursive: true, force: true })
   }
 })

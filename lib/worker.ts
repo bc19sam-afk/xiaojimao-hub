@@ -1,7 +1,7 @@
 import path from 'node:path'
 import { checkPooledHealth, processPending } from './collect'
 import { settleDailyUsage } from './settle'
-import { dailyBackupIfDue } from './backup'
+import { dailyBackupIfDue, parseBackupKeep } from './backup'
 import { env } from './env'
 
 // ============================================================================
@@ -19,12 +19,11 @@ let started = false
 // ===== 每日自动备份（P6-R2，见 lib/backup.ts 的防 churn 说明）=====
 // 备份路径口径与 scripts/backup.ts 逐字对齐（同一套 env 默认值），保证手动/自动两条入口写同一个目录。
 function backupPaths(): { dbPath: string; dir: string; keep: number } {
-  const keep = Number.parseInt(process.env.BACKUP_KEEP || '7', 10)
   return {
     dbPath: process.env.DB_PATH || path.join(process.cwd(), 'data', 'app.db'),
     dir: process.env.BACKUP_DIR || path.join(process.cwd(), 'data', 'backups'),
-    // 脏值兜底：backupDb 对 keep<1 会抛，自动备份不该因为 env 填错就每轮报错刷屏
-    keep: Number.isInteger(keep) && keep >= 1 ? keep : 7,
+    // 非空脏值必须在 VACUUM/轮转前抛错；tick 外层只记备份错误，不影响收号主链路，也绝不删旧备份。
+    keep: parseBackupKeep(process.env.BACKUP_KEEP),
   }
 }
 
