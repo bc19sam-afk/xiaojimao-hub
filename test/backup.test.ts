@@ -196,7 +196,7 @@ test('原子发布：遗留的 .tmp-backup-*.db 不影响 latestBackupDay 与轮
 // ⑤ 🔴🔴 核心回归：**真的 SIGKILL 掉正在 VACUUM 的进程**，断言目录里零个 backup-*.db。
 //    这是本条修复要防的那个确切场景（断电/OOM kill），也是唯一能钉住「先临时名后 rename」的测法——
 //    抛错路径早就被 catch 兜住了（修复前也过），只有硬杀会暴露「直接写最终名」的问题。
-test('原子发布：VACUUM 中途进程被 SIGKILL → 不留下任何 backup-*.db', async () => {
+test('原子发布：VACUUM 中途进程被 SIGKILL → 不留下 backup-*.db，临时库从首字节起不宽于 0600', async () => {
   const dir = fs.mkdtempSync(path.join(tmpDir, 'atomic-kill-'))
   const dbPath = path.join(dir, 'big.db')
   const backupsDir = path.join(dir, 'backups')
@@ -222,6 +222,7 @@ test('原子发布：VACUUM 中途进程被 SIGKILL → 不留下任何 backup-*
       path.resolve(import.meta.dirname, 'setup.mjs'),
       '-e',
       `import('${path.resolve(import.meta.dirname, '../lib/backup.ts')}').then(m => {
+         process.umask(0o022)
          process.send?.('start')
          m.backupDb(${JSON.stringify(dbPath)}, ${JSON.stringify(backupsDir)}, 7)
        })`,
@@ -235,21 +236,42 @@ test('原子发布：VACUUM 中途进程被 SIGKILL → 不留下任何 backup-*
   const deadline = Date.now() + 5000
   let caught = false
   while (Date.now() < deadline) {
-    if (fs.readdirSync(backupsDir).length > 0) {
-      caught = true
-      break
+    const partial = fs
+      .readdirSync(backupsDir)
+      .find((name) => name.startsWith('.tmp-backup-'))
+    if (!partial) continue
+    try {
+      if (fs.statSync(path.join(backupsDir, partial)).size > 0) {
+        caught = true
+        break
+      }
+    } catch (err) {
+      // VACUUM 完成后会立刻 rename；若恰在 readdir/stat 间消失，继续轮询，让后置断言判定是否错过窗口。
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err
     }
   }
+  if (caught) child.kill('SIGSTOP') // 先冻结写入进程，缩短“观测到首字节→SIGKILL”之间的调度竞态
   child.kill('SIGKILL')
   await exited
 
   const leftovers = fs.readdirSync(backupsDir)
-  assert.ok(caught, `5s 内没观测到 VACUUM 写出任何文件，本例失效：${JSON.stringify(leftovers)}`)
+  assert.ok(caught, `5s 内没观测到 VACUUM 写出非空临时库，本例失效：${JSON.stringify(leftovers)}`)
   assert.deepEqual(
     leftovers.filter((f) => /^backup-.*\.db$/.test(f)),
     [],
     `🔴 被硬杀后留下了 backup-*.db，它会被 latestBackupDay 当成「今天备过了」并占轮转名额：${JSON.stringify(leftovers)}`,
   )
+  const partials = leftovers.filter((f) => f.startsWith('.tmp-backup-'))
+  assert.ok(partials.length >= 1, `前置：应留下正在写的临时库，实际：${JSON.stringify(leftovers)}`)
+  for (const name of partials) {
+    const p = path.join(backupsDir, name)
+    assert.ok(fs.statSync(p).size > 0, '前置：被杀时临时库已写入数据，不是空壳')
+    assert.equal(
+      fs.statSync(p).mode & 0o777,
+      0o600,
+      `🔴 SIGKILL 无法清理临时库，因此它从创建第一字节起就必须是 0600：${name}`,
+    )
+  }
 })
 
 // ⑤b VACUUM 抛错（可捕获的失败路径）也不留残骸

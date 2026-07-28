@@ -91,9 +91,17 @@ export function backupDb(dbPath: string, backupDir: string, keep: number, now: D
   //    发布锁 / rename / 轮转），单一清理出口。将来在这中间插新步骤也自动被覆盖，不会再漏。
   //    ⚠️ rename 成功之后才抛错（轮转阶段）时，tmp 已不存在，`force: true` 的 rmSync 是空操作
   //       ——不会误删刚发布的 target。
-  //    ⚠️ 硬杀（SIGKILL/断电）仍会留 tmp：内核不给进程善终机会，JS 层无法清理。它是无害残留
-  //       （不进任何判据），由运维手动删；故意不自动清扫同目录 .tmp-*（见上面注释：会误删并发进程的）。
+  //    ⚠️ 硬杀（SIGKILL/断电）仍会留 tmp：它不进轮转/每日判据，但内容仍是敏感全库，不能称为
+  //       “无害”。因此在 VACUUM 写首字节前先原子创建 0600 空文件；后续 chmod 只是发布前纵深防御。
+  //       遗留文件由运维手动删；故意不自动清扫同目录 .tmp-*（会误删并发进程正在写的文件）。
+  let tmpOwned = false
   try {
+    // SQLite 允许 VACUUM INTO 写入“已存在但为空”的文件。先用 wx+0600 创建，既避免进程级 umask
+    // 的全局副作用，也保证 SIGKILL 落在任意写入时刻，磁盘上的临时全库从第一字节起就不宽于 0600。
+    const tmpFd = fs.openSync(tmp, 'wx', 0o600)
+    tmpOwned = true
+    fs.closeSync(tmpFd)
+
     const src = new DatabaseSync(dbPath)
     try {
       src.exec('PRAGMA busy_timeout = 5000')
@@ -120,7 +128,7 @@ export function backupDb(dbPath: string, backupDir: string, keep: number, now: D
       for (const old of others.slice(keep - 1)) fs.rmSync(old.p, { force: true })
     })
   } catch (err) {
-    fs.rmSync(tmp, { force: true }) // 任何失败：产物不可用且不被任何判据识别，留着只会堆磁盘
+    if (tmpOwned) fs.rmSync(tmp, { force: true }) // 只清本进程创建的 tmp；随机名碰撞时不能删别人的文件
     throw err
   }
 

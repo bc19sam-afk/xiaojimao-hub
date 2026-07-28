@@ -50,6 +50,21 @@ export interface Contribution {
 
 const DB_PATH = process.env.DB_PATH || path.join(process.cwd(), 'data', 'app.db')
 
+interface DbFileIdentity {
+  dev: bigint
+  ino: bigint
+}
+
+function dbFileIdentity(): DbFileIdentity | null {
+  if (DB_PATH === ':memory:') return null
+  const stat = fs.statSync(DB_PATH, { bigint: true })
+  return { dev: stat.dev, ino: stat.ino }
+}
+
+function sameDbFile(a: DbFileIdentity, b: DbFileIdentity): boolean {
+  return a.dev === b.dev && a.ino === b.ino
+}
+
 function openDb(): DatabaseSync {
   fs.mkdirSync(path.dirname(DB_PATH), { recursive: true })
   const d = new DatabaseSync(DB_PATH)
@@ -154,9 +169,21 @@ export function seedDefaults(d: DatabaseSync): void {
   }
 }
 
-// 跨热更新复用同一连接
-const g = globalThis as unknown as { __appDb?: DatabaseSync }
-const conn: DatabaseSync = g.__appDb ?? (g.__appDb = openDb())
+// 跨热更新复用同一连接。文件身份必须跟连接一起缓存：若热更新后重新 stat 当前路径、却继续复用旧
+// SQLite 连接，恰好会把“路径已原子换库、连接仍绑旧 inode”的危险现场重新标成健康。
+const g = globalThis as unknown as {
+  __appDb?: DatabaseSync
+  __appDbPath?: string
+  __appDbIdentity?: DbFileIdentity | null
+}
+if (g.__appDb == null) {
+  g.__appDb = openDb()
+  g.__appDbPath = DB_PATH
+  g.__appDbIdentity = dbFileIdentity()
+}
+const conn: DatabaseSync = g.__appDb
+const openedDbPath = g.__appDbPath
+const openedDbIdentity = g.__appDbIdentity
 
 interface Row {
   id: string
@@ -1344,23 +1371,79 @@ export const db = {
   },
 
   // ===== readiness 只读探针（P6-R2，§9）=====
-  // 供 lib/ready.ts（/api/ready）判定：对**应用实际在用的那条常驻连接**跑一条最轻只读语句 + 读 schema
-  // 版本。不新开连接（新开连接只能证明「文件能打开」，证明不了当前进程这条连接还活着）。纯只读、无副作用。
-  // 抛错不在此处吞——由调用方捕获判 503（库坏/表缺/schema_version 多行都该判「未就绪」而非静默放行）。
-  // ⚠️ 能探到什么，别高估（P6-R2 复审第 8 条，逐场景实测）：`SELECT 1` 是常量表达式，**不读库文件**，
-  //    连接没关就恒回 1；`SELECT version FROM schema_version` 也常命中本连接的 page cache。实测六种坏法：
-  //      库文件被删           → alive=1、旧版本号，**探不出来**（老连接照读缓存页）
-  //      被换成另一个库(v3)   → alive=1、仍报旧版本 11，**探不出来**（同上；新开连接才读到 3）
-  //      头完好·尾部数据页砸烂 → alive=1、旧版本号，**探不出来**
-  //      截断到只剩文件头      → 抛 "database disk image is malformed" → 调用方 catch 判未就绪 ✅
-  //      整文件覆盖(头也没了)  → 抛 "file is not a database" → 同上 ✅
-  //      连接已 close         → 抛 "database is not open" → 同上 ✅
-  //    规律：**坏在文件头/整体结构才探得到，坏在数据页或整个文件被替换探不到**。故本探针的实际覆盖面是
-  //    「连接还活着 + 本进程认知里的 schema 版本对不对得上」，不是「磁盘上的库是好的」。
-  // 🔴 §8：只回数字，绝不回库路径/配置/任何业务数据。
-  readyProbe(): { alive: number; schemaVersion: number | null } {
+  // 同时验证两件此前被混为一谈的事实：① 应用实际在用的常驻连接仍活着；② DB_PATH 当前仍指向
+  // 启动时打开的同一 dev/inode，并且新只读连接能从磁盘路径读出 schema。只做其中任一半都会假绿：
+  // 新连接证明不了常驻连接；常驻连接在路径被 unlink/rename 后又会继续读写已不可见的旧 inode。
+  // fresh 连接不使用 immutable=1：运行中的库是 WAL，immutable 会忽略 WAL 里尚未 checkpoint 的已提交状态。
+  // DB_PATH 在 stat/open/stat 间变化会抛错或身份不匹配，由调用方统一判 503；fresh 连接始终 finally close。
+  // 🔴 §8：只回布尔/版本号，绝不回库路径、dev/ino、配置或任何业务数据。
+  readyProbe(): {
+    alive: number
+    residentSchemaVersion: number | null
+    dbPathExists: boolean
+    dbPathMatchesOpenedFile: boolean
+    diskSchemaVersion: number | null
+  } {
     const r = conn.prepare('SELECT 1 AS ok').get() as unknown as { ok: number } | undefined
-    return { alive: r?.ok ?? 0, schemaVersion: readSchemaVersion(conn) }
+    const residentSchemaVersion = readSchemaVersion(conn)
+
+    // 测试/工具进程可显式使用 :memory:；它没有磁盘路径或 inode，磁盘侧判据退化为同一常驻连接。
+    if (DB_PATH === ':memory:') {
+      return {
+        alive: r?.ok ?? 0,
+        residentSchemaVersion,
+        dbPathExists: true,
+        dbPathMatchesOpenedFile: openedDbPath === DB_PATH && openedDbIdentity === null,
+        diskSchemaVersion: residentSchemaVersion,
+      }
+    }
+
+    let currentIdentity: DbFileIdentity
+    try {
+      currentIdentity = dbFileIdentity() as DbFileIdentity
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+        return {
+          alive: r?.ok ?? 0,
+          residentSchemaVersion,
+          dbPathExists: false,
+          dbPathMatchesOpenedFile: false,
+          diskSchemaVersion: null,
+        }
+      }
+      throw err
+    }
+
+    const pathMatches =
+      openedDbPath === DB_PATH &&
+      openedDbIdentity != null &&
+      sameDbFile(openedDbIdentity, currentIdentity)
+    if (!pathMatches) {
+      return {
+        alive: r?.ok ?? 0,
+        residentSchemaVersion,
+        dbPathExists: true,
+        dbPathMatchesOpenedFile: false,
+        diskSchemaVersion: null,
+      }
+    }
+
+    const disk = new DatabaseSync(DB_PATH, { readOnly: true })
+    try {
+      disk.exec('PRAGMA busy_timeout = 5000')
+      const diskSchemaVersion = readSchemaVersion(disk)
+      const finalIdentity = dbFileIdentity() as DbFileIdentity
+      return {
+        alive: r?.ok ?? 0,
+        residentSchemaVersion,
+        dbPathExists: true,
+        dbPathMatchesOpenedFile:
+          sameDbFile(openedDbIdentity, finalIdentity) && sameDbFile(currentIdentity, finalIdentity),
+        diskSchemaVersion,
+      }
+    } finally {
+      disk.close()
+    }
   },
 }
 

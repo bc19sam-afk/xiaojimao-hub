@@ -26,8 +26,20 @@ set -eu
 DATA_DIR="${DATA_DIR:-data}"
 BACKUP_DIR="${BACKUP_DIR:-$DATA_DIR/backups}"
 APP_URL="${APP_URL:-http://127.0.0.1:3000}"
+READY_TIMEOUT="${READY_TIMEOUT:-60}"
 MARKER="$DATA_DIR/.upgrade-in-progress"
 DB="$DATA_DIR/app.db"
+
+# READY_TIMEOUT 会进入算术展开和 curl/sleep 参数，必须在任何 docker、停机或文件替换之前验证。
+# 只接受 1..86400 的十进制正整数：既避免 /bin/sh 把 abc 当变量名/0，也避免超大值造成无限值守。
+if ! printf '%s\n' "$READY_TIMEOUT" | grep -Eq '^[1-9][0-9]{0,4}$'; then
+  echo "❌ READY_TIMEOUT 必须是 1..86400 的十进制正整数，得到：$READY_TIMEOUT" >&2
+  exit 2
+fi
+if [ "$READY_TIMEOUT" -gt 86400 ]; then
+  echo "❌ READY_TIMEOUT 必须是 1..86400 的十进制正整数，得到：$READY_TIMEOUT" >&2
+  exit 2
+fi
 
 # 🔴 P6-R2 复审三轮第 1 条 + R6①：DB_PATH 覆盖 fail-closed 守卫（与 lib/worker.ts backupPaths() 对齐）
 #
@@ -64,68 +76,22 @@ CONTAINER_DB_PATH=$(docker compose config app 2>/dev/null \
   | sed "s/^['\"]//; s/['\"]$//" \
   || echo "")
 
-# 🔴 R6-P1②（codex R5 终审）：非默认 DB_PATH 的手工恢复指引。
-#
-#    修复前两处守卫都写「直接 cp 快照文件到实际库路径」——这条指引本身会毁数据：
-#      ① 库跑 WAL 模式，app 还在跑时 cp 拷的是**撕裂的中间态**（主文件与 -wal 不一致）；
-#      ② 即便先停了 app，遗留的 `-wal`/`-shm` 属于**旧库**，新库一起来 SQLite 会把这些陈旧页
-#         当成自己的未提交事务重放 → 库直接 malformed，或悄悄混入旧数据；
-#      ③ cp 出来的文件权限/属主随操作账号（root:root 0644 之类），容器以 uid1000 跑 → 起来
-#         就是 "unable to open database file"，或世界可读地暴露全库。
-#    故这里输出**与脚本自身完全同款**的安全序列：停 app → 现场留存 → 原子就位 → 清 WAL 残留
-#    → 恢复权限属主 → 起 app → 校验。绝不给裸 cp。
-#    ⚠️ 下面步骤 b 的路径是容器内路径（docker run 里跑 node），c/d/e 的路径是**宿主**路径——
-#       两者未必一致（DB_PATH=/srv/xjm/db 在容器里用，宿主侧可能是 /mnt/volumes/xjm/db 挂进去）。
-#       运维需自行换算：容器路径照抄守卫输出的那条（已从容器配置读出），宿主路径按自己绑定的
-#       volume 源目录填（compose 的 `-v <host>:<container>`左边）。文档不可能自动算这个（没法从
-#       容器配置反推宿主真实挂载点——overlay/tmpfs/命名卷都不是文件系统路径），只提供模板。
-print_manual_steps() {
-  _target="$1"
-  cat >&2 <<EOF
-     ⚠️ 下面步骤 b 是容器内路径（${_target}），c/d/e 是宿主路径——按你的 volume 绑定换算。
-     a) 停 app（释放写锁，务必先做）：
-          docker compose stop app
-     b) 留存当前现场（🔴 用 VACUUM INTO，不能 cp——WAL 里的已提交数据 cp 不到）：
-          docker compose run --rm --no-deps -T --entrypoint node app -e \\
-            'const {DatabaseSync}=require("node:sqlite");const d=new DatabaseSync("${_target}");d.exec("VACUUM INTO \"${_target}.pre-restore\"");d.close()'
-     c) 原子就位（<宿主路径>，非容器路径；先写临时名再 mv，中途被杀不会留半截库冒充好库）：
-          cp -- <快照路径> '<宿主路径>.tmp' && mv -- '<宿主路径>.tmp' '<宿主路径>'
-     d) 🔴 删掉旧库的 WAL 残留（<宿主路径>；不删则新库启动时会重放陈旧页 → malformed 或混入旧数据）：
-          rm -f '<宿主路径>-wal' '<宿主路径>-shm' '${MARKER}'
-     e) 恢复权限与属主（<宿主路径>；容器以 uid1000 跑，属主不对会 unable to open database file）：
-          sudo chown 1000:1000 '<宿主路径>' && sudo chmod 600 '<宿主路径>'
-     f) 起 app 并校验：
-          docker compose start app
-          curl -fsS --connect-timeout 3 --max-time 5 ${APP_URL}/api/ready
-EOF
+reject_nondefault_db_path() {
+  _source="$1"
+  echo "❌ restore.sh 不支持非默认 DB_PATH（${_source}检测到 DB_PATH=非默认值）。" >&2
+  echo "本脚本拒绝降级为手工恢复：该布局尚未纳入同一套 header/quick_check、私有 stage、互斥锁与信号 trap 状态机。" >&2
+  echo "不得通过 unset DB_PATH、清空 Compose 配置或猜测宿主挂载路径绕过；这些做法可能恢复错库或混入旧 WAL。" >&2
+  echo "本次已在停服务和修改数据库前中止。请使用经独立复核、明确支持该挂载布局的恢复工具。" >&2
+  echo "🔴 不可忽略本错误：强行执行会导致数据丢失。" >&2
+  exit 2
 }
 
 if [ -n "${DB_PATH:-}" ] && [ "$DB_PATH" != "data/app.db" ]; then
-  echo "❌ restore.sh 不支持非默认 DB_PATH（宿主侧检测到 DB_PATH='$DB_PATH'）。" >&2
-  echo "" >&2
-  echo "本脚本硬编码假设库位于 data/app.db（与 docker-compose.yml / Dockerfile 默认一致）。" >&2
-  echo "若运维环境已用 DB_PATH 覆盖库位置，请采用以下方案之一：" >&2
-  echo "  1. 临时恢复默认：unset DB_PATH 后执行本脚本；或" >&2
-  echo "  2. 手动恢复（照下面的顺序做，别直接 cp 到活库上）：" >&2
-  print_manual_steps "$DB_PATH"
-  echo "" >&2
-  echo "🔴 不可忽略本错误：强行执行会把快照恢复到错误位置，导致数据丢失。" >&2
-  exit 2
+  reject_nondefault_db_path "宿主侧"
 fi
 
 if [ -n "$CONTAINER_DB_PATH" ] && [ "$CONTAINER_DB_PATH" != "data/app.db" ]; then
-  echo "❌ restore.sh 不支持非默认 DB_PATH（容器内检测到 DB_PATH='$CONTAINER_DB_PATH'）。" >&2
-  echo "" >&2
-  echo "app 容器配置了非默认数据库路径（来自 .env 或 docker-compose.yml 的 environment）。" >&2
-  echo "本脚本硬编码假设库位于 data/app.db，继续执行会把快照恢复到错误位置。" >&2
-  echo "" >&2
-  echo "请采用以下方案之一：" >&2
-  echo "  1. 清空 .env / docker-compose.yml 里的 DB_PATH 配置，重新部署后执行本脚本；或" >&2
-  echo "  2. 手动恢复（照下面的顺序做，别直接 cp 到活库上）：" >&2
-  print_manual_steps "$CONTAINER_DB_PATH"
-  echo "" >&2
-  echo "🔴 不可忽略本错误：强行执行会导致数据丢失。" >&2
-  exit 2
+  reject_nondefault_db_path "容器内"
 fi
 
 # 路径归一：docker -v 只认绝对路径（相对路径会被当成**命名卷**静默建一个空卷，
@@ -282,17 +248,20 @@ if [ "$SNAPSHOT_ABS" = "$DB_ABS" ]; then
 fi
 
 # 🔴 分叉守卫（docs §5.2）：标记在＝上次升级没走完。此时若直接 start，新镜像 entrypoint 见 schema
-#    落后会拿刚还原的旧库重跑同一个失败迁移，回滚白做。必须先把镜像/代码退回旧版本、`up -d --build`
-#    重建容器，再带 --after-image-rollback 跑本脚本。
+#    落后会拿刚还原的旧库重跑同一个失败迁移，回滚白做。旧代码/镜像只能先 build/pull 并 create
+#    为停止态；数据库恢复完成前严禁 up/start。当前安全 restore 脚本还要先复制到 checkout 外保留。
 if [ -f "$MARKER" ] && [ "$AFTER_ROLLBACK" -eq 0 ]; then
   cat >&2 <<EOF
 🛑 检测到未完结的升级标记：$MARKER
    直接恢复会白做：新镜像启动时见 schema 落后，会拿还原后的旧库重跑同一个失败迁移。
    正确顺序：
-     1) 把代码/镜像退回旧版本（git checkout <旧提交/tag>，或改 compose 切回旧镜像 tag）
-     2) docker compose up -d --build        # 重建容器，旧代码与旧库版本一致、不再迁移
-     3) $0 --after-image-rollback $SNAPSHOT
-   （已确认完成第 1、2 步时，加 --after-image-rollback 继续。）
+     1) RECOVERY_SH="\$(mktemp)"; cp "$0" "\$RECOVERY_SH"; chmod 700 "\$RECOVERY_SH"
+     2) docker compose stop app
+     3) 把代码/镜像退回旧版本（git checkout <旧提交/tag>，或改 compose 切回旧镜像 tag）
+     4) docker compose build app
+     5) docker compose create --force-recreate app   # 只重建为停止态，绝不运行 entrypoint
+     6) "\$RECOVERY_SH" --after-image-rollback <升级前快照路径> && rm -f "\$RECOVERY_SH"
+   🔴 第 6 步前禁止 docker compose up/start；否则旧服务会在旧库恢复前启动并可能写入中间 schema。
 EOF
   exit 3
 fi
@@ -444,7 +413,7 @@ fi
 #    实测截到 2048 字节的库仍带 'SQLite format 3' 头，但 quick_check 抛 malformed。不校验就会
 #    停服务、换库，直到 readiness 才发现，而那时现场已经被换掉了。故放在所有破坏性步骤之前。
 #    只读打开（readOnly:true），绝不改动快照本身。
-echo "→ 校验快照完整性（PRAGMA quick_check + WAL 模式判据）"
+echo "→ 校验快照完整性（PRAGMA quick_check + header 1/1 单文件格式判据）"
 # `immutable=1`（不是单纯 readOnly:true）：WAL 模式的快照主文件，SQLite 打开时即便只读也要在
 # **同目录**建 -wal/-shm——挂 :ro 会直接报 "attempt to write a readonly database"，
 # 把快照误判成坏的。immutable 让 SQLite 完全跳过 WAL/锁机制，只读文件本身；实测仍能检出
@@ -458,8 +427,9 @@ echo "→ 校验快照完整性（PRAGMA quick_check + WAL 模式判据）"
 #    裸 cp 主文件 → quick_check=ok 但只有 100 行；VACUUM INTO 产物 → 150 行。
 #
 #    判据用**文件头 offset 18-19**（两个字节：file format write/read version），不是 PRAGMA：
-#      · 1/1 (0101) = journal 模式（delete/truncate/persist）→ 单文件自足，VACUUM INTO 的产物
-#      · 2/2 (0202) = WAL 模式 → 主文件**可能**不自足，配套 -wal 才是完整状态
+#      · 1/1 (0101) = 已知安全的 journal 单文件格式（VACUUM INTO 的产物）→ 接受
+#      · 2/2 (0202) = WAL 模式 → 主文件**可能**不自足，配套 -wal 才是完整状态 → 拒绝
+#      · 其他未知/混合值没有经过安全证明 → 一律 fail-closed 拒绝；不能把“不是 2”误当成安全
 #    ⚠️ 实测澄清（codex 建议用 `PRAGMA journal_mode` 判，本轮验证后改用文件头）：immutable=1 打开时
 #       `PRAGMA journal_mode` 对两种快照**都返回 delete**（immutable 让 SQLite 完全绕开 WAL 机制、
 #       报的是"当前连接的有效模式"而非文件真实形态）——照 PRAGMA 判会全部放行，等于没修。文件头
@@ -472,12 +442,11 @@ echo "→ 校验快照完整性（PRAGMA quick_check + WAL 模式判据）"
 #       一份快照（脚本下面给了确切命令）；放行的代价是静默丢数据、且要到很久以后才发现。宁可误拒。
 #       docs §5.3 的 sync-backups.sh 异机备份链路取的都是 backupDb() 的 VACUUM 产物（0101），
 #       正常运维路径不受影响。
-#    ⚠️ 与 R6-P1② 手工恢复指引一致：那段已明确「不能 cp——WAL 里的已提交数据 cp 不到」，
-#       这里是脚本自身把同一条纪律**强制**起来（此前只在文档里劝，脚本照收）。
+#    ⚠️ 非默认 DB_PATH 也不再给出弱化手工配方；所有恢复都必须复用同一套校验和状态机。
 node_with_snapshot "$RESTORE_STAGE" '
   const fs = require("fs")
   const { DatabaseSync } = require("node:sqlite")
-  // 先看文件头：offset 18/19 = write/read format version（1=journal，2=WAL）
+  // 先看文件头：offset 18/19 = write/read format version。仅 1/1 是本恢复器已知安全的单文件形态。
   const fd = fs.openSync("/snap.db", "r")
   const hdr = Buffer.alloc(20)
   try {
@@ -485,9 +454,9 @@ node_with_snapshot "$RESTORE_STAGE" '
   } finally {
     fs.closeSync(fd)
   }
-  if (hdr[18] === 2 || hdr[19] === 2) {
-    console.error("WAL_MODE_SNAPSHOT")
-    process.exit(2)
+  if (hdr[18] !== 1 || hdr[19] !== 1) {
+    console.error(`UNSAFE_SNAPSHOT_HEADER:${hdr[18]}/${hdr[19]}`)
+    process.exit(hdr[18] === 2 && hdr[19] === 2 ? 2 : 3)
   }
   const d = new DatabaseSync("file:/snap.db?immutable=1", { readOnly: true })
   try {
@@ -512,6 +481,12 @@ node_with_snapshot "$RESTORE_STAGE" '
        'const {DatabaseSync}=require("node:sqlite");const d=new DatabaseSync("<该库路径>");d.exec("VACUUM INTO \"<输出路径>\"");d.close()'
    注：干净关闭的 WAL 库其实内容完整，但磁盘上与「活动库裸 cp」无法区分，故一并拒绝（宁可误拒）。
 EOF
+    echo "   已中止，${DB} 未被改动，app 也未停。" >&2
+    exit 1
+  fi
+  if [ "$_vrc" = "3" ]; then
+    echo "❌ 快照 header bytes 18/19 不是已知安全的 1/1，拒绝使用：${SNAPSHOT}" >&2
+    echo "   本恢复器只接受 VACUUM INTO 产出的 1/1 journal 单文件格式；未知或混合值一律 fail-closed。" >&2
     echo "   已中止，${DB} 未被改动，app 也未停。" >&2
     exit 1
   fi
@@ -589,8 +564,8 @@ echo "→ 起 app"
 docker compose start app
 
 # 校验：先 liveness（进程起来了吗），再 readiness（库能读、schema 版本对得上吗）。
-# readiness 才是「恢复成功」的判据——liveness 通过但 schema 不匹配说明还原错了版本的快照。
-READY_TIMEOUT="${READY_TIMEOUT:-60}"
+# readiness 才是「恢复成功」的判据——它还会核对 DB_PATH 文件身份与磁盘 schema；liveness 通过
+# 只能说明进程活着，不能证明常驻连接仍指向当前路径上的数据库。
 echo "→ 校验 $APP_URL/api/health 与 /api/ready（最多等 ${READY_TIMEOUT}s）"
 # 🔴 单次请求必须有界（R4-P2④，codex R6 指出）：APP_URL 能建连但**永不返回响应**时（进程卡在
 #    某个 await、反代挂起），无超时的 curl 会在一次迭代里无限阻塞——承诺的 60s 上限失效，

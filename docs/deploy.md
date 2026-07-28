@@ -136,7 +136,7 @@ docker compose logs -f app   # 有迁移：[schema-check] 需迁移 → [backup]
 
 ### 5.1 备份机制
 
-`scripts/backup.ts` 用 SQLite `VACUUM INTO` 产出 **WAL 安全的一致性单文件快照**（对源库只读、不打断在线写入），落到 `data/backups/backup-<时间戳>-<随机>.db`，并按 `BACKUP_KEEP`（默认 7）只保留最新 N 份。
+`scripts/backup.ts` 用 SQLite `VACUUM INTO` 产出 **WAL 安全的一致性单文件快照**（对源库只读、不打断在线写入），先写唯一 `.tmp-backup-*` 再原子发布为 `data/backups/backup-<时间戳>-<随机>.db`，并按 `BACKUP_KEEP`（默认 7）只保留最新 N 份。临时库在 VACUUM 写入前就以 0600 原子创建；即使 SIGKILL 来不及清理，敏感内容也不会短暂落成 0644。
 
 - **升级期自动**：容器启动时若 `schema-check` 判定**有待迁移**才备份（schema 已最新则跳过）；未完结升级的重试（含中途换目标版本）由 `.upgrade-in-progress` 标记去重，标记记录升级前快照（备份后钉成 `data/backups/preupgrade.db`、改名移出 `backup-*.db` 轮转集，不被 `BACKUP_KEEP`/手动备份轮转掉）的绝对路径、**验证快照仍在才跳过备份**（快照丢失则重新备份当前状态），保住迁移前唯一回滚点，迁移成功即清标记；备份失败即中止启动（fail-closed）。详见 §4。
 - **每日自动**（P6-R2）：worker 每轮巡检末尾检查「今天（服务器本地日）是否已有备份」，没有就备一份。升级期备份只在有待迁移时才跑——不升级的日子，上次升级以来的数据本来没有任何快照，这条补上。
@@ -161,10 +161,10 @@ docker compose logs -f app   # 有迁移：[schema-check] 需迁移 → [backup]
 ./scripts/restore.sh data/backups/backup-2026-07-26T01-00-00-a1b2c3.db
 ```
 
-脚本按顺序做：取得 `data/.restore-in-progress` 互斥锁 → 把源快照固化为锁目录内的私有 0600 stage → 对**同一 stage**做文件头、`PRAGMA quick_check` 与 WAL 模式拒收校验 → `docker compose stop app` → 现场 `app.db` 用 `VACUUM INTO` 存为 `data/backups/pre-restore.db`（单文件覆盖式，同 `preupgrade.db` 一样不进轮转集）→ 创建 `replace-armed` 状态并把已校验 stage 同文件系统原子 `mv` 为 `app.db` → 删旧库的 `-wal`/`-shm` 与 `.upgrade-in-progress` → `docker compose start app` → 轮询 `/api/ready` 最多 60s（可用 `READY_TIMEOUT` 调；每轮 curl 与 sleep 都按剩余秒数钳制）→ 释放状态锁。
+脚本按顺序做：先校验 `READY_TIMEOUT` → 取得 `data/.restore-in-progress` 互斥锁 → 把源快照固化为锁目录内的私有 0600 stage → 对**同一 stage**做文件头、`PRAGMA quick_check` 与单文件格式校验 → `docker compose stop app` → 现场 `app.db` 用 `VACUUM INTO` 存为 `data/backups/pre-restore.db`（单文件覆盖式，同 `preupgrade.db` 一样不进轮转集）→ 创建 `replace-armed` 状态并把已校验 stage 同文件系统原子 `mv` 为 `app.db` → 删旧库的 `-wal`/`-shm` 与 `.upgrade-in-progress` → `docker compose start app` → 轮询 `/api/ready` 最多 60s（可用 `READY_TIMEOUT` 调；每轮 curl 与 sleep 都按剩余秒数钳制）→ 释放状态锁。
 
 - 🔴 **完整性校验在所有破坏性步骤之前**：文件头检查（`SQLite format 3`）挡不住**截断/页损坏**——实测截到 2048 字节的库文件头仍然完好，但 `quick_check` 报 malformed。校验不过就直接中止：app 没停、`app.db` 没动。校验借 app 镜像里的 node 起一次性只读容器，以 `file:...?immutable=1` 打开（不是单纯 `readOnly`：纯 `cp` 出来的快照保留 `journal_mode=wal`，只读打开也要在同目录建 `-wal`/`-shm`，挂 `:ro` 会报 "attempt to write a readonly database" 把好快照误判成坏的）。
-- 🔴 **WAL 模式的快照一律拒收**（与 quick_check 同一步，同样在破坏性步骤之前）：WAL 库的已提交数据可能**只存在于配套的 `-wal` 里**，单独还原主文件会静默丢一截——而它结构完好、`quick_check` 返回 ok、`/api/ready` 也过，运维不会察觉（实测：源库 150 行，裸 `cp` 主文件还原出来只有 100 行）。判据是**文件头 offset 18/19**（`1/1`＝journal 模式，`VACUUM INTO` 的产物；`2/2`＝WAL 模式），不是 `PRAGMA journal_mode`——`immutable=1` 打开时 PRAGMA 对两种快照都报 `delete`，照它判等于没判。
+- 🔴 **文件头只接受已知安全的 `1/1`**（与 quick_check 同一步，同样在破坏性步骤之前）：WAL 库的已提交数据可能**只存在于配套的 `-wal` 里**，单独还原主文件会静默丢一截——而它结构完好、`quick_check` 返回 ok、`/api/ready` 也过，运维不会察觉（实测：源库 150 行，裸 `cp` 主文件还原出来只有 100 行）。判据是**文件头 offset 18/19**：`1/1`＝已知安全的 journal 单文件格式（`VACUUM INTO` 的产物）；`2/2`＝WAL 模式；`0/0`、混合值或其他未知值也一律 fail-closed。不能用 `PRAGMA journal_mode` 代替——`immutable=1` 打开时 PRAGMA 对两种快照都报 `delete`，照它判等于没判。
   - `data/backups/backup-*.db`（`npm run backup` 与 worker 每日备份的产物）都是 `VACUUM INTO` 出来的，正常运维路径不受影响。
   - **已知误拒**：干净关闭的 WAL 库内容其实是完整的，但磁盘上与「活动库裸 cp」无法区分，故一并拒绝（宁可误拒也不静默丢数据）。触发时脚本会打印把它转成一致性快照的确切命令。
 - 🔴 **现场留存走 `VACUUM INTO`（借 app 镜像里的 node 起一次性容器），不是 `cp`**：`stop` 发的 SIGTERM 不做 WAL checkpoint，最后一段已提交数据只在 `app.db-wal` 里；裸拷主文件会丢这段，而脚本下一步就删 `-wal`——想反悔时回滚点已残缺且不可挽回。留存失败即 **fail-closed 中止**（不动 `app.db`），没有回滚点就不做破坏性还原。
@@ -173,53 +173,34 @@ docker compose logs -f app   # 有迁移：[schema-check] 需迁移 → [backup]
 - 🔴 **并发与进程级硬中断 fail closed**：同一 `DATA_DIR` 同时只允许一个 restore。若上次被 SIGKILL 或在不安全阶段失败，当前文件系统可见的 `data/.restore-in-progress` 会让下次以退出码 4 拒绝；其中 `replace-armed` 与 `snapshot.db` 的存在性用于判断“已武装未替换”还是“可能已替换待清 sidecar”。先保持 app 停止、确认现场并按脚本提示人工处置，禁止直接删锁后启动。
   - ⚠️ **这不是宿主断电一致性承诺**：脚本没有对 marker、rename、sidecar unlink 做 `fsync` 屏障，SIGKILL 回归也只能证明进程级硬中断，不能证明掉电后的磁盘持久顺序。若 restore 期间宿主掉电/强制重启，无论锁是否仍可见，都先保持 app 停止，人工核对 `app.db`、`app.db-wal`/`app.db-shm` 与锁目录后再启动；不能只凭 marker 存在性自动判断。
 
-- 🔴 **分叉守卫**：若 `data/.upgrade-in-progress` 存在（＝上次升级没走完），脚本**拒绝执行**并打印指引，退出码 3。必须先把镜像/代码退回旧版本、`docker compose up -d --build` 重建容器，再带 `--after-image-rollback` 重跑——原因见下方手工步骤里的 ⚠️ 分叉说明。
-- 校验用 `/api/ready`（不是 `/api/health`）：liveness 通过只说明进程活着，readiness 才验证「库能读 + schema 版本与镜像匹配」——还原错版本的快照就卡在这一步。
-- 环境变量：`SUDO=`（已是 uid1000 / macOS Docker Desktop 时跳过 sudo）、`DATA_DIR`、`BACKUP_DIR`、`APP_URL`、`READY_TIMEOUT`（等 readiness 的秒数上限，默认 60）。不能提权时自动省掉属主移交（只设权限 600）——Docker Desktop 会自动映射 uid，本就不需要 chown。
+- 🔴 **分叉守卫**：若 `data/.upgrade-in-progress` 存在（＝上次升级没走完），脚本**拒绝执行**并打印指引，退出码 3。先把当前安全 `restore.sh` 复制到 checkout 外，再停 app、退回旧代码/镜像、`docker compose build app`（使用镜像 tag 的部署则 `pull app`）、`docker compose create --force-recreate app` 重建为**停止态**，最后用保留的脚本带 `--after-image-rollback` 恢复。数据库恢复前禁止 `up`/`start`，否则旧服务会先运行 entrypoint 并可能写入中间 schema。
+- 校验用 `/api/ready`（不是 `/api/health`）：liveness 通过只说明进程活着；readiness 还会验证常驻连接、`DB_PATH` 当前 dev/inode 是否仍是启动时文件、磁盘新只读连接，以及两侧 schema 是否都与镜像匹配。路径被 unlink 或原子换库时，即使旧连接仍能读 page cache，也会摘流量。
+- 环境变量：`SUDO=`（已是 uid1000 / macOS Docker Desktop 时跳过 sudo）、`DATA_DIR`、`BACKUP_DIR`、`APP_URL`、`READY_TIMEOUT`（等 readiness 的秒数上限，默认 60，只接受十进制正整数 `1..86400`，且在任何 Docker/停机/替换前校验）。不能提权时自动省掉属主移交（只设权限 600）——Docker Desktop 会自动映射 uid，本就不需要 chown。
   - `BACKUP_DIR` 可自由改到任意路径（含 `data/` 之外）：脚本用显式 `-v` 把它挂进一次性容器，不依赖 compose 里那条 `./data:/app/data`。
   - 🔴 `DATA_DIR` **必须与 `docker-compose.yml` 里绑到 `/app/data` 的宿主路径一致**（默认那条是 `./data:/app/data`）：脚本按它定位要还原的库文件，容器按 compose 那条绑定定位它实际读的库；两者指的不是同一个目录时，还原的就是个 app 根本不读的文件。改了 compose 的绑定源要同步改这个。
-- 退出码：0 成功 / 1 快照无效（不存在／非 SQLite／未过 `quick_check`／是 WAL 模式主文件）、路径无法解析、sidecar/状态锁安全清理失败或校验超时 / 2 用法错（含「快照就是当前库本身」）/ 3 被升级标记拒绝 / 4 已有并发或异常中断的 restore 状态锁 / 130 收到 SIGINT / 143 收到 SIGTERM。
+- 退出码：0 成功 / 1 快照无效（不存在／非 SQLite／未过 `quick_check`／header 18/19 不是 `1/1`）、路径无法解析、sidecar/状态锁安全清理失败或校验超时 / 2 用法错（含非法 `READY_TIMEOUT`、非默认 `DB_PATH` 与「快照就是当前库本身」）/ 3 被升级标记拒绝 / 4 已有并发或异常中断的 restore 状态锁 / 130 收到 SIGINT / 143 收到 SIGTERM。
 
 演练完数据核对无误后，删掉 `data/backups/pre-restore.db` 即可（它不占轮转名额，但会一直留着）。
 
-#### 后备：手工步骤（脚本不可用、或需要逐步观察时）
+#### 脚本不可用或布局不受支持时：保持 fail-closed
 
-> 操作账号非 uid1000 时，下面直接读写 `./data`（0700，属主 1000）的命令都需 `sudo`；还原用 `install` 一步把 `app.db` 设成 **属主 1000 + 权限 600**（`cp` 覆盖已存在文件会保留目标原 mode，老部署那份 0644 不会收敛，且属主也要还原），否则容器起来写不了库、或库权限倒退到 0644。
+不要维护第二套裸 `cp/install/rm/start` 手工配方。那条路径会绕过 header `1/1`、`quick_check`、私有 stage、互斥锁、信号 trap 与“未替换时保留旧 WAL / 已替换时先清 sidecar 再启动”的状态机，很容易把恢复做成数据丢失或混库。
 
-```bash
-# 1) 先做一次备份，拿到一份快照文件名
-docker compose exec app node scripts/backup.ts
-sudo ls data/backups/                # 记下 backup-XXXX.db
+- 非默认 `DB_PATH` 当前明确不受 `restore.sh` 支持；不得用 `unset DB_PATH`、清空 Compose 配置或猜测容器路径到宿主路径的映射来绕过。保持 app 与真实配置不变，改用经独立复核、明确支持该挂载布局且复用同等安全门的专用恢复工具。
+- 升级失败回滚仍使用本脚本，只把旧容器预先重建为停止态：
 
-# 2) 停服务（释放对 app.db 的写锁）
-docker compose stop app
+  ```bash
+  RECOVERY_SH="$(mktemp)"
+  cp scripts/restore.sh "$RECOVERY_SH"
+  chmod 700 "$RECOVERY_SH"
+  docker compose stop app
+  git checkout <升级前的旧提交或 tag>
+  docker compose build app
+  docker compose create --force-recreate app
+  "$RECOVERY_SH" --after-image-rollback data/backups/preupgrade.db && rm -f "$RECOVERY_SH"
+  ```
 
-# 3) 备份现场后替换（-wal/-shm 是 WAL 副本，恢复整库快照时必须一并删除；
-#    .upgrade-in-progress 也要清——手动还原=人为终结升级链，不清则下次真升级会因「标记指向的旧快照仍在」被误判、跳过备份）
-# 🔴 存现场必须 VACUUM INTO，别用 cp：stop 发的 SIGTERM 不做 checkpoint，最后一段已提交数据只在 app.db-wal 里，
-#    裸 cp 只拷主文件会丢这段，而下一条命令就把 -wal 删了——想反悔时回滚点已残缺且不可挽回。
-docker compose run --rm --no-deps --entrypoint node app -e \
-  'const {DatabaseSync}=require("node:sqlite");const s=new DatabaseSync("/app/data/app.db");
-   try{s.exec("PRAGMA busy_timeout=5000");s.prepare("VACUUM INTO ?").run("/app/data/backups/app.db.broken.bak")}finally{s.close()}'
-sudo chmod 600 data/backups/app.db.broken.bak   # run 覆盖了 entrypoint，那条 umask 077 不生效
-# 还原源：日常回滚用某份 backup-XXXX.db；若还原的是「升级失败现场」，升级前快照就是 data/backups/preupgrade.db（钉住不轮转、即最近一次升级前的库）
-sudo install -o 1000 -g 1000 -m 600 data/backups/backup-XXXX.db data/app.db   # 一步 覆盖还原 + 属主 uid1000 + 权限 600；不用 cp（覆盖会保留目标原 mode，老部署 0644 收不紧、属主也不还原）
-sudo rm -f data/app.db-wal data/app.db-shm
-sudo rm -f data/.upgrade-in-progress
-
-# 4) 起服务，校验
-#    ⚠️ 分叉——还原的若是「升级失败现场」（用了 preupgrade.db，且本次升级的新镜像跑挂了），不要用 start：
-#       新镜像 entrypoint 见 schema 落后，会拿刚还原的旧库重跑同一个失败迁移，回滚白做。须先把代码/镜像退回旧版本
-#       （git checkout <旧提交/tag>，或改 compose 切回旧镜像 tag），再 `docker compose up -d --build` 重建容器——
-#       旧代码的 LATEST_VERSION 与旧库版本一致，schema-check 过、不再迁移，干净起来。
-#    日常演练 / 回滚到某份历史快照（镜像没换）才用下面这条：
-docker compose start app
-docker compose logs -f app           # [migrate] 完成、schema 版本正常
-curl -s http://127.0.0.1:3000/api/health   # {"ok":true}（进程活着）
-curl -s http://127.0.0.1:3000/api/ready    # {"ok":true}（库可读 + schema 版本匹配 ← 恢复成功的判据）
-```
-
-数据核对无误后删掉 `data/backups/app.db.broken.bak`。
+  使用远端镜像 tag 的部署可将 `docker compose build app` 换为 `docker compose pull app`。恢复脚本成功前禁止 `docker compose up` 或 `docker compose start app`。
 
 ### 5.3 异机同步（离线副本）
 

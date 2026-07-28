@@ -199,6 +199,7 @@ function runRestore(
   dataDir: string,
   backupsDir: string,
   snapshot: string,
+  envOverrides: NodeJS.ProcessEnv = {},
 ): { status: number; stdout: string; stderr: string; log: string } {
   const logFile = path.join(path.dirname(dataDir), 'stub.log')
   fs.writeFileSync(logFile, '')
@@ -211,6 +212,7 @@ function runRestore(
       SUDO: '', // 沙箱里当前用户就是属主，不用 sudo（也避免测试弹密码）
       DATA_DIR: dataDir,
       BACKUP_DIR: backupsDir,
+      ...envOverrides,
     },
     encoding: 'utf8',
   })
@@ -370,6 +372,29 @@ test('R7-P1①：纯 cp 出来的 wal 模式快照（非 VACUUM 产物）被拒�
   assert.doesNotMatch(r.log, /"stop"/, '🔴 校验没过就不该停服务（否则白停一次、现场也白存）')
 })
 
+for (const { label, bytes } of [
+  { label: '0/0', bytes: [0, 0] },
+  { label: '1/0', bytes: [1, 0] },
+  { label: '0/1', bytes: [0, 1] },
+  { label: '3/3', bytes: [3, 3] },
+] as const) {
+  test(`R7-P1① fail-closed：未知 SQLite header ${label} 一律拒收（只接受 1/1）`, () => {
+    const { dataDir, backupsDir } = scene(`unknown-header-${label.replace('/', '-')}`, 'CURRENT')
+    const snap = path.join(backupsDir, `backup-unknown-${label.replace('/', '-')}.db`)
+    makeSnapshot(snap, 'UNKNOWN-HEADER')
+    const buf = fs.readFileSync(snap)
+    buf[18] = bytes[0]
+    buf[19] = bytes[1]
+    fs.writeFileSync(snap, buf)
+
+    const r = runRestore(dataDir, backupsDir, snap)
+    assert.equal(r.status, 1, `未知 header ${label} 必须 fail-closed：\n${r.stdout}\n${r.stderr}`)
+    assert.match(r.stderr, /header.*18.*19.*1\/1|只接受.*1\/1/i, '必须明确只接受已知安全的 1/1')
+    assert.doesNotMatch(r.log, /"stop"/, 'header 未知时必须在停服务前拒绝')
+    assert.equal(readMarker(path.join(dataDir, 'app.db')), 'CURRENT', '当前库不得被替换')
+  })
+}
+
 // ②c 反向回归：VACUUM INTO 产物（文件头 1/1，backupDb 与 preupgrade.db 的真实形态）必须照收。
 //     没有这条，P1① 守卫退化成「拒绝一切快照」也能全绿。
 test('R7-P1① 回归：VACUUM INTO 产物（journal 模式）正常放行', () => {
@@ -517,6 +542,81 @@ exit 0
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true })
   }
+})
+
+test('P6-R2 fail-closed：非默认 DB_PATH 不再输出绕过主状态机的手工恢复命令', () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'restore-dbpath-no-fallback-'))
+  const dataDir = path.join(tmpRoot, 'data')
+  const backupsDir = path.join(dataDir, 'backups')
+  fs.mkdirSync(backupsDir, { recursive: true })
+  const snap = path.join(backupsDir, 'backup.db')
+  fs.writeFileSync(snap, '')
+  const logFile = path.join(tmpRoot, 'stub.log')
+  fs.writeFileSync(logFile, '')
+  try {
+    const r = spawnSync('sh', [RESTORE_SH, snap], {
+      cwd: REPO,
+      env: {
+        ...process.env,
+        PATH: `${binDir}:${process.env.PATH}`,
+        STUB_LOG: logFile,
+        SUDO: '',
+        DATA_DIR: dataDir,
+        BACKUP_DIR: backupsDir,
+        DB_PATH: '/custom/app.db',
+      },
+      encoding: 'utf8',
+    })
+    assert.equal(r.status, 2)
+    assert.match(r.stderr, /不提供.*手工|必须.*同一.*状态机|拒绝.*降级/i)
+    assert.doesNotMatch(
+      r.stderr,
+      /VACUUM INTO|sudo install|rm -f .*-(wal|shm)|docker compose stop app/,
+      '🔴 不得给出跳过 header/quick_check/私有 stage/锁/trap 的弱化恢复配方',
+    )
+    const docs = fs.readFileSync(path.join(REPO, 'docs', 'deploy.md'), 'utf8')
+    assert.match(docs, /保持 fail-closed/)
+    assert.doesNotMatch(docs, /后备：手工步骤|sudo install .*data\/app\.db/)
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true })
+  }
+})
+
+test('P6-R2 升级失败回滚：旧镜像只能 build/pull + create 为停止态，恢复前不得 up/start', () => {
+  const { dataDir, backupsDir } = scene('upgrade-rollback-order', 'MIGRATION-PARTIAL')
+  const snap = path.join(backupsDir, 'preupgrade.db')
+  makeSnapshot(snap, 'PRE-UPGRADE')
+  fs.writeFileSync(path.join(dataDir, '.upgrade-in-progress'), snap)
+
+  const r = runRestore(dataDir, backupsDir, snap)
+  assert.equal(r.status, 3, `升级标记应先阻断并给安全指引：\n${r.stdout}\n${r.stderr}`)
+  assert.match(r.stderr, /docker compose (build|pull) app/)
+  assert.match(r.stderr, /docker compose create .*--force-recreate.* app|docker compose create .*app/i)
+  assert.match(r.stderr, /--after-image-rollback/)
+  const saveAt = r.stderr.indexOf('RECOVERY_SH=')
+  const stopAt = r.stderr.indexOf('docker compose stop app')
+  const rollbackAt = r.stderr.indexOf('git checkout')
+  const buildAt = r.stderr.indexOf('docker compose build app')
+  const createAt = r.stderr.indexOf('docker compose create --force-recreate app')
+  const restoreAt = r.stderr.indexOf('--after-image-rollback')
+  assert.ok(
+    [saveAt, stopAt, rollbackAt, buildAt, createAt, restoreAt].every((index) => index >= 0),
+    `安全指引缺少必要步骤：\n${r.stderr}`,
+  )
+  assert.ok(
+    saveAt < stopAt &&
+      stopAt < rollbackAt &&
+      rollbackAt < buildAt &&
+      buildAt < createAt &&
+      createAt < restoreAt,
+    `安全指引顺序必须是保留脚本→停机→退旧代码→构建→停止态 create→恢复：\n${r.stderr}`,
+  )
+  assert.doesNotMatch(
+    r.stderr,
+    /docker compose (up -d|start) app/,
+    '🔴 数据库恢复前不得启动旧服务，否则会接流量并把中间 schema 写入随后被覆盖',
+  )
+  assert.doesNotMatch(r.log, /"stop"|"start"/, '守卫本身不得改变容器运行态')
 })
 
 
@@ -1619,6 +1719,20 @@ test('R7-P1② 反向：换库前就失败时，当前库的 -wal/-shm 必须原
 // 破损版会记录 curl [5,5]、sleep [2,2] 并跑到 109；修复版必须恰为 curl [5,1]、sleep [2,1]。
 // 默认值仍是 60 这件事由下面那条静态断言单独钉住（与 docs 承诺对齐）。
 // ============================================================================
+test('R7-P2⑥ fail-closed：READY_TIMEOUT 非法或超上限时在停机前 exit 2', () => {
+  for (const value of ['abc', '0', '-1', '1.5', '86401', '999999', '999999999999999999999999']) {
+    const { dataDir, backupsDir } = scene(`invalid-timeout-${value.replace(/[^a-z0-9]/gi, '-')}`, 'CURRENT')
+    const snap = path.join(backupsDir, 'backup-invalid-timeout.db')
+    makeSnapshot(snap, 'SHOULD-NOT-INSTALL')
+
+    const r = runRestore(dataDir, backupsDir, snap, { READY_TIMEOUT: value })
+    assert.equal(r.status, 2, `READY_TIMEOUT=${value} 必须按用法错误退出：\n${r.stdout}\n${r.stderr}`)
+    assert.match(r.stderr, /READY_TIMEOUT.*1.*86400|READY_TIMEOUT.*正整数/i)
+    assert.equal(r.log, '', '🔴 非法 timeout 必须在任何 docker/停机/替换前拒绝')
+    assert.equal(readMarker(path.join(dataDir, 'app.db')), 'CURRENT', '当前库不得被修改')
+  }
+})
+
 test('R7-P2⑥：readiness 轮询用绝对 deadline，慢轮次下总时长仍受上限约束（不是 3 倍）', () => {
   const { dataDir, backupsDir } = scene('deadline', 'CURRENT')
   const snap = path.join(backupsDir, 'backup-2026-07-28T06-00-00-dddddd.db')
