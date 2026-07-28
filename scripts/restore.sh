@@ -5,7 +5,7 @@
 # **宿主侧运行**（在 docker-compose.yml 所在目录，即仓库根）。流程：
 #   互斥锁 + 私有 stage 校验 → 停 app → 现场 app.db 存为 backups/pre-restore.db
 #   → armed + 原子 mv stage 为 app.db（0600 / uid1000）→ 删旧 -wal/-shm/.upgrade-in-progress
-#   → 起 app → 校验 /api/health 与 /api/ready → 释放锁
+#   → 起 app → 以 /api/ready 校验数据库与 schema 就绪 → 释放锁
 #
 # 用法：
 #   ./scripts/restore.sh data/backups/backup-2026-07-26T01-00-00-a1b2c3.db
@@ -563,10 +563,10 @@ $SUDO rm -f "$MARKER"
 echo "→ 起 app"
 docker compose start app
 
-# 校验：先 liveness（进程起来了吗），再 readiness（库能读、schema 版本对得上吗）。
-# readiness 才是「恢复成功」的判据——它还会核对 DB_PATH 文件身份与磁盘 schema；liveness 通过
-# 只能说明进程活着，不能证明常驻连接仍指向当前路径上的数据库。
-echo "→ 校验 $APP_URL/api/health 与 /api/ready（最多等 ${READY_TIMEOUT}s）"
+# 校验：readiness 才是「恢复成功」的判据——它同时证明进程已能响应，并核对
+# 常驻连接、DB_PATH 文件身份、fresh 磁盘连接与两侧 schema。单独查 liveness 只能说明
+# 进程活着，不能证明常驻连接仍指向当前路径上的数据库，故不作为独立恢复门禁。
+echo "→ 校验 $APP_URL/api/ready（最多等 ${READY_TIMEOUT}s）"
 # 🔴 单次请求必须有界（R4-P2④，codex R6 指出）：APP_URL 能建连但**永不返回响应**时（进程卡在
 #    某个 await、反代挂起），无超时的 curl 会在一次迭代里无限阻塞——承诺的 60s 上限失效，
 #    EXIT trap 也进不去、app 停在停止态。--connect-timeout 3 + --max-time 5 ⇒ 单轮最多 5s。
