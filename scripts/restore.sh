@@ -3,9 +3,9 @@
 # 从快照恢复数据库（P6-R2，docs/deploy.md §5.2 手工步骤的脚本化）
 #
 # **宿主侧运行**（在 docker-compose.yml 所在目录，即仓库根）。流程：
-#   互斥锁 + 私有 stage 校验 → 停 app → 现场 app.db 存为 backups/pre-restore.db
+#   Compose + 现有容器 /app/data bind 核对 → 互斥锁 + 私有 stage 校验 → 停 app → 现场 app.db 存为 backups/pre-restore.db
 #   → armed + 原子 mv stage 为 app.db（0600 / uid1000）→ 删旧 -wal/-shm/.upgrade-in-progress
-#   → 起 app → 以 /api/ready 校验数据库与 schema 就绪 → 释放锁
+#   → 起 app → 仅接受 /api/ready 的 HTTP 200 + {"ok":true} → 释放锁
 #
 # 用法：
 #   ./scripts/restore.sh data/backups/backup-2026-07-26T01-00-00-a1b2c3.db
@@ -16,7 +16,8 @@
 #   DATA_DIR     宿主数据目录，默认 data。🔴 **必须与 docker-compose.yml 里绑到 /app/data 的宿主
 #                路径一致**（默认那条是 `./data:/app/data`）：脚本按它定位要还原的库文件，容器按
 #                compose 那条绑定定位它实际读的库——两者必须指同一个目录，否则还原了个 app 根本
-#                不读的文件。改了 compose 的绑定源就同步改这个。
+#                不读的文件。脚本会在锁定/停机/写库前同时核对 Compose 与现有 app 容器实际挂载，
+#                并固定到物理绝对路径；无法唯一确认就拒绝。
 #   BACKUP_DIR   备份目录，默认 $DATA_DIR/backups
 #   APP_URL      校验地址，默认 http://127.0.0.1:3000
 #   READY_TIMEOUT 等 /api/ready 通过的秒数上限，默认 60（与 docs/deploy.md 承诺一致）
@@ -24,11 +25,14 @@
 set -eu
 
 DATA_DIR="${DATA_DIR:-data}"
-BACKUP_DIR="${BACKUP_DIR:-$DATA_DIR/backups}"
+if [ -z "${BACKUP_DIR+x}" ] || [ -z "$BACKUP_DIR" ]; then
+  BACKUP_DIR_IS_DEFAULT=1
+  BACKUP_DIR="$DATA_DIR/backups"
+else
+  BACKUP_DIR_IS_DEFAULT=0
+fi
 APP_URL="${APP_URL:-http://127.0.0.1:3000}"
 READY_TIMEOUT="${READY_TIMEOUT:-60}"
-MARKER="$DATA_DIR/.upgrade-in-progress"
-DB="$DATA_DIR/app.db"
 
 # READY_TIMEOUT 会进入算术展开和 curl/sleep 参数，必须在任何 docker、停机或文件替换之前验证。
 # 只接受 1..86400 的十进制正整数：既避免 /bin/sh 把 abc 当变量名/0，也避免超大值造成无限值守。
@@ -64,11 +68,8 @@ fi
 #    实际生效值，且不依赖 daemon（纯本地文件解析）—— config 比 exec/ps 稳定、比自己手工解析
 #    .env/.yml 安全（不会踩 YAML 引号/插值/多来源合并的坑）。
 #
-#    ⚠️ 解析失败时（.env 缺失、compose 文件损坏）config 退 1 → $(…) 取空、下面 [ -n ... ] 判否、
-#       CONTAINER_DB_PATH 守卫不拦、**只看宿主那条**。这是安全的：config 失败⊆run/exec 全失败
-#      （实测缺 .env 时 config rc=1、run rc=1、stop rc=0），脚本到 node_with_snapshot / node_in_data
-#       阶段一定挂，不会悄悄跳过守卫并恢复到错误位置。唯一丢失的是「容器停机且 config 解不出时
-#       的错误提示质量」（报 docker run 的通用错而非 DB_PATH 专属提示），可接受。
+#    ⚠️ 这次 YAML 查询若失败，CONTAINER_DB_PATH 会暂取空；但下面独立的 JSON 挂载门禁要求同一份
+#       Compose 配置必须成功解析，否则在创建锁、停机或写库前直接 fail-closed，不会继续恢复。
 CONTAINER_DB_PATH=$(docker compose config app 2>/dev/null \
   | grep -E '^ +DB_PATH:' \
   | head -1 \
@@ -146,13 +147,165 @@ abspath() {
 # 「目录不存在」蒙混过关，而 docker -v 遇到不存在的源路径会以 root 悄悄新建一个空目录
 # ——容器于是读到空目录，脚本却以为在读宿主的库。挂载源必须走这个。
 absdir() {
-  _d=$(cd -- "$1" 2>/dev/null && pwd) || _d=""
+  _d=$(cd -P -- "$1" 2>/dev/null && pwd -P) || _d=""
   if [ -z "$_d" ]; then
     echo "❌ 目录不存在或无权进入：$1" >&2
     echo "   $DATA_DIR 按 docs §2 是 0700/属主 uid1000；操作账号不是 1000 时请用 sudo 跑本脚本。" >&2
     exit 1
   fi
   printf '%s\n' "$_d"
+}
+
+# restore 的宿主目标必须同时匹配 Compose 配置与现有唯一 app 容器实际绑到 /app/data 的 bind
+# source。所有查询只读；任何缺失、歧义、named volume、解析失败或路径不一致都在创建 restore 锁、
+# 停服务和写数据库之前 fail closed。
+validate_compose_data_bind() {
+  _compose_json=$(docker compose config --format json app 2>/dev/null) || {
+    echo "❌ 无法解析 docker compose 配置，不能确认 /app/data 的宿主 bind source；恢复已中止。" >&2
+    exit 1
+  }
+
+  # Docker Compose 的 JSON 是缩进后的规范化模型。这里只接受未转义的普通 Unix 路径；若 source
+  # 含 JSON 转义或结构不是预期的 volumes 数组，宁可拒绝，也不猜测一个可能指向错误数据库的路径。
+  _data_mounts=$(printf '%s\n' "$_compose_json" | awk '
+    function indent_of(line) {
+      match(line, /^[[:space:]]*/)
+      return RLENGTH
+    }
+    BEGIN {
+      in_volumes = 0
+      in_mount = 0
+      saw_volumes = 0
+      bad = 0
+    }
+    /^[[:space:]]*"volumes"[[:space:]]*:[[:space:]]*\[[[:space:]]*$/ {
+      if (in_volumes) bad = 1
+      in_volumes = 1
+      volumes_indent = indent_of($0)
+      saw_volumes = 1
+      next
+    }
+    in_volumes {
+      line_indent = indent_of($0)
+      if (!in_mount && line_indent == volumes_indent && $0 ~ /^[[:space:]]*\][,]?[[:space:]]*$/) {
+        in_volumes = 0
+        next
+      }
+      if (!in_mount && $0 ~ /^[[:space:]]*\{[[:space:]]*$/) {
+        in_mount = 1
+        mount_indent = line_indent
+        type = source = target = ""
+        next
+      }
+      if (in_mount && $0 ~ /^[[:space:]]*"type"[[:space:]]*:/) {
+        value = $0
+        sub(/^[[:space:]]*"type"[[:space:]]*:[[:space:]]*"/, "", value)
+        if (value ~ /\\/ || value !~ /"[,]?[[:space:]]*$/) bad = 1
+        sub(/"[,]?[[:space:]]*$/, "", value)
+        type = value
+        next
+      }
+      if (in_mount && $0 ~ /^[[:space:]]*"source"[[:space:]]*:/) {
+        value = $0
+        sub(/^[[:space:]]*"source"[[:space:]]*:[[:space:]]*"/, "", value)
+        if (value ~ /\\/ || value !~ /"[,]?[[:space:]]*$/) bad = 1
+        sub(/"[,]?[[:space:]]*$/, "", value)
+        source = value
+        next
+      }
+      if (in_mount && $0 ~ /^[[:space:]]*"target"[[:space:]]*:/) {
+        value = $0
+        sub(/^[[:space:]]*"target"[[:space:]]*:[[:space:]]*"/, "", value)
+        if (value ~ /\\/ || value !~ /"[,]?[[:space:]]*$/) bad = 1
+        sub(/"[,]?[[:space:]]*$/, "", value)
+        target = value
+        next
+      }
+      if (in_mount && line_indent == mount_indent && $0 ~ /^[[:space:]]*\}[,]?[[:space:]]*$/) {
+        if (target == "/app/data") {
+          if (type == "" || source == "") bad = 1
+          print type "\t" source
+        }
+        in_mount = 0
+        next
+      }
+    }
+    END {
+      if (bad || in_mount || in_volumes || !saw_volumes) exit 2
+    }
+  ') || {
+    echo "❌ 无法可靠解析 Compose 中 /app/data 的挂载配置；恢复已中止。" >&2
+    exit 1
+  }
+
+  _mount_count=$(printf '%s\n' "$_data_mounts" | awk 'NF { count++ } END { print count + 0 }')
+  if [ "$_mount_count" -ne 1 ]; then
+    echo "❌ Compose 必须为 app 的 /app/data 配置唯一一个宿主 bind source；检测到 ${_mount_count} 个。" >&2
+    exit 1
+  fi
+
+  _mount_type=$(printf '%s\n' "$_data_mounts" | awk -F '\t' 'NR == 1 { print $1 }')
+  _mount_source=$(printf '%s\n' "$_data_mounts" | awk 'NR == 1 { tab = index($0, "\t"); if (tab > 0) print substr($0, tab + 1) }')
+  if [ "$_mount_type" != "bind" ] || [ -z "$_mount_source" ]; then
+    echo "❌ Compose 的 /app/data 必须是可解析的宿主 bind source，不能使用 named volume。" >&2
+    exit 1
+  fi
+
+  _compose_data_abs=$(absdir "$_mount_source") || exit 1
+  _requested_data_abs=$(absdir "$DATA_DIR") || exit 1
+  if [ "$_compose_data_abs" != "$_requested_data_abs" ]; then
+    echo "❌ DATA_DIR 与 Compose 的 /app/data bind source 不一致，拒绝恢复。" >&2
+    echo "   DATA_DIR: $_requested_data_abs" >&2
+    echo "   Compose:  $_compose_data_abs" >&2
+    exit 1
+  fi
+
+  # `docker compose start` 会复用现有容器，不会按刚修改过的 Compose 配置重建。故还要核对将被
+  # start 的唯一 app 容器：它当前实际挂到 /app/data 的 bind source 也必须与配置和 DATA_DIR 一致。
+  _container_ids=$(docker compose ps --all -q app 2>/dev/null) || {
+    echo "❌ 无法查询现有 app 容器，不能确认其 /app/data 实际挂载；恢复已中止。" >&2
+    exit 1
+  }
+  _container_count=$(printf '%s\n' "$_container_ids" | awk 'NF { count++ } END { print count + 0 }')
+  if [ "$_container_count" -ne 1 ]; then
+    echo "❌ 恢复前必须存在唯一一个 app 容器；检测到 ${_container_count} 个。" >&2
+    echo "   请先按当前 Compose 配置 create/recreate 为停止态，再重新运行 restore。" >&2
+    exit 1
+  fi
+  _container_id=$(printf '%s\n' "$_container_ids" | awk 'NF { print; exit }')
+  _container_mounts=$(docker inspect --format \
+    '{{range .Mounts}}{{if eq .Destination "/app/data"}}{{printf "%s\t%s\n" .Type .Source}}{{end}}{{end}}' \
+    "$_container_id" 2>/dev/null) || {
+    echo "❌ 无法读取 app 容器的 /app/data 实际挂载；恢复已中止。" >&2
+    exit 1
+  }
+  _container_mount_count=$(printf '%s\n' "$_container_mounts" | awk 'NF { count++ } END { print count + 0 }')
+  if [ "$_container_mount_count" -ne 1 ]; then
+    echo "❌ app 容器必须为 /app/data 配置唯一一个实际挂载；检测到 ${_container_mount_count} 个。" >&2
+    exit 1
+  fi
+  _container_mount_type=$(printf '%s\n' "$_container_mounts" | awk -F '\t' 'NR == 1 { print $1 }')
+  _container_mount_source=$(printf '%s\n' "$_container_mounts" | awk 'NR == 1 { tab = index($0, "\t"); if (tab > 0) print substr($0, tab + 1) }')
+  if [ "$_container_mount_type" != "bind" ] || [ -z "$_container_mount_source" ]; then
+    echo "❌ app 容器的 /app/data 实际挂载必须是可解析的宿主 bind source。" >&2
+    exit 1
+  fi
+  _container_data_abs=$(absdir "$_container_mount_source") || exit 1
+  if [ "$_container_data_abs" != "$_compose_data_abs" ]; then
+    echo "❌ 现有 app 容器的 /app/data 挂载与当前 Compose 配置不一致，拒绝恢复。" >&2
+    echo "   Container: $_container_data_abs" >&2
+    echo "   Compose:   $_compose_data_abs" >&2
+    echo "   请先 create/recreate app 为停止态，使实际挂载与 Compose 一致。" >&2
+    exit 1
+  fi
+
+  # 后续锁、marker、app.db 操作只使用已经核验过的物理绝对路径，避免 symlink 在校验后换靶。
+  DATA_DIR="$_requested_data_abs"
+  if [ "$BACKUP_DIR_IS_DEFAULT" = "1" ]; then
+    BACKUP_DIR="$DATA_DIR/backups"
+  fi
+  MARKER="$DATA_DIR/.upgrade-in-progress"
+  DB="$DATA_DIR/app.db"
 }
 
 # 借 app 镜像里的 node 跑一段只读/备份 JS。本脚本本就依赖 docker compose（下面要 stop/start），
@@ -235,6 +388,8 @@ if [ -z "$SNAPSHOT" ]; then
   exit 2
 fi
 
+validate_compose_data_bind
+
 [ -f "$SNAPSHOT" ] || { echo "❌ 快照不存在：$SNAPSHOT" >&2; exit 1; }
 
 SNAPSHOT_ABS="$(abspath "$SNAPSHOT")"
@@ -283,9 +438,15 @@ echo "→ 目标库：$DB"
 RESTORE_LOCK="$DATA_DIR/.restore-in-progress"
 RESTORE_STAGE="$RESTORE_LOCK/snapshot.db"
 RESTORE_ARMED_MARKER="$RESTORE_LOCK/replace-armed"
+RESTORE_SIDECARS_CLEAN_MARKER="$RESTORE_LOCK/sidecars-clean"
+RESTORE_UPGRADE_MARKER_CLEAN_MARKER="$RESTORE_LOCK/upgrade-marker-clean"
+RESTORE_APP_STARTED_MARKER="$RESTORE_LOCK/app-started"
+RESTORE_READY_ACCEPTED_MARKER="$RESTORE_LOCK/ready-accepted"
+RESTORE_READY_BODY="$RESTORE_LOCK/ready-body"
 PRE_RESTORE_TMP="$BACKUP_DIR/pre-restore.db.tmp"
 LOCK_HELD=0
 STOP_ATTEMPTED=0
+READY_ACCEPTED=0
 
 release_restore_lock() {
   [ "$LOCK_HELD" = "1" ] || return 0
@@ -293,23 +454,88 @@ release_restore_lock() {
     LOCK_HELD=0
     return 0
   fi
-  if ! $SUDO rm -f "$RESTORE_STAGE" "$RESTORE_ARMED_MARKER"; then
+  if ! $SUDO rm -f \
+    "$RESTORE_STAGE" \
+    "$RESTORE_ARMED_MARKER" \
+    "$RESTORE_SIDECARS_CLEAN_MARKER" \
+    "$RESTORE_UPGRADE_MARKER_CLEAN_MARKER" \
+    "$RESTORE_APP_STARTED_MARKER" \
+    "$RESTORE_READY_ACCEPTED_MARKER" \
+    "$RESTORE_READY_BODY"; then
     echo "❌ 无法清理 restore 锁目录里的临时状态：$RESTORE_LOCK" >&2
     return 1
   fi
   if ! $SUDO rmdir "$RESTORE_LOCK"; then
-    echo "❌ 无法释放 restore 锁：$RESTORE_LOCK（请确认目录内无未知文件后人工处理）" >&2
+    echo "❌ 无法释放 restore 锁：${RESTORE_LOCK}（请确认目录内无未知文件后人工处理）" >&2
     return 1
   fi
   LOCK_HELD=0
 }
 
 db_was_replaced() {
-  [ -f "$RESTORE_ARMED_MARKER" ] && [ ! -e "$RESTORE_STAGE" ]
+  [ -f "$RESTORE_SIDECARS_CLEAN_MARKER" ] ||
+    [ -f "$RESTORE_UPGRADE_MARKER_CLEAN_MARKER" ] ||
+    [ -f "$RESTORE_APP_STARTED_MARKER" ] ||
+    [ -f "$RESTORE_READY_ACCEPTED_MARKER" ] ||
+    { [ -f "$RESTORE_ARMED_MARKER" ] && [ ! -e "$RESTORE_STAGE" ]; }
+}
+
+sidecars_are_clean() {
+  [ -f "$RESTORE_SIDECARS_CLEAN_MARKER" ] ||
+    [ -f "$RESTORE_UPGRADE_MARKER_CLEAN_MARKER" ] ||
+    [ -f "$RESTORE_APP_STARTED_MARKER" ] ||
+    [ -f "$RESTORE_READY_ACCEPTED_MARKER" ]
+}
+
+restore_was_accepted() {
+  [ "$READY_ACCEPTED" = "1" ] || [ -f "$RESTORE_READY_ACCEPTED_MARKER" ]
+}
+
+mark_restore_phase() {
+  $SUDO install -m 600 /dev/null "$1"
+}
+
+ready_body_is_ok() {
+  # body 直接从 0600 文件按原始字节读取，绝不经过无法保存 NUL 的 shell 变量。固定响应契约只有
+  # 单字段对象 {"ok":true}；token 间只允许 JSON 的 space/tab/CR/LF，任何额外字节都拒绝。
+  LC_ALL=C od -An -v -t u1 "$1" 2>/dev/null | awk '
+    function is_ws(byte) {
+      return byte == 32 || byte == 9 || byte == 10 || byte == 13
+    }
+    function skip_ws() {
+      while (cursor <= count && is_ws(bytes[cursor])) cursor++
+    }
+    function expect(byte) {
+      if (cursor > count || bytes[cursor] != byte) return 0
+      cursor++
+      return 1
+    }
+    {
+      for (field = 1; field <= NF; field++) bytes[++count] = $field
+    }
+    END {
+      cursor = 1
+      skip_ws()
+      ok = expect(123) # {
+      skip_ws()
+      ok = ok && expect(34) && expect(111) && expect(107) && expect(34) # "ok"
+      skip_ws()
+      ok = ok && expect(58) # :
+      skip_ws()
+      ok = ok && expect(116) && expect(114) && expect(117) && expect(101) # true
+      skip_ws()
+      ok = ok && expect(125) # }
+      skip_ws()
+      ok = ok && cursor > count
+      exit ok ? 0 : 1
+    }
+  '
 }
 
 clean_replaced_sidecars() {
-  # armed 不存在＝要么尚未进入替换，要么旧 sidecar 已清成功；两种情况都绝不能再删。
+  # sidecars-clean 或更晚阶段存在时，app 可能已为新库创建自己的 WAL；绝不能重复删除。
+  sidecars_are_clean && return 0
+  # armed 不存在＝尚未进入替换，绝不能碰当前库可能承载已提交数据的 WAL。
   [ -f "$RESTORE_ARMED_MARKER" ] || return 0
   # stage 仍在＝最终 mv 尚未成功，app.db/WAL 仍属于当前库，必须原样保留。
   [ ! -e "$RESTORE_STAGE" ] || return 0
@@ -318,36 +544,47 @@ clean_replaced_sidecars() {
     echo "   请保持 app 停止，修复权限后删除：$DB-wal $DB-shm。" >&2
     return 1
   fi
-  # 先清 sidecar，成功后才撤销 armed。信号落在两者之间时 app 仍停着，重做 rm 安全；
-  # armed 撤销后，任何后续 EXIT 都不会再删除新库运行中生成的 WAL。
-  if ! $SUDO rm -f "$RESTORE_ARMED_MARKER"; then
-    echo "❌ 旧 WAL/SHM 已删除，但无法推进 restore 状态；为防后续误清新 WAL，拒绝重启 app。" >&2
+  # 用同目录原子 rename 把 armed 推进为 sidecars-clean，避免“旧 sidecar 已删但阶段尚未记录”的
+  # 信号窗口。信号落在 mv 内部时，trap 看到的必然是 armed 或 sidecars-clean 之一。
+  if ! $SUDO mv -- "$RESTORE_ARMED_MARKER" "$RESTORE_SIDECARS_CLEAN_MARKER"; then
+    echo "❌ 旧 WAL/SHM 已删除，但无法记录 sidecars-clean 阶段；拒绝重启 app。" >&2
     return 1
   fi
 }
 
-cleanup_and_start() {
+cleanup_restore() {
   _exit_rc=$?
   trap - EXIT INT TERM
-  _restart_ok=1
   _keep_lock=0
+  _post_replace=0
+  _accepted=0
 
-  if db_was_replaced; then
+  if restore_was_accepted; then
+    _accepted=1
+  elif db_was_replaced; then
+    _post_replace=1
     if ! clean_replaced_sidecars; then
-      _restart_ok=0
       _keep_lock=1
       [ "$_exit_rc" -ne 0 ] || _exit_rc=1
     fi
   fi
 
-  if [ "$STOP_ATTEMPTED" = "1" ] && [ "$_restart_ok" = "1" ]; then
+  if [ "$_post_replace" = "1" ]; then
+    _keep_lock=1
+    # 库已替换但尚未 ready/accepted：即使 start 命令可能只执行了一半，也再次 stop 并保留现场。
+    # 此时绝不再 start；人工确认前锁目录持续阻断下一次 restore。
+    if [ "$STOP_ATTEMPTED" = "1" ] && ! docker compose stop app; then
+      echo "❌ restore 收尾无法确认 app 已停止；请立即保持服务隔离并人工检查。" >&2
+      [ "$_exit_rc" -ne 0 ] || _exit_rc=1
+    fi
+    echo "🛑 数据库已替换但恢复尚未被 readiness 接受；app 保持停止，restore 锁与阶段证据已保留。" >&2
+  elif [ "$_accepted" != "1" ] && [ "$STOP_ATTEMPTED" = "1" ]; then
+    # 数据库尚未替换：当前 DB/WAL 仍是一体，恢复旧 app 运行并释放本次临时锁。
     if ! docker compose start app; then
       echo "❌ restore 收尾无法重启 app；请执行 docker compose start app 并检查日志。" >&2
       _keep_lock=1
       [ "$_exit_rc" -ne 0 ] || _exit_rc=1
     fi
-  elif [ "$_restart_ok" != "1" ]; then
-    echo "🛑 app 保持停止：旧 WAL/SHM 尚未安全清除，不能与新数据库一起启动。" >&2
   fi
 
   # 现场 VACUUM 的临时文件永远不是正式回滚点；优雅退出时清掉。SIGKILL 来不及清时，Node
@@ -359,10 +596,12 @@ cleanup_and_start() {
 
   if [ "$_keep_lock" = "0" ]; then
     if ! release_restore_lock; then
+      _keep_lock=1
       [ "$_exit_rc" -ne 0 ] || _exit_rc=1
     fi
-  else
-    echo "🛑 已保留 restore 状态锁：$RESTORE_LOCK；完成上面的人工处置后再移除。" >&2
+  fi
+  if [ "$_keep_lock" != "0" ]; then
+    echo "🛑 已保留 restore 状态锁：${RESTORE_LOCK}；完成上面的人工处置后再移除。" >&2
   fi
 
   exit "$_exit_rc"
@@ -371,7 +610,15 @@ cleanup_and_start() {
 if ! $SUDO mkdir "$RESTORE_LOCK"; then
   if [ -e "$RESTORE_LOCK" ]; then
     echo "🛑 已有另一个 restore 或上次异常中断的状态锁：$RESTORE_LOCK" >&2
-    if [ -f "$RESTORE_ARMED_MARKER" ] && [ ! -e "$RESTORE_STAGE" ]; then
+    if [ -f "$RESTORE_READY_ACCEPTED_MARKER" ]; then
+      echo "   状态显示：readiness 已接受，但锁释放未完成；核对 app 与锁目录后再人工处置。" >&2
+    elif [ -f "$RESTORE_APP_STARTED_MARKER" ]; then
+      echo "   状态显示：app 曾启动但 readiness 未接受；保持 app 停止，检查恢复后的库与日志。" >&2
+    elif [ -f "$RESTORE_UPGRADE_MARKER_CLEAN_MARKER" ]; then
+      echo "   状态显示：升级标记已清、app 尚未被接受；保持 app 停止，切勿直接 start。" >&2
+    elif [ -f "$RESTORE_SIDECARS_CLEAN_MARKER" ]; then
+      echo "   状态显示：旧 WAL/SHM 已清、后续阶段未完成；保持 app 停止，切勿直接 start。" >&2
+    elif [ -f "$RESTORE_ARMED_MARKER" ] && [ ! -e "$RESTORE_STAGE" ]; then
       echo "   状态显示：数据库可能已替换、旧 WAL/SHM 尚待确认。保持 app 停止，切勿直接 start。" >&2
     elif [ -f "$RESTORE_ARMED_MARKER" ]; then
       echo "   状态显示：替换已武装但 stage 仍在，数据库大概率尚未替换；仍需先确认现场。" >&2
@@ -380,12 +627,12 @@ if ! $SUDO mkdir "$RESTORE_LOCK"; then
     fi
     exit 4
   else
-    echo "❌ 无法创建 restore 状态锁：$RESTORE_LOCK（目录权限、只读文件系统或磁盘故障）。" >&2
+    echo "❌ 无法创建 restore 状态锁：${RESTORE_LOCK}（目录权限、只读文件系统或磁盘故障）。" >&2
     exit 1
   fi
 fi
 LOCK_HELD=1
-trap cleanup_and_start EXIT
+trap cleanup_restore EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 # 锁目录属于宿主调用者而不是容器 uid1000：shell 需要持续读取其中的状态文件名。stage 文件本身仍按
@@ -495,8 +742,8 @@ EOF
   exit 1
 }
 
-# trap 必须在 stop **之前**安装：stop 已完成、下一行尚未执行的同类信号窗口也会让 app 永久停机。
-# 提前安装后，即便信号落在 stop 命令内部/刚返回时，收尾也会幂等 start；若 app 尚未停，start 亦无害。
+# trap 必须在 stop **之前**安装：未替换时的失败/信号会保留当前 DB/WAL 并恢复旧 app；一旦库已
+# 替换但尚未 ready/accepted，收尾则再次 stop、保留锁与阶段证据，绝不自动 start 或释放锁。
 STOP_ATTEMPTED=1
 echo "→ 停 app（释放对 app.db 的写锁）"
 docker compose stop app
@@ -558,10 +805,35 @@ $SUDO mv -- "$RESTORE_STAGE" "$DB"  # DATA_DIR 内同一文件系统，rename �
 # 标记也要清——手动还原＝人为终结升级链，不清则下次真升级会因「标记指向的旧快照仍在」被误判、跳过备份。
 echo "→ 清理 -wal/-shm 与升级标记"
 clean_replaced_sidecars
-$SUDO rm -f "$MARKER"
+$SUDO rm -f "$MARKER" || {
+  _marker_rc=$?
+  echo "❌ 无法删除升级标记：${MARKER}；拒绝启动 app，保留 restore 状态供人工处理。" >&2
+  exit "$_marker_rc"
+}
+mark_restore_phase "$RESTORE_UPGRADE_MARKER_CLEAN_MARKER" || {
+  _phase_rc=$?
+  echo "❌ 升级标记虽已删除，但无法记录 upgrade-marker-clean 阶段；拒绝启动 app。" >&2
+  exit "$_phase_rc"
+}
+
+# curl 的响应体必须保留原始字节（含潜在 NUL）供严格解析；shell 变量做不到。锁目录已是调用者
+# 私有 0700，这里再以 umask 077 创建固定文件，curl 后续只覆写内容、不改变权限。
+if ! (umask 077 && : > "$RESTORE_READY_BODY"); then
+  echo "❌ 无法创建 readiness 响应暂存文件；拒绝启动 app。" >&2
+  exit 1
+fi
+if ! chmod 600 "$RESTORE_READY_BODY"; then
+  echo "❌ 无法收紧 readiness 响应暂存文件权限；拒绝启动 app。" >&2
+  exit 1
+fi
 
 echo "→ 起 app"
 docker compose start app
+mark_restore_phase "$RESTORE_APP_STARTED_MARKER" || {
+  _phase_rc=$?
+  echo "❌ app 已尝试启动，但无法记录 app-started 阶段；将再次停机并保留 restore 锁。" >&2
+  exit "$_phase_rc"
+}
 
 # 校验：readiness 才是「恢复成功」的判据——它同时证明进程已能响应，并核对
 # 常驻连接、DB_PATH 文件身份、fresh 磁盘连接与两侧 schema。单独查 liveness 只能说明
@@ -589,11 +861,20 @@ while :; do
   if [ "$_remaining" -lt "$_curl_timeout" ]; then
     _curl_timeout="$_remaining"
   fi
-  if curl -fsS --connect-timeout 3 --max-time "$_curl_timeout" -o /dev/null "$APP_URL/api/ready" 2>/dev/null; then
-    echo "✅ 恢复完成：/api/ready 通过（库可读 + schema 版本匹配）"
-    release_restore_lock
-    trap - EXIT INT TERM  # 恢复成功：清掉收尾与信号 trap，正常退出不用再 start
-    exit 0
+  if _ready_status=$(curl -sS --connect-timeout 3 --max-time "$_curl_timeout" \
+    --output "$RESTORE_READY_BODY" --write-out '%{http_code}' "$APP_URL/api/ready" 2>/dev/null); then
+    if [ "$_ready_status" = "200" ] && ready_body_is_ok "$RESTORE_READY_BODY"; then
+      mark_restore_phase "$RESTORE_READY_ACCEPTED_MARKER" || {
+        _phase_rc=$?
+        echo "❌ readiness 已返回 200 + ok=true，但无法记录 ready-accepted；将停机并保留锁。" >&2
+        exit "$_phase_rc"
+      }
+      READY_ACCEPTED=1
+      echo "✅ 恢复完成：/api/ready 严格返回 HTTP 200 + {\"ok\":true}"
+      release_restore_lock
+      trap - EXIT INT TERM  # 只有 accepted 且状态锁已释放后，才撤销收尾与信号 trap
+      exit 0
+    fi
   fi
 
   _now=$(date +%s)

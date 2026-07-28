@@ -128,7 +128,7 @@ docker compose logs -f app   # 有迁移：[schema-check] 需迁移 → [backup]
 > `preupgrade.db` 确实早于该异常状态时才恢复它；首次检测到此状态时，entrypoint 可能刚把当前歧义库钉住为
 > `preupgrade.db`，此时应找更早的已知正常备份，或复制数据库到离线环境核对实际 schema 后再补写正确版本。
 
-> 升级前如需人工快照，见 §5 手动备份。回滚：停容器 → 用 §5 的恢复步骤还原到升级前的备份 → 起旧镜像。
+> 升级前如需人工快照，见 §5 手动备份。回滚：停机 → 退回旧代码/镜像 → build/pull + create 旧容器为停止态 → 恢复 DB → 启动。
 
 ---
 
@@ -161,7 +161,7 @@ docker compose logs -f app   # 有迁移：[schema-check] 需迁移 → [backup]
 ./scripts/restore.sh data/backups/backup-2026-07-26T01-00-00-a1b2c3.db
 ```
 
-脚本按顺序做：先校验 `READY_TIMEOUT` → 取得 `data/.restore-in-progress` 互斥锁 → 把源快照固化为锁目录内的私有 0600 stage → 对**同一 stage**做文件头、`PRAGMA quick_check` 与单文件格式校验 → `docker compose stop app` → 现场 `app.db` 用 `VACUUM INTO` 存为 `data/backups/pre-restore.db`（单文件覆盖式，同 `preupgrade.db` 一样不进轮转集）→ 创建 `replace-armed` 状态并把已校验 stage 同文件系统原子 `mv` 为 `app.db` → 删旧库的 `-wal`/`-shm` 与 `.upgrade-in-progress` → `docker compose start app` → 轮询 `/api/ready` 最多 60s（可用 `READY_TIMEOUT` 调；每轮 curl 与 sleep 都按剩余秒数钳制）→ 释放状态锁。
+脚本按顺序做：先校验 `READY_TIMEOUT` → 用 `docker compose config` 唯一确认 `/app/data` 的宿主 bind source，并把它与 `DATA_DIR` 做物理路径规范化核对 → 再用只读 inspect 确认将被 `start` 的唯一 app 容器实际也挂着同一个 bind source（旧容器与新 Compose 不一致时先拒绝）→ 把后续数据操作钉到该物理绝对路径 → 取得 `data/.restore-in-progress` 互斥锁 → 把源快照固化为锁目录内的私有 0600 stage → 对**同一 stage**做文件头、`PRAGMA quick_check` 与单文件格式校验 → `docker compose stop app` → 现场 `app.db` 用 `VACUUM INTO` 存为 `data/backups/pre-restore.db`（单文件覆盖式，同 `preupgrade.db` 一样不进轮转集）→ 创建 `replace-armed` 状态并把已校验 stage 同文件系统原子 `mv` 为 `app.db` → 清旧库的 `-wal`/`-shm`，并把阶段原子推进为 `sidecars-clean` → 清 `.upgrade-in-progress` 并记录 `upgrade-marker-clean` → `docker compose start app` 并记录 `app-started` → 轮询 `/api/ready` 最多 60s（可用 `READY_TIMEOUT` 调；每轮 curl 与 sleep 都按剩余秒数钳制）→ 仅在响应严格为 HTTP 200 且 JSON `ok === true` 时记录 `ready-accepted`、释放状态锁。
 
 - 🔴 **完整性校验在所有破坏性步骤之前**：文件头检查（`SQLite format 3`）挡不住**截断/页损坏**——实测截到 2048 字节的库文件头仍然完好，但 `quick_check` 报 malformed。校验不过就直接中止：app 没停、`app.db` 没动。校验借 app 镜像里的 node 起一次性只读容器，以 `file:...?immutable=1` 打开（不是单纯 `readOnly`：纯 `cp` 出来的快照保留 `journal_mode=wal`，只读打开也要在同目录建 `-wal`/`-shm`，挂 `:ro` 会报 "attempt to write a readonly database" 把好快照误判成坏的）。
 - 🔴 **文件头只接受已知安全的 `1/1`**（与 quick_check 同一步，同样在破坏性步骤之前）：WAL 库的已提交数据可能**只存在于配套的 `-wal` 里**，单独还原主文件会静默丢一截——而它结构完好、`quick_check` 返回 ok、`/api/ready` 也过，运维不会察觉（实测：源库 150 行，裸 `cp` 主文件还原出来只有 100 行）。判据是**文件头 offset 18/19**：`1/1`＝已知安全的 journal 单文件格式（`VACUUM INTO` 的产物）；`2/2`＝WAL 模式；`0/0`、混合值或其他未知值也一律 fail-closed。不能用 `PRAGMA journal_mode` 代替——`immutable=1` 打开时 PRAGMA 对两种快照都报 `delete`，照它判等于没判。
@@ -169,16 +169,16 @@ docker compose logs -f app   # 有迁移：[schema-check] 需迁移 → [backup]
   - **已知误拒**：干净关闭的 WAL 库内容其实是完整的，但磁盘上与「活动库裸 cp」无法区分，故一并拒绝（宁可误拒也不静默丢数据）。触发时脚本会打印把它转成一致性快照的确切命令。
 - 🔴 **现场留存走 `VACUUM INTO`（借 app 镜像里的 node 起一次性容器），不是 `cp`**：`stop` 发的 SIGTERM 不做 WAL checkpoint，最后一段已提交数据只在 `app.db-wal` 里；裸拷主文件会丢这段，而脚本下一步就删 `-wal`——想反悔时回滚点已残缺且不可挽回。留存失败即 **fail-closed 中止**（不动 `app.db`），没有回滚点就不做破坏性还原。
 - 🔴 **用 `pre-restore.db` 本身当恢复源是安全的**：脚本在停 app、重建 `pre-restore.db` 之前，已经把原恢复源固化并校验到私有 stage；所以现场留存覆盖原文件不会影响最终还原内容，也不会静默丢掉唯一回滚点。
-- 🔴 **EXIT / SIGINT / SIGTERM 收尾不会混库**：trap 在 `stop` 前安装；最终 `mv` 前先创建 `replace-armed`，再以私有 stage 是否仍存在判断原子 rename 是否已经成功，因此不存在“库已替换但下一行状态尚未记录”的进程级信号窗口。未替换时保留当前库自己的 WAL（其中可能有唯一一份已提交数据）；已替换时必须先删旧 WAL/SHM 并撤销 armed 才允许重启。清理失败会明确报错、保持 app 停止并保留状态锁，不会带着陈旧 sidecar 启动。armed 撤销后，readiness 超时等后续 EXIT 不会再误删新库运行中产生的 WAL/SHM。SIGINT / SIGTERM 分别以 130 / 143 退出，并在安全条件满足时幂等尝试重启 app。
-- 🔴 **并发与进程级硬中断 fail closed**：同一 `DATA_DIR` 同时只允许一个 restore。若上次被 SIGKILL 或在不安全阶段失败，当前文件系统可见的 `data/.restore-in-progress` 会让下次以退出码 4 拒绝；其中 `replace-armed` 与 `snapshot.db` 的存在性用于判断“已武装未替换”还是“可能已替换待清 sidecar”。先保持 app 停止、确认现场并按脚本提示人工处置，禁止直接删锁后启动。
+- 🔴 **EXIT / SIGINT / SIGTERM 收尾不会混库**：trap 在 `stop` 前安装；最终 `mv` 前先创建 `replace-armed`，再以私有 stage 是否仍存在判断原子 rename 是否已经成功，因此不存在“库已替换但下一行状态尚未记录”的进程级信号窗口。未替换时保留当前库自己的 WAL（其中可能有唯一一份已提交数据）、重启旧 app 并释放本次锁；已替换时先安全清旧 WAL/SHM，再把 `replace-armed` 原子改名为 `sidecars-clean`。从数据库已替换直到 `ready-accepted` 之间，任一错误、SIGINT 或 SIGTERM 都会再次停止 app、保留锁和阶段证据，绝不由 EXIT trap 重启或释放锁。readiness 失败后新库自己产生的 WAL/SHM 也不会被重复删除。SIGINT / SIGTERM 分别以 130 / 143 退出。
+- 🔴 **并发与进程级硬中断 fail closed**：同一 `DATA_DIR` 同时只允许一个 restore。若上次被 SIGKILL，或 restore 已替换数据库但尚未被接受，当前文件系统可见的 `data/.restore-in-progress` 会让下次以退出码 4 拒绝。`replace-armed` + `snapshot.db` 区分“已武装未替换/可能已替换”，后续 `sidecars-clean`、`upgrade-marker-clean`、`app-started`、`ready-accepted` 则留下最近完成阶段。除 `ready-accepted` 仅因锁释放失败而残留的情况外，看到任何 post-replace 阶段都先保持 app 停止、核对数据库与日志，禁止直接删锁后启动。
   - ⚠️ **这不是宿主断电一致性承诺**：脚本没有对 marker、rename、sidecar unlink 做 `fsync` 屏障，SIGKILL 回归也只能证明进程级硬中断，不能证明掉电后的磁盘持久顺序。若 restore 期间宿主掉电/强制重启，无论锁是否仍可见，都先保持 app 停止，人工核对 `app.db`、`app.db-wal`/`app.db-shm` 与锁目录后再启动；不能只凭 marker 存在性自动判断。
 
 - 🔴 **分叉守卫**：若 `data/.upgrade-in-progress` 存在（＝上次升级没走完），脚本**拒绝执行**并打印指引，退出码 3。先把当前安全 `restore.sh` 复制到 checkout 外，再停 app、退回旧代码/镜像、`docker compose build app`（使用镜像 tag 的部署则 `pull app`）、`docker compose create --force-recreate app` 重建为**停止态**，最后用保留的脚本带 `--after-image-rollback` 恢复。数据库恢复前禁止 `up`/`start`，否则旧服务会先运行 entrypoint 并可能写入中间 schema。
-- 校验用 `/api/ready`（不是 `/api/health`）：liveness 通过只说明进程活着；readiness 还会验证常驻连接、`DB_PATH` 当前 dev/inode 是否仍是启动时文件、磁盘新只读连接，以及两侧 schema 是否都与镜像匹配。路径被 unlink 或原子换库时，即使旧连接仍能读 page cache，也会摘流量。
+- 校验用 `/api/ready`（不是 `/api/health`）：liveness 通过只说明进程活着；restore 仅接受 HTTP status **严格等于 200** 且响应 JSON **`ok === true`**。body 先写入 restore 锁目录内的 0600 文件并按原始字节解析，不经过会吞掉 NUL 的 shell 变量。302、其他 2xx、`ok:false`、空响应、额外内容或畸形 JSON 都会在 deadline 后失败、再次停机并保留 restore 锁。readiness 本身还会验证常驻连接、`DB_PATH` 当前 dev/inode 是否仍是启动时文件、磁盘新只读连接，以及两侧 schema 是否都与镜像匹配。
 - 环境变量：`SUDO=`（已是 uid1000 / macOS Docker Desktop 时跳过 sudo）、`DATA_DIR`、`BACKUP_DIR`、`APP_URL`、`READY_TIMEOUT`（等 readiness 的秒数上限，默认 60，只接受十进制正整数 `1..86400`，且在任何 Docker/停机/替换前校验）。不能提权时自动省掉属主移交（只设权限 600）——Docker Desktop 会自动映射 uid，本就不需要 chown。
   - `BACKUP_DIR` 可自由改到任意路径（含 `data/` 之外）：脚本用显式 `-v` 把它挂进一次性容器，不依赖 compose 里那条 `./data:/app/data`。
-  - 🔴 `DATA_DIR` **必须与 `docker-compose.yml` 里绑到 `/app/data` 的宿主路径一致**（默认那条是 `./data:/app/data`）：脚本按它定位要还原的库文件，容器按 compose 那条绑定定位它实际读的库；两者指的不是同一个目录时，还原的就是个 app 根本不读的文件。改了 compose 的绑定源要同步改这个。
-- 退出码：0 成功 / 1 快照无效（不存在／非 SQLite／未过 `quick_check`／header 18/19 不是 `1/1`）、路径无法解析、sidecar/状态锁安全清理失败或校验超时 / 2 用法错（含非法 `READY_TIMEOUT`、非默认 `DB_PATH` 与「快照就是当前库本身」）/ 3 被升级标记拒绝 / 4 已有并发或异常中断的 restore 状态锁 / 130 收到 SIGINT / 143 收到 SIGTERM。
+  - 🔴 `DATA_DIR` **必须与 Compose 中绑到 `/app/data` 的唯一宿主 bind source 指向同一实体目录**（默认是 `./data:/app/data`），且现有唯一 app 容器的实际 `/app/data` 挂载也必须一致。脚本在锁定、停机或写任一数据库前调用 `docker compose config --format json app`、`docker compose ps --all -q app` 与只读 `docker inspect` 核对；容器不存在/有多个、实际挂载缺失/歧义/named volume、旧容器与当前 Compose 不一致都 fail-closed，先 `create --force-recreate app` 为停止态再恢复。相对/绝对路径或 symlink 最终落到同一目录可通过，但后续锁与数据库写入会固定到已验证的物理绝对路径，链接之后换靶也不会改变目标。
+- 退出码：0 仅表示严格 readiness 已接受并释放锁 / 1 快照无效（不存在／非 SQLite／未过 `quick_check`／header 18/19 不是 `1/1`）、Compose 数据绑定或路径无法可靠解析、sidecar/状态锁安全清理失败、readiness 超时或响应未被接受 / 2 用法错（含非法 `READY_TIMEOUT`、非默认 `DB_PATH` 与「快照就是当前库本身」）/ 3 被升级标记拒绝 / 4 已有并发或异常中断的 restore 状态锁 / 130 收到 SIGINT / 143 收到 SIGTERM。数据库已替换后的非成功退出默认保持 app 停止并保留状态锁。
 
 演练完数据核对无误后，删掉 `data/backups/pre-restore.db` 即可（它不占轮转名额，但会一直留着）。
 

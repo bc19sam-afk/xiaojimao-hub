@@ -12,7 +12,7 @@ import { DatabaseSync } from 'node:sqlite'
 //
 // 用**桩 docker** 跑真实脚本：桩把 `docker compose run ... -v H:C ... -e <JS>` 里的容器路径按挂载
 // 规格换回宿主路径，然后用真 node 跑那段 JS——于是 VACUUM INTO 是真的在跑、真的读写真 SQLite 库，
-// 只有「起容器」这一层被替换掉。stop/start 是空操作，curl 恒成功。
+// 只有「起容器」这一层被替换掉。stop/start 默认是空操作，curl 默认返回严格 200 + {"ok":true}。
 //
 // ⚠️ 测试库隔离（红线）：全程临时目录，DATA_DIR/BACKUP_DIR 都指向 tmp，绝不碰真实 data/。
 // ============================================================================
@@ -39,7 +39,30 @@ import { spawnSync } from 'node:child_process'
 
 const args = process.argv.slice(2)
 fs.appendFileSync(process.env.STUB_LOG, JSON.stringify(args) + '\\n')
+if (args[0] === 'inspect') {
+  if (process.env.TEST_CONTAINER_MOUNT_MODE === 'inspect-fail') process.exit(78)
+  const mode = process.env.TEST_CONTAINER_MOUNT_MODE || 'bind'
+  const source = process.env.TEST_CONTAINER_DATA_SOURCE || process.env.TEST_COMPOSE_DATA_SOURCE || process.env.DATA_DIR || ''
+  if (mode === 'missing') process.exit(0)
+  if (mode === 'multiple') {
+    console.log(\`bind\\t\${source}\`)
+    console.log(\`bind\\t\${process.env.TEST_CONTAINER_DATA_SOURCE_2 || source}\`)
+    process.exit(0)
+  }
+  console.log(\`\${mode === 'named' ? 'volume' : 'bind'}\\t\${mode === 'named' ? 'xiaojimao_data' : source}\`)
+  process.exit(0)
+}
 if (args[0] !== 'compose') process.exit(0)
+if (args[1] === 'ps') {
+  if (process.env.TEST_CONTAINER_MOUNT_MODE === 'container-missing') process.exit(0)
+  if (process.env.TEST_CONTAINER_MOUNT_MODE === 'container-multiple') {
+    console.log('stub-app-1')
+    console.log('stub-app-2')
+    process.exit(0)
+  }
+  console.log('stub-app')
+  process.exit(0)
+}
 if (args[1] === 'stop') process.exit(0)
 if (args[1] === 'start') {
   // 信号/退出路径测试需要证明「start 被调用的那个瞬间」sidecar 已经处于安全状态，不能只看
@@ -62,6 +85,25 @@ if (args[1] === 'start') {
   process.exit(0)
 }
 if (args[1] === 'config') {
+  const mountMode = process.env.TEST_COMPOSE_MOUNT_MODE || 'bind'
+  if (mountMode === 'config-fail') process.exit(77)
+  const formatAt = args.indexOf('--format')
+  if (formatAt >= 0 && args[formatAt + 1] === 'json') {
+    const source = process.env.TEST_COMPOSE_DATA_SOURCE || process.env.DATA_DIR || ''
+    let volumes = []
+    if (mountMode === 'bind') {
+      volumes = [{ type: 'bind', source, target: '/app/data', bind: {} }]
+    } else if (mountMode === 'named') {
+      volumes = [{ type: 'volume', source: 'xiaojimao_data', target: '/app/data', volume: {} }]
+    } else if (mountMode === 'multiple') {
+      volumes = [
+        { type: 'bind', source, target: '/app/data', bind: {} },
+        { type: 'bind', source: process.env.TEST_COMPOSE_DATA_SOURCE_2 || source, target: '/app/data', bind: {} },
+      ]
+    }
+    console.log(JSON.stringify({ services: { app: { volumes } } }, null, 2))
+    process.exit(0)
+  }
   // R4-P1①：restore.sh 改用 docker compose config app 读容器内 DB_PATH。
   // 桩默认不输出 DB_PATH 行（模拟未设 DB_PATH 的默认配置）；测试可通过 TEST_CONTAINER_DB_PATH
   // 注入非默认值触发守卫。真 config 会展开 env_file、引号剥离、插值等，桩只输最终形式。
@@ -115,6 +157,30 @@ for (const d of roDirs) {
 process.exit(r.status ?? 1)
 `
 
+const READY_CURL_STUB = `#!/bin/sh
+if [ "\${TEST_READY_BODY+x}" = x ]; then
+  body=$TEST_READY_BODY
+else
+  body='{"ok":true}'
+fi
+status=\${TEST_READY_STATUS-200}
+out=
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--output" ]; then out=$2; shift 2; else shift; fi
+done
+if [ -n "$out" ]; then
+  printf '%s' "$body" > "$out"
+  printf '%s' "$status"
+else
+  printf '%s\\n%s\\n' "$body" "$status"
+fi
+exit "\${TEST_READY_EXIT-0}"
+`
+
+function installReadyCurlStub(dir: string): void {
+  fs.writeFileSync(path.join(dir, 'curl'), READY_CURL_STUB, { mode: 0o755 })
+}
+
 before(() => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'xjm-restore-'))
   binDir = path.join(tmpDir, 'bin')
@@ -126,8 +192,8 @@ before(() => {
     `#!/bin/sh\nexec "${process.execPath}" "${path.join(binDir, 'docker-stub.mjs')}" "$@"\n`,
     { mode: 0o755 },
   )
-  // curl 桩：脚本末尾轮询 /api/ready，恒成功即可（起服务不在本文件的验证范围内）
-  fs.writeFileSync(path.join(binDir, 'curl'), '#!/bin/sh\nexit 0\n', { mode: 0o755 })
+  // curl 桩：默认返回严格 200 + {"ok":true}；个别测试可用 TEST_READY_* 注入反例。
+  installReadyCurlStub(binDir)
 })
 
 after(() => {
@@ -437,6 +503,189 @@ test('建议5：BACKUP_DIR 覆盖到非默认位置时，pre-restore.db 真落�
   assert.equal(readMarker(path.join(backupsDir, 'pre-restore.db')), 'CURRENT')
 })
 
+test('P6-R2 DATA_DIR 绑定门禁：配置指向真数据目录时，错误 DATA_DIR 必须在停机/写库前 fail-closed', () => {
+  const root = fs.mkdtempSync(path.join(tmpDir, 'wrong-data-dir-'))
+  const actualDataDir = path.join(root, 'actual-data')
+  const wrongDataDir = path.join(root, 'wrong-data')
+  const wrongBackups = path.join(wrongDataDir, 'backups')
+  fs.mkdirSync(wrongBackups, { recursive: true })
+  makeDb(path.join(actualDataDir, 'app.db'), 'ACTUAL-SERVICE-DB')
+  makeDb(path.join(wrongDataDir, 'app.db'), 'WRONG-TARGET-BEFORE')
+  const snap = path.join(wrongBackups, 'backup-wrong-target.db')
+  makeSnapshot(snap, 'SHOULD-NOT-INSTALL')
+
+  const r = runRestore(wrongDataDir, wrongBackups, snap, {
+    TEST_COMPOSE_DATA_SOURCE: actualDataDir,
+    TEST_READY_STATUS: '200',
+    TEST_READY_BODY: '{"ok":true}', // 真服务仍 ready：旧逻辑因此会假成功
+  })
+
+  assert.notEqual(r.status, 0, `🔴 DATA_DIR 不匹配必须拒绝：\n${r.stdout}\n${r.stderr}`)
+  assert.match(r.stderr, /DATA_DIR|\/app\/data|bind source/i)
+  assert.equal(readMarker(path.join(actualDataDir, 'app.db')), 'ACTUAL-SERVICE-DB', '真库不得改动')
+  assert.equal(readMarker(path.join(wrongDataDir, 'app.db')), 'WRONG-TARGET-BEFORE', '错路径也不得被写入')
+  assert.ok(!fs.existsSync(path.join(wrongDataDir, '.restore-in-progress')), '不得创建 restore 锁')
+  assert.ok(!fs.existsSync(path.join(wrongBackups, 'pre-restore.db')), '不得生成现场快照')
+  assert.doesNotMatch(r.log, /"run"|"stop"|"start"/, '只允许静态 config，不得启动容器或改变运行态')
+})
+
+for (const mode of ['missing', 'named', 'multiple', 'config-fail'] as const) {
+  test(`P6-R2 DATA_DIR 绑定门禁：${mode} /app/data 配置必须 fail-closed`, () => {
+    const { dataDir, backupsDir } = scene(`compose-data-${mode}`, 'CURRENT')
+    const snap = path.join(backupsDir, `backup-${mode}.db`)
+    makeSnapshot(snap, 'SHOULD-NOT-INSTALL')
+    const second = path.join(path.dirname(dataDir), 'second-data')
+    fs.mkdirSync(second, { recursive: true })
+
+    const r = runRestore(dataDir, backupsDir, snap, {
+      TEST_COMPOSE_MOUNT_MODE: mode,
+      TEST_COMPOSE_DATA_SOURCE: dataDir,
+      TEST_COMPOSE_DATA_SOURCE_2: second,
+    })
+
+    assert.notEqual(r.status, 0, `🔴 ${mode} 布局不得继续恢复：\n${r.stdout}\n${r.stderr}`)
+    assert.equal(readMarker(path.join(dataDir, 'app.db')), 'CURRENT')
+    assert.ok(!fs.existsSync(path.join(dataDir, '.restore-in-progress')))
+    assert.doesNotMatch(r.log, /"run"|"stop"|"start"/)
+  })
+}
+
+test('P6-R2 DATA_DIR 绑定门禁：相对/绝对路径及 symlink 规范化到同一目录时正常放行', () => {
+  const root = fs.mkdtempSync(path.join(tmpDir, 'data-dir-symlink-'))
+  const actualDataDir = path.join(root, 'actual-data')
+  const aliasDataDir = path.join(root, 'data-alias')
+  const backupsDir = path.join(actualDataDir, 'backups')
+  fs.mkdirSync(backupsDir, { recursive: true })
+  makeDb(path.join(actualDataDir, 'app.db'), 'CURRENT')
+  fs.symlinkSync(actualDataDir, aliasDataDir, 'dir')
+  const snap = path.join(backupsDir, 'backup-symlink-ok.db')
+  makeSnapshot(snap, 'SYMLINK-SNAPSHOT')
+
+  const r = runRestore(aliasDataDir, path.join(aliasDataDir, 'backups'), snap, {
+    TEST_COMPOSE_DATA_SOURCE: path.relative(REPO, actualDataDir),
+  })
+  assert.equal(r.status, 0, `指向同一实体目录的 symlink 应放行：\n${r.stdout}\n${r.stderr}`)
+  assert.equal(readMarker(path.join(actualDataDir, 'app.db')), 'SYMLINK-SNAPSHOT')
+})
+
+test('P6-R2 DATA_DIR 绑定门禁：Compose 已改但现有容器仍挂旧目录时必须在写库前拒绝', () => {
+  const root = fs.mkdtempSync(path.join(tmpDir, 'stale-container-mount-'))
+  const configuredDataDir = path.join(root, 'configured-data')
+  const staleContainerDataDir = path.join(root, 'stale-container-data')
+  const backupsDir = path.join(configuredDataDir, 'backups')
+  fs.mkdirSync(backupsDir, { recursive: true })
+  makeDb(path.join(configuredDataDir, 'app.db'), 'CONFIGURED-CURRENT')
+  makeDb(path.join(staleContainerDataDir, 'app.db'), 'STALE-CONTAINER-CURRENT')
+  const snap = path.join(backupsDir, 'backup-stale-container.db')
+  makeSnapshot(snap, 'SHOULD-NOT-INSTALL')
+
+  const r = runRestore(configuredDataDir, backupsDir, snap, {
+    TEST_COMPOSE_DATA_SOURCE: configuredDataDir,
+    TEST_CONTAINER_DATA_SOURCE: staleContainerDataDir,
+    TEST_READY_STATUS: '200',
+    TEST_READY_BODY: '{"ok":true}',
+  })
+
+  assert.notEqual(r.status, 0, `🔴 旧容器挂载与当前 Compose 不一致时不得假成功：\n${r.stdout}\n${r.stderr}`)
+  assert.match(r.stderr, /container|容器|mount|挂载|\/app\/data/i)
+  assert.equal(readMarker(path.join(configuredDataDir, 'app.db')), 'CONFIGURED-CURRENT')
+  assert.equal(readMarker(path.join(staleContainerDataDir, 'app.db')), 'STALE-CONTAINER-CURRENT')
+  assert.ok(!fs.existsSync(path.join(configuredDataDir, '.restore-in-progress')))
+  assert.ok(!fs.existsSync(path.join(backupsDir, 'pre-restore.db')))
+  assert.doesNotMatch(r.log, /"run"|"stop"|"start"/)
+})
+
+for (const mode of ['container-missing', 'container-multiple', 'missing', 'named', 'multiple', 'inspect-fail'] as const) {
+  test(`P6-R2 DATA_DIR 绑定门禁：现有容器挂载状态 ${mode} 必须 fail-closed`, () => {
+    const { dataDir, backupsDir } = scene(`container-data-${mode}`, 'CURRENT')
+    const snap = path.join(backupsDir, `backup-container-${mode}.db`)
+    makeSnapshot(snap, 'SHOULD-NOT-INSTALL')
+    const second = path.join(path.dirname(dataDir), 'second-container-data')
+    fs.mkdirSync(second, { recursive: true })
+
+    const r = runRestore(dataDir, backupsDir, snap, {
+      TEST_CONTAINER_MOUNT_MODE: mode,
+      TEST_CONTAINER_DATA_SOURCE: dataDir,
+      TEST_CONTAINER_DATA_SOURCE_2: second,
+    })
+
+    assert.notEqual(r.status, 0, `🔴 容器挂载状态 ${mode} 不明确时不得继续恢复：\n${r.stdout}\n${r.stderr}`)
+    assert.equal(readMarker(path.join(dataDir, 'app.db')), 'CURRENT')
+    assert.ok(!fs.existsSync(path.join(dataDir, '.restore-in-progress')))
+    assert.ok(!fs.existsSync(path.join(backupsDir, 'pre-restore.db')))
+    assert.doesNotMatch(r.log, /"run"|"stop"|"start"/)
+  })
+}
+
+test('P6-R2 DATA_DIR 绑定门禁：校验后的 symlink 换靶不得改变锁与数据库实际目标', () => {
+  const root = fs.mkdtempSync(path.join(tmpDir, 'data-dir-retarget-'))
+  const actualDataDir = path.join(root, 'actual-data')
+  const retargetDataDir = path.join(root, 'retarget-data')
+  const aliasDataDir = path.join(root, 'data-alias')
+  const backupsDir = path.join(actualDataDir, 'backups')
+  fs.mkdirSync(backupsDir, { recursive: true })
+  makeDb(path.join(actualDataDir, 'app.db'), 'ACTUAL-CURRENT')
+  makeDb(path.join(retargetDataDir, 'app.db'), 'RETARGET-CURRENT')
+  fs.symlinkSync(actualDataDir, aliasDataDir, 'dir')
+  const snap = path.join(backupsDir, 'backup-retarget.db')
+  makeSnapshot(snap, 'PINNED-SNAPSHOT')
+
+  const retargetBin = path.join(root, 'retarget-bin')
+  fs.mkdirSync(retargetBin, { recursive: true })
+  fs.writeFileSync(
+    path.join(retargetBin, 'docker'),
+    `#!/bin/sh\nexec "${process.execPath}" "${path.join(binDir, 'docker-stub.mjs')}" "$@"\n`,
+    { mode: 0o755 },
+  )
+  installReadyCurlStub(retargetBin)
+  const retargetDone = path.join(root, 'retarget-done')
+  const dirnameStub = path.join(retargetBin, 'dirname-stub.mjs')
+  fs.writeFileSync(
+    dirnameStub,
+    `import fs from 'node:fs'
+import path from 'node:path'
+if (!fs.existsSync(process.env.TEST_RETARGET_DONE)) {
+  fs.unlinkSync(process.env.TEST_DATA_ALIAS)
+  fs.symlinkSync(process.env.TEST_RETARGET_DEST, process.env.TEST_DATA_ALIAS, 'dir')
+  fs.writeFileSync(process.env.TEST_RETARGET_DONE, '')
+}
+console.log(path.dirname(process.argv.at(-1)))
+`,
+  )
+  fs.writeFileSync(
+    path.join(retargetBin, 'dirname'),
+    `#!/bin/sh\nexec "${process.execPath}" "${dirnameStub}" "$@"\n`,
+    { mode: 0o755 },
+  )
+
+  const logFile = path.join(root, 'stub.log')
+  fs.writeFileSync(logFile, '')
+  const r = spawnSync('sh', [RESTORE_SH, snap], {
+    cwd: REPO,
+    env: {
+      ...process.env,
+      PATH: `${retargetBin}:${process.env.PATH}`,
+      STUB_LOG: logFile,
+      SUDO: '',
+      DATA_DIR: aliasDataDir,
+      BACKUP_DIR: backupsDir,
+      APP_URL: 'http://stub',
+      TEST_COMPOSE_DATA_SOURCE: actualDataDir,
+      TEST_CONTAINER_DATA_SOURCE: actualDataDir,
+      TEST_DATA_ALIAS: aliasDataDir,
+      TEST_RETARGET_DEST: retargetDataDir,
+      TEST_RETARGET_DONE: retargetDone,
+    },
+    encoding: 'utf8',
+  })
+
+  assert.equal(r.status, 0, `规范化后应固定写入已验证实体目录：\n${r.stdout}\n${r.stderr}`)
+  assert.ok(fs.existsSync(retargetDone), '前置：验证后确实发生了 symlink 换靶')
+  assert.equal(readMarker(path.join(actualDataDir, 'app.db')), 'PINNED-SNAPSHOT')
+  assert.equal(readMarker(path.join(retargetDataDir, 'app.db')), 'RETARGET-CURRENT', '换靶目录不得被写入')
+  assert.ok(!fs.existsSync(path.join(retargetDataDir, '.restore-in-progress')))
+})
+
 // ============================================================================
 // P6-R2 复审三轮第 1 条 + R6① 回归：DB_PATH 覆盖 fail-closed 守卫
 //
@@ -446,7 +695,7 @@ test('建议5：BACKUP_DIR 覆盖到非默认位置时，pre-restore.db 真落�
 // DB_PATH≠默认值 → 拒绝运行 + 清晰报错。
 //
 // R6① 增强（codex R5）：宿主侧 DB_PATH 只能看 export 的值，漏了「容器内 .env/compose 配置、
-// 宿主未 export」的正常运维场景。增强：从运行中容器读实际生效值，两侧任一非默认就拒绝。
+// 宿主未 export」的正常运维场景。增强：从 Compose 最终配置静态读实际生效值，两侧任一非默认就拒绝。
 // ============================================================================
 
 test('复审三轮1：DB_PATH 覆盖且≠默认值（宿主侧）→ fail-closed 拒绝运行', () => {
@@ -504,6 +753,10 @@ test('R4-P1①：容器停机时也须从 compose 配置读出 DB_PATH → fail-
     path.join(binDir2, 'docker'),
     `#!/bin/sh
 if [ "$1" = "compose" ] && [ "$2" = "config" ]; then
+  if [ "$3" = "--format" ] && [ "$4" = "json" ]; then
+    printf '{"services":{"app":{"volumes":[{"type":"bind","source":"%s","target":"/app/data","bind":{}}]}}}\n' "$DATA_DIR"
+    exit 0
+  fi
   echo "services:"
   echo "  app:"
   echo "    environment:"
@@ -617,6 +870,13 @@ test('P6-R2 升级失败回滚：旧镜像只能 build/pull + create 为停止�
     '🔴 数据库恢复前不得启动旧服务，否则会接流量并把中间 schema 写入随后被覆盖',
   )
   assert.doesNotMatch(r.log, /"stop"|"start"/, '守卫本身不得改变容器运行态')
+  const docs = fs.readFileSync(path.join(REPO, 'docs', 'deploy.md'), 'utf8')
+  assert.match(
+    docs,
+    /回滚：停机.*退回旧代码\/镜像.*(?:build|pull).*create.*停止态.*恢复 DB.*启动/s,
+    '摘要必须与详细流程的停止态 create 安全顺序一致',
+  )
+  assert.doesNotMatch(docs, /回滚：停容器 → 用 §5 的恢复步骤还原到升级前的备份 → 起旧镜像/)
 })
 
 
@@ -673,7 +933,7 @@ test('R3-新② trap 陷阱：stop 后 armed 标记写入失败，app 仍被重�
     `#!/bin/sh\nexec "${process.execPath}" "${path.join(binDir, 'docker-stub.mjs')}" "$@"\n`,
     { mode: 0o755 },
   )
-  fs.writeFileSync(path.join(failBin, 'curl'), '#!/bin/sh\nexit 0\n', { mode: 0o755 })
+  installReadyCurlStub(failBin)
   fs.writeFileSync(
     path.join(failBin, 'install'),
     `#!/bin/sh
@@ -700,7 +960,7 @@ fi
       DATA_DIR: dataDir,
       BACKUP_DIR: backupsDir,
       APP_URL: 'http://stub',
-      TEST_FAIL_INSTALL_TARGET: path.join(dataDir, '.restore-in-progress', 'replace-armed'),
+      TEST_FAIL_INSTALL_TARGET: path.join(fs.realpathSync(dataDir), '.restore-in-progress', 'replace-armed'),
     },
     encoding: 'utf8',
   })
@@ -726,7 +986,7 @@ test('P6-R2 现场临时快照：chmod 前已是 0600，chmod 失败时 trap 清
     `#!/bin/sh\nexec "${process.execPath}" "${path.join(binDir, 'docker-stub.mjs')}" "$@"\n`,
     { mode: 0o755 },
   )
-  fs.writeFileSync(path.join(failBin, 'curl'), '#!/bin/sh\nexit 0\n', { mode: 0o755 })
+  installReadyCurlStub(failBin)
   fs.writeFileSync(
     path.join(failBin, 'chmod'),
     `#!/bin/sh
@@ -917,7 +1177,7 @@ exec "${process.execPath}" "${path.join(binDir, 'docker-stub.mjs')}" "$@"
 `,
     { mode: 0o755 },
   )
-  fs.writeFileSync(path.join(swapBin, 'curl'), '#!/bin/sh\nexit 0\n', { mode: 0o755 })
+  installReadyCurlStub(swapBin)
 
   const logFile = path.join(path.dirname(dataDir), 'stub.log')
   fs.writeFileSync(logFile, '')
@@ -968,7 +1228,7 @@ exec "${process.execPath}" "${path.join(binDir, 'docker-stub.mjs')}" "$@"
 `,
     { mode: 0o755 },
   )
-  fs.writeFileSync(path.join(swapBin, 'curl'), '#!/bin/sh\nexit 0\n', { mode: 0o755 })
+  installReadyCurlStub(swapBin)
 
   const logFile = path.join(path.dirname(dataDir), 'stub.log')
   fs.writeFileSync(logFile, '')
@@ -1069,7 +1329,7 @@ test('P6-R2：非 uid1000 且使用默认 sudo 时，宿主文件头检查也必
     `#!/bin/sh\nexec "${process.execPath}" "${path.join(binDir, 'docker-stub.mjs')}" "$@"\n`,
     { mode: 0o755 },
   )
-  fs.writeFileSync(path.join(logicalBin, 'curl'), '#!/bin/sh\nexit 0\n', { mode: 0o755 })
+  installReadyCurlStub(logicalBin)
   fs.writeFileSync(
     path.join(logicalBin, 'id'),
     `#!/bin/sh
@@ -1199,7 +1459,7 @@ for (const { signal, exitCode } of [
   { signal: 'SIGTERM' as const, exitCode: 143 },
   { signal: 'SIGINT' as const, exitCode: 130 },
 ]) {
-test(`R7-P1②：真实 ${signal} 落在 mv 成功窗口 → start 前清掉旧 WAL/SHM，退出 ${exitCode}`, async () => {
+test(`R7-P1②：真实 ${signal} 落在 mv 成功窗口 → 清旧 WAL/SHM 但保持停机与锁，退出 ${exitCode}`, async () => {
   const { dataDir, backupsDir } = scene(`trap-wal-${signal.toLowerCase()}`, 'CURRENT')
   const snap = path.join(backupsDir, `backup-2026-07-28T05-00-00-${exitCode}.db`)
   makeSnapshot(snap, 'SNAPSHOT-WAL')
@@ -1219,7 +1479,7 @@ test(`R7-P1②：真实 ${signal} 落在 mv 成功窗口 → start 前清掉旧 
     `#!/bin/sh\nexec "${process.execPath}" "${path.join(binDir, 'docker-stub.mjs')}" "$@"\n`,
     { mode: 0o755 },
   )
-  fs.writeFileSync(path.join(signalBin, 'curl'), '#!/bin/sh\nexit 0\n', { mode: 0o755 })
+  installReadyCurlStub(signalBin)
 
   const mvDone = path.join(path.dirname(dataDir), 'target-mv-done')
   fs.writeFileSync(
@@ -1250,7 +1510,7 @@ fi
       DATA_DIR: dataDir,
       BACKUP_DIR: backupsDir,
       APP_URL: 'http://stub',
-      TEST_BLOCK_MV_TARGET: path.join(dataDir, 'app.db'),
+      TEST_BLOCK_MV_TARGET: path.join(fs.realpathSync(dataDir), 'app.db'),
       TEST_MV_DONE: mvDone,
       TEST_START_STATE: startStateFile,
       TEST_WAL_PATH: wal,
@@ -1295,13 +1555,11 @@ fi
     `🔴 ${signal} 落在 mv/状态推进之间时仍必须清掉旧库 -wal\n${r.stdout}\n${r.stderr}`,
   )
   assert.ok(shmGone, '🔴 trap 必须清掉旧库 -shm')
-  assert.equal(startStates.length, 1, '信号收尾应恰好尝试一次 start')
-  assert.deepEqual(
-    startStates[0],
-    { walExists: false, shmExists: false },
-    '🔴 docker compose start 被调用的那个瞬间，旧 WAL/SHM 必须已经不存在',
-  )
-  assert.ok(!fs.existsSync(path.join(dataDir, '.restore-in-progress')), '优雅信号收尾后应释放状态锁')
+  assert.equal(startStates.length, 0, '库已替换但尚未 ready/accepted，信号收尾不得 start')
+  const lock = path.join(dataDir, '.restore-in-progress')
+  assert.ok(fs.existsSync(lock), '库已替换的信号退出必须保留状态锁')
+  assert.ok(fs.existsSync(path.join(lock, 'sidecars-clean')), '应留下旧 sidecar 已清理证据')
+  assert.ok(!fs.existsSync(path.join(lock, 'ready-accepted')))
 })
 }
 
@@ -1322,7 +1580,7 @@ test('R7-P1②：SIGKILL 落在 mv 成功窗口 → 状态锁保留 armed 并阻
     `#!/bin/sh\nexec "${process.execPath}" "${path.join(binDir, 'docker-stub.mjs')}" "$@"\n`,
     { mode: 0o755 },
   )
-  fs.writeFileSync(path.join(killBin, 'curl'), '#!/bin/sh\nexit 0\n', { mode: 0o755 })
+  installReadyCurlStub(killBin)
   const mvDone = path.join(path.dirname(dataDir), 'sigkill-mv-done')
   fs.writeFileSync(
     path.join(killBin, 'mv'),
@@ -1352,7 +1610,7 @@ fi
       DATA_DIR: dataDir,
       BACKUP_DIR: backupsDir,
       APP_URL: 'http://stub',
-      TEST_BLOCK_MV_TARGET: path.join(dataDir, 'app.db'),
+      TEST_BLOCK_MV_TARGET: path.join(fs.realpathSync(dataDir), 'app.db'),
       TEST_MV_DONE: mvDone,
       TEST_START_STATE: startStateFile,
       TEST_WAL_PATH: wal,
@@ -1406,7 +1664,7 @@ exec "${process.execPath}" "${path.join(binDir, 'docker-stub.mjs')}" "$@"
 `,
     { mode: 0o755 },
   )
-  fs.writeFileSync(path.join(stopBin, 'curl'), '#!/bin/sh\nexit 0\n', { mode: 0o755 })
+  installReadyCurlStub(stopBin)
 
   const logFile = path.join(path.dirname(dataDir), 'stub.log')
   const startStateFile = path.join(path.dirname(dataDir), 'start-state.jsonl')
@@ -1468,7 +1726,7 @@ test('R7-P1② 反向：已 armed 但 mv 尚未执行时 SIGTERM → 保留旧 D
     `#!/bin/sh\nexec "${process.execPath}" "${path.join(binDir, 'docker-stub.mjs')}" "$@"\n`,
     { mode: 0o755 },
   )
-  fs.writeFileSync(path.join(signalBin, 'curl'), '#!/bin/sh\nexit 0\n', { mode: 0o755 })
+  installReadyCurlStub(signalBin)
   const mvEntered = path.join(path.dirname(dataDir), 'target-mv-entered')
   fs.writeFileSync(
     path.join(signalBin, 'mv'),
@@ -1500,7 +1758,7 @@ fi
       DATA_DIR: dataDir,
       BACKUP_DIR: backupsDir,
       APP_URL: 'http://stub',
-      TEST_BLOCK_MV_TARGET: path.join(dataDir, 'app.db'),
+      TEST_BLOCK_MV_TARGET: path.join(fs.realpathSync(dataDir), 'app.db'),
       TEST_MV_ENTERED: mvEntered,
       TEST_START_STATE: startStateFile,
       TEST_WAL_PATH: wal,
@@ -1535,9 +1793,123 @@ fi
   assert.ok(!fs.existsSync(path.join(dataDir, '.restore-in-progress')), 'mv 前优雅信号应清 stage 并释放锁')
 })
 
-// ②a 反向窗口：正常路径已经清掉旧 sidecar、app 启动并为**新库**创建 WAL 后，readiness 失败
-// 再进 EXIT trap 时绝不能重复 rm。否则恢复刚完成，应用的新提交又会被当成「旧 WAL」删掉。
-test('R7-P1②：app 已启动后 EXIT trap 不得删除新库刚生成的 WAL/SHM', () => {
+for (const { label, status, body } of [
+  { label: '302 redirect', status: '302', body: '{"ok":true}' },
+  { label: '204 other-2xx', status: '204', body: '' },
+  { label: '200 ok=false', status: '200', body: '{"ok":false}' },
+  { label: '200 malformed', status: '200', body: 'not-json' },
+  { label: '200 empty', status: '200', body: '' },
+  { label: '200 invalid key whitespace', status: '200', body: '{"o k":true}' },
+  { label: '200 invalid literal whitespace', status: '200', body: '{"ok":tr ue}' },
+  { label: '200 leading garbage line', status: '200', body: 'garbage\n{"ok":true}' },
+  { label: '200 trailing garbage line', status: '200', body: '{"ok":true}\ngarbage' },
+  { label: '200 false then true lines', status: '200', body: '{"ok":false}\n{"ok":true}' },
+  { label: '200 vertical-tab whitespace', status: '200', body: '\v{"ok":true}' },
+  { label: '200 form-feed whitespace', status: '200', body: '{"ok":true}\f' },
+] as const) {
+  test(`P6-R2 readiness 严格接受：${label} 不得宣告恢复成功`, () => {
+    const { dataDir, backupsDir } = scene(`ready-reject-${label.replace(/[^a-z0-9]/gi, '-')}`, 'CURRENT')
+    const snap = path.join(backupsDir, `backup-${label.replace(/[^a-z0-9]/gi, '-')}.db`)
+    makeSnapshot(snap, 'SNAPSHOT-UNACCEPTED')
+
+    const r = runRestore(dataDir, backupsDir, snap, {
+      READY_TIMEOUT: '1',
+      TEST_READY_STATUS: status,
+      TEST_READY_BODY: body,
+    })
+    const calls = r.log.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line) as string[])
+    const starts = calls.filter((call) => call[0] === 'compose' && call[1] === 'start')
+    const stops = calls.filter((call) => call[0] === 'compose' && call[1] === 'stop')
+    const lock = path.join(dataDir, '.restore-in-progress')
+
+    assert.equal(r.status, 1, `🔴 ${label} 必须在 deadline 后失败：\n${r.stdout}\n${r.stderr}`)
+    assert.doesNotMatch(r.stdout, /恢复完成/)
+    assert.equal(starts.length, 1, '只允许正常路径的一次 start，EXIT trap 不得再 start')
+    assert.equal(stops.length, 2, 'readiness 未接受时必须再 stop 一次并保持停机')
+    assert.ok(fs.existsSync(lock), '未接受的恢复必须保留状态锁')
+    assert.ok(fs.existsSync(path.join(lock, 'sidecars-clean')))
+    assert.ok(fs.existsSync(path.join(lock, 'upgrade-marker-clean')))
+    assert.ok(fs.existsSync(path.join(lock, 'app-started')))
+    assert.ok(!fs.existsSync(path.join(lock, 'ready-accepted')))
+    assert.equal(readMarker(path.join(dataDir, 'app.db')), 'SNAPSHOT-UNACCEPTED')
+  })
+}
+
+test('P6-R2 readiness 严格接受：200 body 在 true 中夹 NUL 不得被 shell 吞掉后误接受', () => {
+  const { dataDir, backupsDir } = scene('ready-reject-nul', 'CURRENT')
+  const snap = path.join(backupsDir, 'backup-ready-reject-nul.db')
+  makeSnapshot(snap, 'SNAPSHOT-NUL-UNACCEPTED')
+
+  const nulBin = path.join(path.dirname(dataDir), 'nul-ready-bin')
+  fs.mkdirSync(nulBin, { recursive: true })
+  fs.writeFileSync(
+    path.join(nulBin, 'docker'),
+    `#!/bin/sh\nexec "${process.execPath}" "${path.join(binDir, 'docker-stub.mjs')}" "$@"\n`,
+    { mode: 0o755 },
+  )
+  fs.writeFileSync(
+    path.join(nulBin, 'curl'),
+    `#!/bin/sh
+out=
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--output" ]; then out=$2; shift 2; else shift; fi
+done
+if [ -n "$out" ]; then
+  printf '{"ok":tru\\000e}' > "$out"
+  printf '200'
+else
+  printf '{"ok":tru\\000e}\\n200\\n'
+fi
+`,
+    { mode: 0o755 },
+  )
+  const logFile = path.join(path.dirname(dataDir), 'stub.log')
+  fs.writeFileSync(logFile, '')
+  const r = spawnSync('sh', [RESTORE_SH, snap], {
+    cwd: REPO,
+    env: {
+      ...process.env,
+      PATH: `${nulBin}:${process.env.PATH}`,
+      STUB_LOG: logFile,
+      SUDO: '',
+      DATA_DIR: dataDir,
+      BACKUP_DIR: backupsDir,
+      APP_URL: 'http://stub',
+      READY_TIMEOUT: '1',
+    },
+    encoding: 'utf8',
+  })
+  const calls = fs.readFileSync(logFile, 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line) as string[])
+  const lock = path.join(dataDir, '.restore-in-progress')
+
+  assert.equal(r.status, 1, `🔴 NUL 响应不得变成合法 JSON 后成功：\n${r.stdout}\n${r.stderr}`)
+  assert.doesNotMatch(r.stdout, /恢复完成/)
+  assert.equal(calls.filter((call) => call[0] === 'compose' && call[1] === 'start').length, 1)
+  assert.equal(calls.filter((call) => call[0] === 'compose' && call[1] === 'stop').length, 2)
+  assert.ok(fs.existsSync(lock), 'NUL body 未接受时必须保留 restore 锁')
+  assert.equal(readMarker(path.join(dataDir, 'app.db')), 'SNAPSHOT-NUL-UNACCEPTED')
+})
+
+test('P6-R2 readiness 严格接受：仅 200 + {"ok":true} 释放锁并宣告成功', () => {
+  const { dataDir, backupsDir } = scene('ready-accepted', 'CURRENT')
+  const snap = path.join(backupsDir, 'backup-ready-accepted.db')
+  makeSnapshot(snap, 'SNAPSHOT-ACCEPTED')
+  const r = runRestore(dataDir, backupsDir, snap, {
+    TEST_READY_STATUS: '200',
+    TEST_READY_BODY: ' { "ok" : true } ',
+  })
+  const calls = r.log.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line) as string[])
+  assert.equal(r.status, 0, `合法 readiness 应通过：\n${r.stdout}\n${r.stderr}`)
+  assert.match(r.stdout, /恢复完成/)
+  assert.equal(calls.filter((call) => call[0] === 'compose' && call[1] === 'start').length, 1)
+  assert.equal(calls.filter((call) => call[0] === 'compose' && call[1] === 'stop').length, 1)
+  assert.ok(!fs.existsSync(path.join(dataDir, '.restore-in-progress')), '只有 accepted 后才释放锁')
+  assert.equal(readMarker(path.join(dataDir, 'app.db')), 'SNAPSHOT-ACCEPTED')
+})
+
+// ②a 反向窗口：旧 sidecar 已清理、app 已为新库创建 WAL 后 readiness 失败。
+// EXIT trap 必须保留新 WAL，再次 stop app，且保留阶段锁；不得再 start 或释放锁。
+test('R7-P1②：readiness 失败后保留新 WAL，停机并保留未接受恢复锁', () => {
   const { dataDir, backupsDir } = scene('trap-new-wal', 'CURRENT')
   const snap = path.join(backupsDir, 'backup-2026-07-28T06-00-00-dddddd.db')
   makeSnapshot(snap, 'SNAPSHOT-NEW-WAL')
@@ -1581,14 +1953,72 @@ test('R7-P1②：app 已启动后 EXIT trap 不得删除新库刚生成的 WAL/S
 
   const states = fs.readFileSync(startStateFile, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l))
   assert.equal(r.status, 1, 'readiness 超时应以 1 退出')
-  assert.ok(states.length >= 2, '正常路径 start 后，EXIT trap 还会做一次幂等 start')
+  assert.equal(states.length, 1, 'readiness 失败后 EXIT trap 不得再 start')
   assert.deepEqual(states[0], { walExists: false, shmExists: false }, '第一次 start 前旧 sidecar 已清干净')
-  assert.deepEqual(
-    states.at(-1),
-    { walExists: true, shmExists: true },
-    '🔴 第二次 start 前必须保留 app 为新库创建的 sidecar；false 说明 trap 在运行中误删新 WAL',
+  assert.equal(fs.readFileSync(wal, 'utf8'), 'NEW-DB-WAL', '🔴 新库 WAL 不得被 EXIT trap 误删')
+  assert.equal(fs.readFileSync(shm, 'utf8'), 'NEW-DB-SHM')
+  const calls = fs.readFileSync(logFile, 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line) as string[])
+  assert.equal(calls.filter((call) => call[0] === 'compose' && call[1] === 'stop').length, 2)
+  const lock = path.join(dataDir, '.restore-in-progress')
+  assert.ok(fs.existsSync(lock), 'readiness 失败必须保留锁')
+  assert.ok(fs.existsSync(path.join(lock, 'app-started')))
+  assert.ok(!fs.existsSync(path.join(lock, 'ready-accepted')))
+})
+
+test('P6-R2 post-replace：.upgrade-in-progress 删除失败时保持停机并保留阶段锁', () => {
+  const { dataDir, backupsDir } = scene('upgrade-marker-rm-fail', 'CURRENT')
+  const snap = path.join(backupsDir, 'preupgrade.db')
+  makeSnapshot(snap, 'PRE-UPGRADE')
+  const marker = path.join(dataDir, '.upgrade-in-progress')
+  fs.writeFileSync(marker, snap)
+
+  const failBin = path.join(path.dirname(dataDir), 'marker-rm-fail-bin')
+  fs.mkdirSync(failBin, { recursive: true })
+  fs.writeFileSync(
+    path.join(failBin, 'docker'),
+    `#!/bin/sh\nexec "${process.execPath}" "${path.join(binDir, 'docker-stub.mjs')}" "$@"\n`,
+    { mode: 0o755 },
   )
-  assert.ok(!fs.existsSync(path.join(dataDir, '.restore-in-progress')), 'readiness 失败但状态安全时应释放锁')
+  installReadyCurlStub(failBin)
+  fs.writeFileSync(
+    path.join(failBin, 'rm'),
+    `#!/bin/sh
+for arg in "$@"; do
+  if [ "$arg" = "$TEST_FAIL_RM_MARKER" ]; then
+    echo "rm: injected upgrade marker failure" >&2
+    exit 73
+  fi
+done
+/bin/rm "$@"
+`,
+    { mode: 0o755 },
+  )
+  const logFile = path.join(path.dirname(dataDir), 'stub.log')
+  fs.writeFileSync(logFile, '')
+  const r = spawnSync('sh', [RESTORE_SH, '--after-image-rollback', snap], {
+    cwd: REPO,
+    env: {
+      ...process.env,
+      PATH: `${failBin}:${process.env.PATH}`,
+      STUB_LOG: logFile,
+      SUDO: '',
+      DATA_DIR: dataDir,
+      BACKUP_DIR: backupsDir,
+      APP_URL: 'http://stub',
+      TEST_FAIL_RM_MARKER: path.join(fs.realpathSync(dataDir), '.upgrade-in-progress'),
+    },
+    encoding: 'utf8',
+  })
+  const calls = fs.readFileSync(logFile, 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line) as string[])
+  const lock = path.join(dataDir, '.restore-in-progress')
+  assert.equal(r.status, 73, `应保留 rm 原退出码：\n${r.stdout}\n${r.stderr}`)
+  assert.equal(calls.filter((call) => call[0] === 'compose' && call[1] === 'start').length, 0, '标记未清不得启动')
+  assert.equal(calls.filter((call) => call[0] === 'compose' && call[1] === 'stop').length, 2, '收尾再 stop 保证停机')
+  assert.ok(fs.existsSync(marker), '注入失败应保留升级标记')
+  assert.ok(fs.existsSync(lock), '必须保留 restore 锁')
+  assert.ok(fs.existsSync(path.join(lock, 'sidecars-clean')))
+  assert.ok(!fs.existsSync(path.join(lock, 'upgrade-marker-clean')))
+  assert.equal(readMarker(path.join(dataDir, 'app.db')), 'PRE-UPGRADE')
 })
 
 // ②b 清理失败必须 fail closed：库已经换成快照时，旧 sidecar 删不掉就绝不能 start。
@@ -1610,7 +2040,7 @@ test('R7-P1②：数据库已替换但旧 WAL/SHM 删除失败 → 保持 app �
     `#!/bin/sh\nexec "${process.execPath}" "${path.join(binDir, 'docker-stub.mjs')}" "$@"\n`,
     { mode: 0o755 },
   )
-  fs.writeFileSync(path.join(failBin, 'curl'), '#!/bin/sh\nexit 0\n', { mode: 0o755 })
+  installReadyCurlStub(failBin)
   fs.writeFileSync(
     path.join(failBin, 'rm'),
     `#!/bin/sh
@@ -1637,8 +2067,8 @@ done
       DATA_DIR: dataDir,
       BACKUP_DIR: backupsDir,
       APP_URL: 'http://stub',
-      TEST_FAIL_RM_WAL: wal,
-      TEST_FAIL_RM_SHM: shm,
+      TEST_FAIL_RM_WAL: path.join(fs.realpathSync(dataDir), 'app.db-wal'),
+      TEST_FAIL_RM_SHM: path.join(fs.realpathSync(dataDir), 'app.db-shm'),
     },
     encoding: 'utf8',
   })

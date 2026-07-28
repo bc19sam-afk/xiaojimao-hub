@@ -203,13 +203,24 @@ export function latestBackupDay(dir: string): string | null {
   return latest
 }
 
+function hasBackupOnLocalDay(dir: string, day: string): boolean {
+  let files: string[]
+  try {
+    files = fs.readdirSync(dir)
+  } catch {
+    return false
+  }
+  return files.some((f) => backupLocalDay(f) === day)
+}
+
 // 当天（now 所在的服务器本地自然日）若尚无备份 → 备一份并返回 true；已有则跳过返回 false。
 // now 注入以可测（跨日判定确定性）；调用方传真实时钟。
 // 备份本身失败会照常抛出，由调用方（worker 第四段）捕获记日志——绝不静默吞掉备份失败。
 export function dailyBackupIfDue(now: Date, dbPath: string, dir: string, keep: number): boolean {
   const today = localDayStr(now)
-  const latest = latestBackupDay(dir)
-  if (latest !== null && latest >= today) return false // >= 而非 ===：时钟回拨时也不重复备
+  // 只有“今天本地日”的有效 backup-*.db 才能满足今日门禁。宿主时钟曾跳快留下的未来文件仍可
+  // 安全保留并参与正常轮转，但不能替代今天的恢复点。
+  if (hasBackupOnLocalDay(dir, today)) return false
   backupDb(dbPath, dir, keep, now) // 传同一个 now：命名与判定同源，日界前后不会互相错位
   return true
 }

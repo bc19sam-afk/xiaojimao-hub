@@ -173,14 +173,29 @@ test('dailyBackupIfDue：跨到次日 → 再产一份', () => {
   assert.equal(backupsIn(backups).length, 2)
 })
 
-// 时钟回拨（NTP 校正 / 宿主时间被改）：不该因为「今天 < 最近备份日」就再备一份。
-test('dailyBackupIfDue：时钟回拨到更早的日子 → 不重复备份', () => {
+// 时钟曾跳快又校正时，未来日期文件不能代替「今天」的快照。
+// keep=2 同时钉住轮转边界：补今天后未来快照仍在，第二次 tick 不再重复备份。
+test('dailyBackupIfDue：未来日期备份不得压制今日备份，且 keep 边界不误删', () => {
   const dir = fs.mkdtempSync(path.join(tmpDir, 'rollback-'))
   const dbPath = makeDb(dir)
   const backups = path.join(dir, 'backups')
-  assert.equal(dailyBackupIfDue(new Date('2026-07-26T09:00:00'), dbPath, backups, 7), true)
-  assert.equal(dailyBackupIfDue(new Date('2026-07-25T09:00:00'), dbPath, backups, 7), false)
-  assert.equal(backupsIn(backups).length, 1)
+  const future = fakeBackupAtLocal(backups, '2026-07-26T09:00:00', 'f001')
+  assert.equal(dailyBackupIfDue(new Date('2026-07-25T09:00:00'), dbPath, backups, 2), true)
+  assert.equal(backupsIn(backups).length, 2)
+  assert.ok(fs.existsSync(path.join(backups, future)), '在 keep 限额内的未来快照不得被误删')
+  assert.equal(dailyBackupIfDue(new Date('2026-07-25T18:00:00'), dbPath, backups, 2), false)
+  assert.equal(backupsIn(backups).length, 2, '今日已补后后续 tick 不得再备')
+})
+
+test('dailyBackupIfDue：今日快照已存在时，即使还有更晚的未来文件也不重复备份', () => {
+  const dir = fs.mkdtempSync(path.join(tmpDir, 'today-plus-future-'))
+  const dbPath = makeDb(dir)
+  const backups = path.join(dir, 'backups')
+  fakeBackupAtLocal(backups, '2026-07-25T09:00:00', 'a001')
+  fakeBackupAtLocal(backups, '2026-08-27T09:00:00', 'f002')
+  const before = backupsIn(backups)
+  assert.equal(dailyBackupIfDue(new Date('2026-07-25T18:00:00'), dbPath, backups, 7), false)
+  assert.deepEqual(backupsIn(backups), before)
 })
 
 // preupgrade.db 是升级前钉住的回滚点、不算「今天的日常备份」：它在目录里也不该抑制当日备份。
