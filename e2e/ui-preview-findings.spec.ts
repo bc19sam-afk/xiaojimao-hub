@@ -109,6 +109,9 @@ async function mockReviewQueue(page: Page, onPost?: (route: Route) => Promise<vo
 }
 
 test('provider options remain fully visible and keyboard operable at mobile and desktop widths', async ({ page }) => {
+  // Five viewport reloads plus the first cold Next.js dashboard compilation can exceed the default
+  // 30s on a fresh CI runner; keep the bound explicit without relaxing the rest of the suite.
+  test.slow()
   await login(page)
 
   const longAccount = `grok-realistic-${'very-long-account-segment-'.repeat(8)}tail`
