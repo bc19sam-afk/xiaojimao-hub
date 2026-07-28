@@ -448,13 +448,16 @@ const realClient: CpaClient = {
   async deleteAuthFile(name) {
     await req('DELETE', `/v0/management/auth-files?name=${encodeURIComponent(name)}`)
   },
-  // 🔴 不变量（P6-R2 R7-P2③，codex R6 指出）：**本函数只在「巡检确实跑完」时正常返回**，
-  //    没跑成一律抛错。返回 [] 因此单义地表示「跑完了、本轮零结果」（号刚落、cpamp 侧还没登记），
+  // 🔴 不变量（P6-R2 R7-P2③ + 对接-R3b）：**本函数只在 run.status === 'completed' 时正常返回**，
+  //    没到可验证成功终态一律抛错。results 只是载荷：字段存在、空数组或非空数组都不能单独证明 run
+  //    已完成。返回 [] 因此单义地表示「completed 且本轮零结果」（号刚落、cpamp 侧还没登记），
   //    那是正常情况、不是故障。
   //
   //    修复前有两条**不抛的失败路径**都 `return []`：
   //      ① POST run 返回 200 但体里没有 run.id（cpamp 侧建不起巡检任务）；
   //      ② 轮询 30 轮（约 30s）后 run 仍未 completed、results 仍未出现 → `detail.results ?? []`。
+  //    对接-R3b 又证实：真实首次 GET 可为 running + results: []。旧条件把 [] 的 truthy 当完成，
+  //    会在最终 completed 结果到达前提前返回；running + 非空 partial results 同样不能视为最终集合。
   //    调用方（collect.ts 的 processPending / checkPooledHealth）看到空数组就一个号都不处理，
   //    却留 inspectFailed=false ⇒ dead-man 心跳照报健康，而首检/存活巡检链路实际已不可用
   //    （codex 号一个也进不了池、失效号一个也停不掉），且**完全静默**。
@@ -477,7 +480,7 @@ const realClient: CpaClient = {
     let done = false
     for (let i = 0; i < 30; i++) {
       detail = (await req('GET', `/v0/management/codex-inspection/runs/${id}`)) as typeof detail
-      if (detail.run?.status === 'completed' || detail.results) {
+      if (detail.run?.status === 'completed') {
         done = true
         break
       }
