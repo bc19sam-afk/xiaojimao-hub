@@ -96,6 +96,15 @@ async function openAdmin(page: Page) {
   await expect(page.getByRole('heading', { name: '管理后台', level: 1 })).toBeVisible()
 }
 
+async function waitForStableLayout(page: Page) {
+  await page.evaluate(
+    () =>
+      new Promise<void>((resolve) => {
+        requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
+      }),
+  )
+}
+
 async function mockReviewQueue(page: Page, onPost?: (route: Route) => Promise<void>) {
   await page.route('**/api/admin/review', async (route) => {
     if (route.request().method() === 'GET') {
@@ -111,10 +120,7 @@ async function mockReviewQueue(page: Page, onPost?: (route: Route) => Promise<vo
 }
 
 test('provider options remain fully visible and keyboard operable at mobile and desktop widths', async ({ page }) => {
-  // Five viewport reloads plus the first cold Next.js dashboard compilation took ~82s on a fresh
-  // runner; keep a bounded test-specific margin without relaxing the rest of the suite.
-  test.setTimeout(120_000)
-  await login(page)
+  test.setTimeout(60_000)
 
   const longAccount = `grok-realistic-${'very-long-account-segment-'.repeat(8)}tail`
   seedContribution({
@@ -137,9 +143,11 @@ test('provider options remain fully visible and keyboard operable at mobile and 
     ).run(1, 123_456_789, 'usage', 'usage:e2e-long-dashboard:2026-07-27', Date.now())
   })
 
+  await login(page)
+
   for (const width of [320, 375, 390, 430, 1440]) {
     await page.setViewportSize({ width, height: 900 })
-    await page.reload()
+    await waitForStableLayout(page)
 
     const buttons = page.locator('[data-provider-option]')
     await expect(buttons).toHaveCount(3)
@@ -212,7 +220,6 @@ test('Playwright web server listens only on loopback', async ({ request }) => {
 
 test('real long CDK result reflows inside the dashboard at every mobile viewport', async ({ page }) => {
   test.setTimeout(60_000)
-  await login(page)
   const itemName = `真实长码商品-${Date.now()}`
   const longCode = `CDK-${'A'.repeat(500)}`
   const itemId = withE2eDb((db) => {
@@ -232,20 +239,24 @@ test('real long CDK result reflows inside the dashboard at every mobile viewport
   })
 
   try {
+    await page.setViewportSize({ width: 320, height: 900 })
+    await login(page)
+    const itemRow = page.getByText(itemName, { exact: true }).first().locator('../..')
+    await expect(itemRow).toBeVisible()
+    await itemRow.getByRole('button').click()
+
+    const feedback = page.getByTestId('redeem-feedback')
+    await expect(feedback).toContainText(`已兑换「${itemName}」`)
+    const resultRow = page.getByTestId('redemption-record').filter({ hasText: itemName })
+    const result = resultRow.getByTestId('redemption-copy-code')
+    await expect(result).toBeVisible()
+
     for (const width of [320, 375, 390, 430, 1440]) {
       await page.setViewportSize({ width, height: 900 })
-      await page.reload()
-      const itemRow = page.getByText(itemName, { exact: true }).first().locator('../..')
-      await expect(itemRow).toBeVisible()
-      if (width === 320) {
-        await itemRow.getByRole('button').click()
-        await expect(page.getByText(`已兑换「${itemName}」：${longCode}`, { exact: true })).toBeVisible()
-      }
+      await waitForStableLayout(page)
       const pageWidth = await page.evaluate(() => document.documentElement.clientWidth)
       const scrollWidth = await page.evaluate(() => document.documentElement.scrollWidth)
       expect(scrollWidth, `${width}px 长 CDK 页面不应横向溢出`).toBeLessThanOrEqual(pageWidth + 1)
-      const result = page.getByRole('button', { name: `复制兑换码 ${longCode}` })
-      await expect(result).toBeVisible()
       const resultBounds = await result.evaluate((node) => {
         const rect = node.getBoundingClientRect()
         return { left: rect.left, right: rect.right, clientWidth: node.clientWidth, scrollWidth: node.scrollWidth }

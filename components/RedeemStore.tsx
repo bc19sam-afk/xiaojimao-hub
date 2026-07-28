@@ -147,6 +147,7 @@ export default function RedeemStore({ refreshKey, onRedeemed }: { refreshKey: nu
 
       {toast && (
         <div
+          data-testid="redeem-feedback"
           className={`mt-3 min-w-0 max-w-full rounded-lg px-3 py-2 text-xs [overflow-wrap:anywhere] ${
             toast.ok ? 'bg-emerald-500/10 text-emerald-300' : 'bg-rose-500/10 text-rose-300'
           }`}
@@ -173,7 +174,11 @@ export default function RedeemStore({ refreshKey, onRedeemed }: { refreshKey: nu
                       ? 'border-amber-300/25 bg-amber-400/10 text-amber-200'
                       : 'border-white/15 bg-white/5 text-neutral-300'
               return (
-                <li key={r.id} className="min-w-0 max-w-full rounded-xl border border-white/10 bg-white/[0.02] px-3 py-2.5 text-xs">
+                <li
+                  key={r.id}
+                  data-testid="redemption-record"
+                  className="min-w-0 max-w-full rounded-xl border border-white/10 bg-white/[0.02] px-3 py-2.5 text-xs"
+                >
                   <div className="flex min-w-0 max-w-full flex-wrap items-start justify-between gap-2">
                     <span className="min-w-0 break-words text-neutral-200">{r.itemName}</span>
                     <span
@@ -189,6 +194,7 @@ export default function RedeemStore({ refreshKey, onRedeemed }: { refreshKey: nu
                     {isCode && (
                       <button
                         type="button"
+                        data-testid="redemption-copy-code"
                         onClick={() => copyCode(r.result)}
                         aria-label={`复制兑换码 ${r.result}`}
                         title="点击复制"
