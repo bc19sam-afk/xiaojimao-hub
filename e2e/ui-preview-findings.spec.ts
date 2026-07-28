@@ -96,15 +96,6 @@ async function openAdmin(page: Page) {
   await expect(page.getByRole('heading', { name: '管理后台', level: 1 })).toBeVisible()
 }
 
-async function waitForStableLayout(page: Page) {
-  await page.evaluate(
-    () =>
-      new Promise<void>((resolve) => {
-        requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
-      }),
-  )
-}
-
 async function mockReviewQueue(page: Page, onPost?: (route: Route) => Promise<void>) {
   await page.route('**/api/admin/review', async (route) => {
     if (route.request().method() === 'GET') {
@@ -143,63 +134,82 @@ test('provider options remain fully visible and keyboard operable at mobile and 
     ).run(1, 123_456_789, 'usage', 'usage:e2e-long-dashboard:2026-07-27', Date.now())
   })
 
+  await page.setViewportSize({ width: 320, height: 900 })
   await login(page)
+  await expect(page.getByText(longAccount, { exact: true })).toBeVisible()
+
+  const providerSubtexts = [
+    ['codex', 'ChatGPT', 'Plus / Pro / Team / K12'],
+    ['claude', 'Claude', 'Claude 订阅'],
+    ['grok', 'Grok', 'SuperGrok'],
+  ] as const
 
   for (const width of [320, 375, 390, 430, 1440]) {
     await page.setViewportSize({ width, height: 900 })
-    await waitForStableLayout(page)
-
-    const buttons = page.locator('[data-provider-option]')
-    await expect(buttons).toHaveCount(3)
-    const bounds = await buttons.evaluateAll((nodes) =>
-      nodes.map((node) => {
-        const rect = node.getBoundingClientRect()
-        return { left: rect.left, right: rect.right, width: rect.width }
-      }),
-    )
-    const providerSubtexts = [
-      ['codex', 'ChatGPT', 'Plus / Pro / Team / K12'],
-      ['claude', 'Claude', 'Claude 订阅'],
-      ['grok', 'Grok', 'SuperGrok'],
-    ] as const
-    const pageWidth = await page.evaluate(() => document.documentElement.clientWidth)
-    const scrollWidth = await page.evaluate(() => document.documentElement.scrollWidth)
-    const contributionsScroller = page.getByRole('table').locator('..')
-    const scrollerBounds = await contributionsScroller.evaluate((node) => {
-      const rect = node.getBoundingClientRect()
-      return {
-        left: rect.left,
-        right: rect.right,
-        clientWidth: node.clientWidth,
-        scrollWidth: node.scrollWidth,
-      }
-    })
-
-    expect(scrollWidth, `${width}px 页面不应横向溢出`).toBeLessThanOrEqual(pageWidth + 1)
-    for (const rect of bounds) {
-      expect(rect.width).toBeGreaterThan(0)
-      expect(rect.left).toBeGreaterThanOrEqual(0)
-      expect(rect.right).toBeLessThanOrEqual(pageWidth + 1)
-    }
-    for (const [id, name, subtext] of providerSubtexts) {
-      const option = page.locator(`[data-provider-option="${id}"]`)
-      await expect(option).toContainText(name)
-      const sub = option.getByText(subtext, { exact: true })
-      await expect(sub).toBeVisible()
-      const subBounds = await sub.evaluate((node) => {
-        const rect = node.getBoundingClientRect()
-        return { left: rect.left, right: rect.right, clientWidth: node.clientWidth, scrollWidth: node.scrollWidth }
+    const layout = await page.evaluate(async (expectedProviders) => {
+      await new Promise<void>((resolve) => {
+        requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
       })
-      expect(subBounds.left).toBeGreaterThanOrEqual(0)
-      expect(subBounds.right).toBeLessThanOrEqual(pageWidth + 1)
-      expect(subBounds.scrollWidth).toBeLessThanOrEqual(subBounds.clientWidth + 1)
-    }
-    expect(scrollerBounds.left).toBeGreaterThanOrEqual(0)
-    expect(scrollerBounds.right).toBeLessThanOrEqual(pageWidth + 1)
-    if (width === 320) expect(scrollerBounds.scrollWidth).toBeGreaterThan(scrollerBounds.clientWidth)
-  }
+      const documentElement = document.documentElement
+      const providers = Array.from(document.querySelectorAll<HTMLElement>('[data-provider-option]')).map((option) => {
+        const id = option.dataset.providerOption ?? ''
+        const subtext = expectedProviders.find(([expectedId]) => expectedId === id)?.[2] ?? ''
+        const optionRect = option.getBoundingClientRect()
+        const subtextNode = Array.from(option.querySelectorAll<HTMLElement>('*')).find(
+          (node) => node.textContent?.trim() === subtext,
+        )
+        const subtextRect = subtextNode?.getBoundingClientRect()
+        return {
+          id,
+          text: option.textContent ?? '',
+          bounds: { left: optionRect.left, right: optionRect.right, width: optionRect.width },
+          subtext: subtextNode && subtextRect
+            ? {
+                text: subtextNode.textContent?.trim() ?? '',
+                left: subtextRect.left,
+                right: subtextRect.right,
+                clientWidth: subtextNode.clientWidth,
+                scrollWidth: subtextNode.scrollWidth,
+              }
+            : null,
+        }
+      })
+      const scroller = document.querySelector('table')?.parentElement
+      const scrollerRect = scroller?.getBoundingClientRect()
+      return {
+        pageWidth: documentElement.clientWidth,
+        scrollWidth: documentElement.scrollWidth,
+        providers,
+        scroller: scroller && scrollerRect
+          ? {
+              left: scrollerRect.left,
+              right: scrollerRect.right,
+              clientWidth: scroller.clientWidth,
+              scrollWidth: scroller.scrollWidth,
+            }
+          : null,
+      }
+    }, providerSubtexts)
 
-  await expect(page.getByText(longAccount, { exact: true })).toBeVisible()
+    expect(layout.scrollWidth, `${width}px 页面不应横向溢出`).toBeLessThanOrEqual(layout.pageWidth + 1)
+    expect(layout.providers).toHaveLength(3)
+    for (const [id, name, subtext] of providerSubtexts) {
+      const option = layout.providers.find((provider) => provider.id === id)
+      expect(option?.text).toContain(name)
+      expect(option?.bounds).not.toBeNull()
+      expect(option?.bounds?.width).toBeGreaterThan(0)
+      expect(option?.bounds?.left).toBeGreaterThanOrEqual(0)
+      expect(option?.bounds?.right).toBeLessThanOrEqual(layout.pageWidth + 1)
+      expect(option?.subtext?.text).toBe(subtext)
+      expect(option?.subtext?.left).toBeGreaterThanOrEqual(0)
+      expect(option?.subtext?.right).toBeLessThanOrEqual(layout.pageWidth + 1)
+      expect(option?.subtext?.scrollWidth).toBeLessThanOrEqual((option?.subtext?.clientWidth ?? 0) + 1)
+    }
+    expect(layout.scroller).not.toBeNull()
+    expect(layout.scroller?.left).toBeGreaterThanOrEqual(0)
+    expect(layout.scroller?.right).toBeLessThanOrEqual(layout.pageWidth + 1)
+    if (width === 320) expect(layout.scroller?.scrollWidth).toBeGreaterThan(layout.scroller?.clientWidth ?? 0)
+  }
 
   const grok = page.getByRole('button', { name: 'Grok SuperGrok' })
   await grok.focus()
@@ -253,17 +263,26 @@ test('real long CDK result reflows inside the dashboard at every mobile viewport
 
     for (const width of [320, 375, 390, 430, 1440]) {
       await page.setViewportSize({ width, height: 900 })
-      await waitForStableLayout(page)
-      const pageWidth = await page.evaluate(() => document.documentElement.clientWidth)
-      const scrollWidth = await page.evaluate(() => document.documentElement.scrollWidth)
-      expect(scrollWidth, `${width}px 长 CDK 页面不应横向溢出`).toBeLessThanOrEqual(pageWidth + 1)
-      const resultBounds = await result.evaluate((node) => {
+      const layout = await result.evaluate(async (node) => {
+        await new Promise<void>((resolve) => {
+          requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
+        })
         const rect = node.getBoundingClientRect()
-        return { left: rect.left, right: rect.right, clientWidth: node.clientWidth, scrollWidth: node.scrollWidth }
+        return {
+          pageWidth: document.documentElement.clientWidth,
+          scrollWidth: document.documentElement.scrollWidth,
+          result: {
+            left: rect.left,
+            right: rect.right,
+            clientWidth: node.clientWidth,
+            scrollWidth: node.scrollWidth,
+          },
+        }
       })
-      expect(resultBounds.left).toBeGreaterThanOrEqual(0)
-      expect(resultBounds.right).toBeLessThanOrEqual(pageWidth + 1)
-      expect(resultBounds.scrollWidth).toBeLessThanOrEqual(resultBounds.clientWidth + 1)
+      expect(layout.scrollWidth, `${width}px 长 CDK 页面不应横向溢出`).toBeLessThanOrEqual(layout.pageWidth + 1)
+      expect(layout.result.left).toBeGreaterThanOrEqual(0)
+      expect(layout.result.right).toBeLessThanOrEqual(layout.pageWidth + 1)
+      expect(layout.result.scrollWidth).toBeLessThanOrEqual(layout.result.clientWidth + 1)
     }
   } finally {
     withE2eDb((db) => {
