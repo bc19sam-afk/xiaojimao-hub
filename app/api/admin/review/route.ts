@@ -44,22 +44,27 @@ export async function POST(req: NextRequest) {
   const id = typeof b.id === 'string' ? b.id : ''
   if (!id) return NextResponse.json({ error: '缺 id' }, { status: 400 })
   try {
-    const c = db.all().find((x) => x.id === id)
-    if (!c) return NextResponse.json({ error: '记录不存在' }, { status: 400 })
-    // CAS 转态：仅当仍处 needs_review 才转；返 false＝态已变（并发/已处理）→ 不审计、不改
-    const ok = action === 'retry' ? db.retryReview(id) : db.terminateReview(id)
-    if (!ok) return NextResponse.json({ ok: false, error: '状态已变' })
-    // 审计去向与真实转态一致（codex 复审 P1）：terminate→stopped；retry 按 pooled_at 分叉——入过池直接回池
-    // 'pooled'、从没入池回首检 'submitted'。c 在 CAS 前取，pooled_at 于 needs_review 期不可变（只由
-    // transitionToPool 从 submitted/first_check 写），故 c.pooledAt 与 retryReview 内分叉口径一致、安全。
-    const toStatus =
-      action === 'terminate' ? 'stopped' : c.pooledAt != null ? 'pooled' : 'submitted'
-    db.recordAudit(
-      actor,
-      auditContributionReview(action === 'retry' ? 'contribution.retry' : 'contribution.terminate', c, toStatus),
-    )
-    return NextResponse.json({ ok: true, review: reviewQueue() })
-  } catch {
+    const result = db.withTransaction(() => {
+      const c = db.all().find((x) => x.id === id)
+      if (!c) return { state: 'missing' as const }
+      // CAS 转态：仅当仍处 needs_review 才转；返 false＝态已变（并发/已处理）→ 不审计、不改
+      const ok = action === 'retry' ? db.retryReview(id) : db.terminateReview(id)
+      if (!ok) return { state: 'changed' as const }
+      // 审计去向与真实转态一致（codex 复审 P1）：terminate→stopped；retry 按 pooled_at 分叉——入过池直接回池
+      // 'pooled'、从没入池回首检 'submitted'。c 在同一事务内读取，pooled_at 于 needs_review 期不可变。
+      const toStatus =
+        action === 'terminate' ? 'stopped' : c.pooledAt != null ? 'pooled' : 'submitted'
+      db.recordAudit(
+        actor,
+        auditContributionReview(action === 'retry' ? 'contribution.retry' : 'contribution.terminate', c, toStatus),
+      )
+      return { state: 'ok' as const, review: reviewQueue() }
+    })
+    if (result.state === 'missing') return NextResponse.json({ error: '记录不存在' }, { status: 400 })
+    if (result.state === 'changed') return NextResponse.json({ ok: false, error: '状态已变' })
+    return NextResponse.json({ ok: true, review: result.review })
+  } catch (error) {
+    console.error('[admin] review action failed', error instanceof Error ? error.name : 'unknown')
     return NextResponse.json(REVIEW_ACTION_FAILURE, { status: 500 })
   }
 }

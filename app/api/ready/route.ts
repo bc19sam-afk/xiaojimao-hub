@@ -7,9 +7,10 @@ export const dynamic = 'force-dynamic'
 
 export async function GET() {
   const result = await readinessResultAsync(async () => {
-    // 冷启动坏库时，db.ts 的模块求值可能抛错；必须在 handler 内捕获并稳定返回 503。
-    const { db } = await import('@/lib/db')
-    db.assertReady()
+    // 每次请求都走 fresh connection；不能让坏库首次求值的 singleton rejection
+    // 被 ESM cache 固化为永久 503。
+    const { assertReadinessDatabase } = await import('@/lib/readiness-probe')
+    assertReadinessDatabase()
   })
   return NextResponse.json(result.body, { status: result.status })
 }

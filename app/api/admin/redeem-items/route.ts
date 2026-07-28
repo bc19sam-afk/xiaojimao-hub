@@ -51,15 +51,18 @@ export async function DELETE(req: NextRequest) {
   const id = Number(new URL(req.url).searchParams.get('id'))
   if (!id) return NextResponse.json({ error: '缺 id' }, { status: 400 })
   try {
-    const old = db.getRedeemItem(id)
-    db.deleteRedeemItem(id)
-    db.recordAudit(actor, auditRedeemItemDelete(old, id))
-    return NextResponse.json({
-      ok: true,
-      redeemItems: db.listRedeemItems(false),
-      overview: db.adminOverview(),
+    const result = db.withTransaction(() => {
+      const old = db.getRedeemItem(id)
+      db.deleteRedeemItem(id)
+      db.recordAudit(actor, auditRedeemItemDelete(old, id))
+      return {
+        redeemItems: db.listRedeemItems(false),
+        overview: db.adminOverview(),
+      }
     })
-  } catch {
+    return NextResponse.json({ ok: true, ...result })
+  } catch (error) {
+    console.error('[admin] redeem item delete failed', error instanceof Error ? error.name : 'unknown')
     return NextResponse.json(REDEEM_ITEM_DELETE_FAILURE, { status: 500 })
   }
 }

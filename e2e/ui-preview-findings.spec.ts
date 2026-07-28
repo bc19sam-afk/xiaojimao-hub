@@ -488,6 +488,27 @@ test('dangerous admin routes return fixed public JSON when SQLite operations fai
       withE2eDb((db) => db.exec(`ALTER TABLE "${entry.broken}" RENAME TO "${entry.table}"`))
     }
   }
+
+  // Audit failure must not turn a committed delete into a retryable half-success.
+  const brokenAudit = `__e2e_audit_log_${suffix}`
+  const protectedRuleId = withE2eDb((db) =>
+    (db.prepare('SELECT id FROM point_rules ORDER BY id LIMIT 1').get() as { id: number }).id,
+  )
+  withE2eDb((db) => db.exec(`ALTER TABLE audit_log RENAME TO "${brokenAudit}"`))
+  try {
+    const response = await page.request.delete(`/api/admin/point-rules?id=${protectedRuleId}`)
+    expect(response.status()).toBe(500)
+    expect(await response.json()).toEqual({
+      ok: false,
+      code: 'POINT_RULE_DELETE_FAILED',
+      error: '删除发分规则失败，请重试',
+    })
+  } finally {
+    withE2eDb((db) => db.exec(`ALTER TABLE "${brokenAudit}" RENAME TO audit_log`))
+  }
+  expect(withE2eDb((db) => db.prepare('SELECT id FROM point_rules WHERE id=?').get(protectedRuleId))).toEqual({
+    id: protectedRuleId,
+  })
 })
 
 test('successful delete, retry, and terminate use exact targets, persist audit state, and restore stable focus', async ({ page }) => {

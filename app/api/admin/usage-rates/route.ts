@@ -48,11 +48,15 @@ export async function DELETE(req: NextRequest) {
   const id = Number(new URL(req.url).searchParams.get('id'))
   if (!id) return NextResponse.json({ error: '缺 id' }, { status: 400 })
   try {
-    const old = db.listUsageRates().find((r) => r.id === id)
-    db.deleteUsageRate(id)
-    db.recordAudit(actor, auditUsageRateDelete(old, id))
-    return NextResponse.json({ ok: true, usageRates: db.listUsageRates() })
-  } catch {
+    const usageRates = db.withTransaction(() => {
+      const old = db.listUsageRates().find((r) => r.id === id)
+      db.deleteUsageRate(id)
+      db.recordAudit(actor, auditUsageRateDelete(old, id))
+      return db.listUsageRates()
+    })
+    return NextResponse.json({ ok: true, usageRates })
+  } catch (error) {
+    console.error('[admin] usage rate delete failed', error instanceof Error ? error.name : 'unknown')
     return NextResponse.json(USAGE_RATE_DELETE_FAILURE, { status: 500 })
   }
 }

@@ -1228,6 +1228,23 @@ export const db = {
         Date.now(),
       )
   },
+  // 管理写操作把主变更与审计放在同一事务内；审计落库失败时主变更一并回滚，
+  // 客户端收到可安全重试的失败，不会出现“状态已变但没有审计”的半成功。
+  withTransaction<T>(work: () => T): T {
+    conn.exec('BEGIN IMMEDIATE')
+    try {
+      const result = work()
+      conn.exec('COMMIT')
+      return result
+    } catch (error) {
+      try {
+        conn.exec('ROLLBACK')
+      } catch {
+        // 保留原始业务/审计错误；readiness 与 API 层会统一脱敏返回。
+      }
+      throw error
+    }
+  },
   // 审计查看（倒序分页，最新在前）：limit 钳 [1,200]、offset 钳 ≥0 防脏输入。old/new 本就是脱敏摘要，不泄敏感值。
   // 按 id DESC（自增＝插入序＝时间序，比 created_at 更稳、无同毫秒并列歧义）。
   listAudit(limit = 50, offset = 0): AuditRow[] {

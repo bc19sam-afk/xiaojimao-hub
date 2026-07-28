@@ -50,7 +50,7 @@ function createDatabase(dbPath: string, broken = false): void {
   const db = new DatabaseSync(dbPath)
   db.exec('PRAGMA journal_mode = WAL')
   migrate(db)
-  if (broken) db.exec('DROP TABLE redeem_items')
+  if (broken) db.exec('ALTER TABLE redeem_items RENAME TO __xjm_broken_redeem_items')
   db.close()
 }
 
@@ -83,6 +83,27 @@ function spawnProbeServer(dbPath: string): Promise<{
   child.stdout.setEncoding('utf8')
   child.stderr.setEncoding('utf8')
 
+  const hasExited = () => child.exitCode !== null || child.signalCode !== null
+  let cleanupPromise: Promise<void> | undefined
+  const waitForExit = async () => {
+    if (hasExited()) return
+    await Promise.race([
+      once(child, 'exit'),
+      new Promise<void>((resolve) => setTimeout(() => {
+        if (!hasExited()) child.kill('SIGKILL')
+        resolve()
+      }, 1_000)),
+    ])
+  }
+  const cleanup = () => {
+    cleanupPromise ??= (async () => {
+      if (!hasExited()) child.kill('SIGTERM')
+      await waitForExit()
+      fs.rmSync(dir, { recursive: true, force: true })
+    })()
+    return cleanupPromise
+  }
+
   let output = ''
   let errors = ''
   child.stdout.on('data', (chunk) => { output += chunk })
@@ -107,12 +128,11 @@ function spawnProbeServer(dbPath: string): Promise<{
   return ready.then((port) => ({
     child,
     baseUrl: `http://127.0.0.1:${port}`,
-    stop: async () => {
-      if (!child.killed) child.kill('SIGTERM')
-      await once(child, 'exit')
-      fs.rmSync(dir, { recursive: true, force: true })
-    },
-  }))
+    stop: cleanup,
+  })).catch(async (error) => {
+    await cleanup()
+    throw error
+  })
 }
 
 async function wait(ms: number): Promise<void> {
@@ -141,6 +161,16 @@ test('production cold start keeps health live and returns sanitized ready 503 fo
     for (const secret of [dbPath, 'redeem_items', 'SQLITE', 'stack']) {
       assert.equal(JSON.stringify(body).includes(secret), false)
     }
+
+    const repair = new DatabaseSync(dbPath)
+    try {
+      repair.exec('ALTER TABLE __xjm_broken_redeem_items RENAME TO redeem_items')
+    } finally {
+      repair.close()
+    }
+    const recovered = await fetch(`${server.baseUrl}/api/ready`)
+    assert.equal(recovered.status, 200)
+    assert.deepEqual(await recovered.json(), { ok: true })
   } finally {
     await server?.stop()
     fs.rmSync(dir, { recursive: true, force: true })

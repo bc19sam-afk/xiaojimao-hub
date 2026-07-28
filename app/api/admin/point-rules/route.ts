@@ -32,11 +32,15 @@ export async function DELETE(req: NextRequest) {
   const id = Number(new URL(req.url).searchParams.get('id'))
   if (!id) return NextResponse.json({ error: '缺 id' }, { status: 400 })
   try {
-    const old = db.listPointRules().find((r) => r.id === id)
-    db.deletePointRule(id)
-    db.recordAudit(actor, auditPointRuleDelete(old, id))
-    return NextResponse.json({ ok: true, pointRules: db.listPointRules() })
-  } catch {
+    const pointRules = db.withTransaction(() => {
+      const old = db.listPointRules().find((r) => r.id === id)
+      db.deletePointRule(id)
+      db.recordAudit(actor, auditPointRuleDelete(old, id))
+      return db.listPointRules()
+    })
+    return NextResponse.json({ ok: true, pointRules })
+  } catch (error) {
+    console.error('[admin] point rule delete failed', error instanceof Error ? error.name : 'unknown')
     return NextResponse.json(POINT_RULE_DELETE_FAILURE, { status: 500 })
   }
 }
