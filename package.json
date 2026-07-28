@@ -8,7 +8,8 @@
     "start": "next start",
     "migrate": "node scripts/migrate.ts",
     "backup": "node scripts/backup.ts",
-    "test": "node --import ./test/setup.mjs --test test/*.test.ts"
+    "test": "node --import ./test/setup.mjs --test test/*.test.ts",
+    "test:ui": "playwright test"
   },
   "dependencies": {
     "@phosphor-icons/react": "^2.1.10",
@@ -20,6 +21,7 @@
     "three": "^0.185.1"
   },
   "devDependencies": {
+    "@playwright/test": "^1.62.0",
     "@types/node": "^22.10.5",
     "@types/react": "^19.0.7",
     "@types/react-dom": "^19.0.3",

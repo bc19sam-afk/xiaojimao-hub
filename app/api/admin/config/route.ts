@@ -8,5 +8,6 @@ export async function GET() {
   return NextResponse.json({
     pointRules: db.listPointRules(),
     redeemItems: db.listRedeemItems(false),
+    overview: db.adminOverview(),
   })
 }

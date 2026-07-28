@@ -1,6 +1,12 @@
 'use client'
 
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
+import ConfirmDialog, { type ConfirmDialogRequest } from './ConfirmDialog'
+import {
+  loadingServiceProbe,
+  probeSystemStatus,
+  type ServiceProbeResult,
+} from '@/lib/service-status'
 
 interface PointRule {
   id: number
@@ -92,6 +98,15 @@ interface ReviewRow {
   createdAt: number
   updatedAt: number
 }
+interface AdminOverview {
+  pooledAccounts: number
+  needsReview: number
+  pendingRedemptions: number
+  enabledRedeemItems: number
+}
+interface PendingConfirmation extends ConfirmDialogRequest {
+  run: () => Promise<void>
+}
 
 const KINDS = [
   { v: 'timed_quota', t: '限时额度' },
@@ -124,12 +139,21 @@ export default function AdminPanel() {
   const [settlements, setSettlements] = useState<SettlementRow[]>([])
   const [redemptions, setRedemptions] = useState<RedemptionRow[]>([])
   const [review, setReview] = useState<ReviewRow[]>([])
+  const [overview, setOverview] = useState<AdminOverview | null>(null)
+  const [systemStatus, setSystemStatus] = useState<{
+    liveness: ServiceProbeResult
+    readiness: ServiceProbeResult
+  }>({ liveness: loadingServiceProbe(), readiness: loadingServiceProbe() })
+  const [refreshingStatus, setRefreshingStatus] = useState(false)
+  const [confirmation, setConfirmation] = useState<PendingConfirmation | null>(null)
+  const statusRefreshInFlight = useRef(false)
   const [msg, setMsg] = useState('')
 
   const load = useCallback(async () => {
     const d = await fetch('/api/admin/config', { cache: 'no-store' }).then((r) => r.json())
     setRules(d.pointRules ?? [])
     setItems(d.redeemItems ?? [])
+    if (d.overview) setOverview(d.overview)
   }, [])
   const loadRates = useCallback(async () => {
     const d = await fetch('/api/admin/usage-rates', { cache: 'no-store' }).then((r) => r.json())
@@ -175,6 +199,18 @@ export default function AdminPanel() {
     const d = await fetch('/api/admin/review', { cache: 'no-store' }).then((r) => r.json())
     if (d.ok) setReview(d.review ?? [])
   }, [])
+  const refreshSystemStatus = useCallback(async () => {
+    if (statusRefreshInFlight.current) return
+    statusRefreshInFlight.current = true
+    setRefreshingStatus(true)
+    setSystemStatus({ liveness: loadingServiceProbe(), readiness: loadingServiceProbe() })
+    try {
+      setSystemStatus(await probeSystemStatus())
+    } finally {
+      statusRefreshInFlight.current = false
+      setRefreshingStatus(false)
+    }
+  }, [])
   useEffect(() => {
     load()
     loadRates()
@@ -187,9 +223,10 @@ export default function AdminPanel() {
     loadSettlements()
     loadRedemptions()
     loadReview()
+    refreshSystemStatus()
   }, [
     load, loadRates, loadQuota, loadGate, loadSettle, loadPool, loadAudit,
-    loadContributions, loadSettlements, loadRedemptions, loadReview,
+    loadContributions, loadSettlements, loadRedemptions, loadReview, refreshSystemStatus,
   ])
 
   const flash = (t: string) => {
@@ -291,9 +328,12 @@ export default function AdminPanel() {
     } else flash(d.error || '失败')
   }
   async function delRule(id: number) {
-    const d = await fetch('/api/admin/point-rules?id=' + id, { method: 'DELETE' }).then((r) => r.json())
+    const res = await fetch('/api/admin/point-rules?id=' + id, { method: 'DELETE' })
+    const d = await res.json().catch(() => ({}))
+    if (!res.ok || !d.ok || !Array.isArray(d.pointRules)) throw new Error(d.error || '删除发分规则失败，请重试')
     setRules(d.pointRules)
     flash('已删除')
+    loadAudit()
   }
   async function saveRate(r: Partial<UsageRate>) {
     const res = await fetch('/api/admin/usage-rates', {
@@ -309,9 +349,12 @@ export default function AdminPanel() {
     } else flash(d.error || '失败')
   }
   async function delRate(id: number) {
-    const d = await fetch('/api/admin/usage-rates?id=' + id, { method: 'DELETE' }).then((r) => r.json())
+    const res = await fetch('/api/admin/usage-rates?id=' + id, { method: 'DELETE' })
+    const d = await res.json().catch(() => ({}))
+    if (!res.ok || !d.ok || !Array.isArray(d.usageRates)) throw new Error(d.error || '删除折算规则失败，请重试')
     setRates(d.usageRates)
     flash('已删除')
+    loadAudit()
   }
   async function saveItem(it: Partial<RedeemItem>) {
     const res = await fetch('/api/admin/redeem-items', {
@@ -326,9 +369,13 @@ export default function AdminPanel() {
     } else flash(d.error || '失败')
   }
   async function delItem(id: number) {
-    const d = await fetch('/api/admin/redeem-items?id=' + id, { method: 'DELETE' }).then((r) => r.json())
+    const res = await fetch('/api/admin/redeem-items?id=' + id, { method: 'DELETE' })
+    const d = await res.json().catch(() => ({}))
+    if (!res.ok || !d.ok || !Array.isArray(d.redeemItems)) throw new Error(d.error || '删除兑换项失败，请重试')
     setItems(d.redeemItems)
     flash('已删除')
+    loadAudit()
+    load()
   }
 
   // 人工复核处理（P4-R3，§7.4）：重试（按是否入过池分叉：未入过→回首检 / 入过→直接回池）/ 终止（→ 停用）。
@@ -346,8 +393,57 @@ export default function AdminPanel() {
       flash(action === 'retry' ? '已重试' : '已终止')
       loadAudit()
       loadContributions()
-    } else flash(d.error || '失败')
+      load()
+    } else throw new Error(d.error || '人工复核操作失败，请重试')
   }
+
+  function confirmRuleDelete(rule: PointRule) {
+    setConfirmation({
+      title: '确认删除发分规则',
+      target: `${rule.provider} / ${rule.plan}`,
+      consequence: '删除后该规则立即停止发分；如需恢复，必须重新创建并保存。',
+      confirmLabel: '确认删除',
+      run: () => delRule(rule.id),
+    })
+  }
+
+  function confirmRateDelete(rate: UsageRate) {
+    setConfirmation({
+      title: '确认删除折算规则',
+      target: `${rate.provider} / ${rate.plan}`,
+      consequence: '删除后该套餐将不再按此单价结算；如无兜底规则，后续用量可能不再发分。',
+      confirmLabel: '确认删除',
+      run: () => delRate(rate.id),
+    })
+  }
+
+  function confirmItemDelete(item: RedeemItem) {
+    setConfirmation({
+      title: '确认删除兑换项',
+      target: item.name,
+      consequence: '该商品会从商店配置中删除；历史兑换记录仍保留，但此操作不能在当前页面撤销。',
+      confirmLabel: '确认删除',
+      run: () => delItem(item.id),
+    })
+  }
+
+  function confirmReviewAction(row: ReviewRow, action: 'retry' | 'terminate') {
+    const retry = action === 'retry'
+    setConfirmation({
+      title: retry ? '确认重试人工复核' : '确认终止人工复核',
+      target: `${row.provider} / ${row.accountId}`,
+      consequence: retry
+        ? '该账号会按既有状态机重新进入首检或直接回池；已有结算与唯一键语义不变。'
+        : '该账号会被标记为已停用并退出待复核队列；历史记录与已有结算会保留。',
+      confirmLabel: retry ? '确认重试' : '确认终止',
+      run: () => doReview(row.id, action),
+    })
+  }
+
+  const lastCheckedAt = Math.max(
+    systemStatus.liveness.checkedAt ?? 0,
+    systemStatus.readiness.checkedAt ?? 0,
+  )
 
   return (
     <main className="min-h-[100dvh] bg-neutral-950 px-4 py-8 text-neutral-200">
@@ -355,7 +451,7 @@ export default function AdminPanel() {
         <header className="mb-6 flex items-center justify-between">
           <h1 className="text-xl font-bold text-white">管理后台</h1>
           <div className="flex items-center gap-3">
-            {msg && <span className="text-xs text-emerald-400">{msg}</span>}
+            {msg && <span role="status" aria-live="polite" className="text-xs text-emerald-400">{msg}</span>}
             <a href="/dashboard" className="text-sm text-neutral-400 hover:text-white">
               前台
             </a>
@@ -368,6 +464,61 @@ export default function AdminPanel() {
           </div>
         </header>
 
+        <section aria-labelledby="admin-overview-title" className="mb-8 rounded-2xl border border-white/10 bg-white/[0.03] p-5">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <h2 id="admin-overview-title" className="font-bold text-white">运营概览</h2>
+              <p className="mt-1 text-xs text-neutral-500">真实数据库总数与当前服务探针；Liveness 和 Readiness 分别检查。</p>
+            </div>
+            <button
+              type="button"
+              data-testid="refresh-system-status"
+              onClick={refreshSystemStatus}
+              disabled={refreshingStatus}
+              className="rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 text-xs font-medium text-neutral-200 transition hover:bg-white/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {refreshingStatus ? '检查中…' : '刷新系统状态'}
+            </button>
+          </div>
+
+          <dl className="mt-4 grid grid-cols-2 overflow-hidden rounded-xl border border-white/10 bg-black/15 sm:grid-cols-4">
+            {[
+              ['在池账号', overview?.pooledAccounts],
+              ['待人工复核', overview?.needsReview],
+              ['待处理兑换', overview?.pendingRedemptions],
+              ['已启用商品', overview?.enabledRedeemItems],
+            ].map(([label, value], index) => (
+              <div
+                key={String(label)}
+                className={`px-3 py-3 ${index % 2 === 1 ? 'border-l border-white/10' : ''} ${index >= 2 ? 'border-t border-white/10 sm:border-t-0' : ''} ${index > 0 ? 'sm:border-l sm:border-white/10' : ''}`}
+              >
+                <dt className="text-[11px] text-neutral-500">{label}</dt>
+                <dd className="mono mt-1 text-xl font-bold text-white">{value ?? '—'}</dd>
+              </div>
+            ))}
+          </dl>
+
+          <div className="mt-4 grid gap-3 sm:grid-cols-2">
+            <ServiceStatusCard
+              testId="liveness-status"
+              title="Liveness"
+              subtitle="进程存活 / 可响应"
+              result={systemStatus.liveness}
+            />
+            <ServiceStatusCard
+              testId="readiness-status"
+              title="Readiness"
+              subtitle="依赖就绪 / 可接流量"
+              result={systemStatus.readiness}
+            />
+          </div>
+          <p className="mt-3 text-right text-[11px] text-neutral-600">
+            {lastCheckedAt > 0
+              ? `最近检查：${new Date(lastCheckedAt).toLocaleTimeString('zh-CN', { hour12: false })}`
+              : '最近检查：尚未完成'}
+          </p>
+        </section>
+
         {/* 发分规则 */}
         <section className="mb-8 rounded-2xl border border-white/10 bg-white/[0.02] p-5">
           <h2 className="mb-1 font-bold text-white">发分规则</h2>
@@ -379,7 +530,7 @@ export default function AdminPanel() {
               <span>provider</span><span>plan</span><span>积分</span><span>标签</span><span>启用</span><span></span>
             </div>
             {rules.map((r) => (
-              <RuleRow key={r.id} rule={r} onSave={saveRule} onDelete={() => delRule(r.id)} />
+              <RuleRow key={r.id} rule={r} onSave={saveRule} onDelete={() => confirmRuleDelete(r)} />
             ))}
             <RuleRow onSave={saveRule} isNew />
           </div>
@@ -397,7 +548,7 @@ export default function AdminPanel() {
               <span>provider</span><span>plan</span><span>单价</span><span>标签</span><span>启用</span><span></span>
             </div>
             {rates.map((r) => (
-              <RateRow key={r.id} rate={r} onSave={saveRate} onDelete={() => delRate(r.id)} />
+              <RateRow key={r.id} rate={r} onSave={saveRate} onDelete={() => confirmRateDelete(r)} />
             ))}
             <RateRow onSave={saveRate} isNew />
           </div>
@@ -412,7 +563,7 @@ export default function AdminPanel() {
               <span>名称</span><span>积分价</span><span>类型</span><span>说明</span><span>启用</span><span></span>
             </div>
             {items.map((it) => (
-              <ItemRow key={it.id} item={it} onSave={saveItem} onDelete={() => delItem(it.id)} />
+              <ItemRow key={it.id} item={it} onSave={saveItem} onDelete={() => confirmItemDelete(it)} />
             ))}
             <ItemRow onSave={saveItem} isNew />
           </div>
@@ -612,13 +763,17 @@ export default function AdminPanel() {
                 <span className="break-all text-neutral-400">{r.accountId}</span>
                 <div className="flex gap-1">
                   <button
-                    onClick={() => doReview(r.id, 'retry')}
+                    type="button"
+                    onClick={() => confirmReviewAction(r, 'retry')}
+                    aria-label={`重试人工复核 ${r.provider} ${r.accountId}`}
                     className="rounded-lg bg-[var(--brand)]/20 px-2.5 py-1 text-xs font-medium text-[var(--brand-bright)] hover:bg-[var(--brand)]/30"
                   >
                     重试
                   </button>
                   <button
-                    onClick={() => doReview(r.id, 'terminate')}
+                    type="button"
+                    onClick={() => confirmReviewAction(r, 'terminate')}
+                    aria-label={`终止人工复核 ${r.provider} ${r.accountId}`}
                     className="rounded-lg bg-rose-500/10 px-2.5 py-1 text-xs text-rose-300 hover:bg-rose-500/20"
                   >
                     终止
@@ -731,7 +886,51 @@ export default function AdminPanel() {
           </div>
         </section>
       </div>
+      {confirmation && (
+        <ConfirmDialog
+          request={confirmation}
+          onClose={() => setConfirmation(null)}
+          onConfirm={confirmation.run}
+        />
+      )}
     </main>
+  )
+}
+
+function ServiceStatusCard({
+  testId,
+  title,
+  subtitle,
+  result,
+}: {
+  testId: string
+  title: string
+  subtitle: string
+  result: ServiceProbeResult
+}) {
+  const presentation =
+    result.state === 'available'
+      ? { symbol: '✓', label: '可用', cls: 'border-emerald-400/25 bg-emerald-500/10 text-emerald-200' }
+      : result.state === 'unavailable'
+        ? { symbol: '!', label: '不可用', cls: 'border-rose-400/25 bg-rose-500/10 text-rose-200' }
+        : result.state === 'unknown'
+          ? { symbol: '?', label: '未知', cls: 'border-amber-300/25 bg-amber-400/10 text-amber-100' }
+          : { symbol: '…', label: '检查中', cls: 'border-white/15 bg-white/5 text-neutral-300' }
+
+  return (
+    <div data-testid={testId} role="status" aria-live="polite" aria-atomic="true" className="rounded-xl border border-white/10 bg-black/15 p-3">
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <h3 className="mono text-xs font-bold uppercase tracking-wide text-white">{title}</h3>
+          <p className="mt-0.5 text-[11px] text-neutral-500">{subtitle}</p>
+        </div>
+        <span className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-xs font-semibold ${presentation.cls}`}>
+          <span aria-hidden="true" className="font-black">{presentation.symbol}</span>
+          {presentation.label}
+        </span>
+      </div>
+      <p className="mt-2 text-xs text-neutral-400">{result.summary}</p>
+    </div>
   )
 }
 
@@ -859,13 +1058,19 @@ function RuleRow({
       <input type="checkbox" checked={enabled} onChange={(e) => setEnabled(e.target.checked)} className="h-4 w-4 accent-emerald-500" />
       <div className="flex gap-1">
         <button
+          type="button"
           onClick={() => onSave({ provider, plan, points, label, enabled: enabled ? 1 : 0 })}
           className="rounded-lg bg-[var(--brand)]/20 px-2.5 py-1.5 text-xs font-medium text-[var(--brand-bright)] hover:bg-[var(--brand)]/30"
         >
           {isNew ? '新增' : '保存'}
         </button>
         {onDelete && (
-          <button onClick={onDelete} className="rounded-lg bg-rose-500/10 px-2.5 py-1.5 text-xs text-rose-300 hover:bg-rose-500/20">
+          <button
+            type="button"
+            onClick={onDelete}
+            aria-label={`删除发分规则 ${provider} ${plan}`}
+            className="rounded-lg bg-rose-500/10 px-2.5 py-1.5 text-xs text-rose-300 hover:bg-rose-500/20"
+          >
             删
           </button>
         )}
@@ -903,13 +1108,19 @@ function RateRow({
       <input type="checkbox" checked={enabled} onChange={(e) => setEnabled(e.target.checked)} className="h-4 w-4 accent-emerald-500" />
       <div className="flex gap-1">
         <button
+          type="button"
           onClick={() => onSave({ provider, plan, pointsPerCall, label, enabled: enabled ? 1 : 0 })}
           className="rounded-lg bg-[var(--brand)]/20 px-2.5 py-1.5 text-xs font-medium text-[var(--brand-bright)] hover:bg-[var(--brand)]/30"
         >
           {isNew ? '新增' : '保存'}
         </button>
         {onDelete && (
-          <button onClick={onDelete} className="rounded-lg bg-rose-500/10 px-2.5 py-1.5 text-xs text-rose-300 hover:bg-rose-500/20">
+          <button
+            type="button"
+            onClick={onDelete}
+            aria-label={`删除折算规则 ${provider} ${plan}`}
+            className="rounded-lg bg-rose-500/10 px-2.5 py-1.5 text-xs text-rose-300 hover:bg-rose-500/20"
+          >
             删
           </button>
         )}
@@ -968,6 +1179,7 @@ function ItemRow({
       <input type="checkbox" checked={enabled} onChange={(e) => setEnabled(e.target.checked)} className="h-4 w-4 accent-emerald-500" />
       <div className="flex gap-1">
         <button
+          type="button"
           onClick={() =>
             onSave({ id: item?.id, name, cost, kind, fulfillment, perUserLimit, description, sort: item?.sort ?? 0, enabled: enabled ? 1 : 0 })
           }
@@ -976,7 +1188,12 @@ function ItemRow({
           {isNew ? '新增' : '保存'}
         </button>
         {onDelete && (
-          <button onClick={onDelete} className="rounded-lg bg-rose-500/10 px-2.5 py-1.5 text-xs text-rose-300 hover:bg-rose-500/20">
+          <button
+            type="button"
+            onClick={onDelete}
+            aria-label={`删除兑换项 ${name}`}
+            className="rounded-lg bg-rose-500/10 px-2.5 py-1.5 text-xs text-rose-300 hover:bg-rose-500/20"
+          >
             删
           </button>
         )}

@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { CoinsIcon, GiftIcon } from '@phosphor-icons/react'
+import { redemptionStatusView } from '@/lib/redemption-status'
 
 interface Item {
   id: number
@@ -16,7 +17,7 @@ interface Redemption {
   id: string
   itemName: string
   cost: number
-  status: string
+  status?: string
   result: string
   createdAt: number
 }
@@ -157,26 +158,49 @@ export default function RedeemStore({ refreshKey, onRedeemed }: { refreshKey: nu
       {redemptions.length > 0 && (
         <div className="mt-4 border-t border-white/10 pt-3">
           <div className="mb-2 text-[11px] text-neutral-500">兑换记录</div>
-          <ul className="space-y-1.5">
+          <ul className="space-y-2">
             {redemptions.slice(0, 5).map((r) => {
+              const status = redemptionStatusView(r.status)
               // 码类结果（CDK / 占位邀请码）为可打印 ASCII → 显示可复制码（§5.3「响应丢失可在兑换记录找回」）；
               // 中文占位串（「已发放（占位…）」）不当码显示。
-              const isCode = !!r.result && /^[\x21-\x7e]+$/.test(r.result)
+              const isCode = status.key === 'fulfilled' && !!r.result && /^[\x21-\x7e]+$/.test(r.result)
+              const statusClass =
+                status.key === 'fulfilled'
+                  ? 'border-emerald-400/25 bg-emerald-500/10 text-emerald-200'
+                  : status.key === 'failed'
+                    ? 'border-rose-400/25 bg-rose-500/10 text-rose-200'
+                    : status.key === 'pending'
+                      ? 'border-amber-300/25 bg-amber-400/10 text-amber-200'
+                      : 'border-white/15 bg-white/5 text-neutral-300'
               return (
-                <li key={r.id} className="flex items-center justify-between gap-2 text-xs">
-                  <span className="text-neutral-300">{r.itemName}</span>
-                  <span className="mono flex items-center gap-2 text-neutral-500">
-                    −{r.cost}
+                <li key={r.id} className="rounded-xl border border-white/10 bg-white/[0.02] px-3 py-2.5 text-xs">
+                  <div className="flex flex-wrap items-start justify-between gap-2">
+                    <span className="min-w-0 break-words text-neutral-200">{r.itemName}</span>
+                    <span
+                      aria-label={`兑换状态：${status.label}`}
+                      className={`inline-flex shrink-0 items-center gap-1 rounded-full border px-2 py-0.5 font-medium ${statusClass}`}
+                    >
+                      <span aria-hidden="true" className="font-black">{status.symbol}</span>
+                      {status.label}
+                    </span>
+                  </div>
+                  <div className="mt-2 flex flex-wrap items-center justify-between gap-2 text-neutral-500">
+                    <span className="mono">−{r.cost} 积分</span>
                     {isCode && (
                       <button
+                        type="button"
                         onClick={() => copyCode(r.result)}
+                        aria-label={`复制兑换码 ${r.result}`}
                         title="点击复制"
-                        className="max-w-[10rem] truncate rounded bg-[var(--brand)]/15 px-1.5 py-0.5 text-[var(--brand-bright)] hover:bg-[var(--brand)]/25"
+                        className="mono max-w-full break-all rounded bg-[var(--brand)]/15 px-2 py-1 text-left text-[var(--brand-bright)] hover:bg-[var(--brand)]/25 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400"
                       >
                         {r.result}
                       </button>
                     )}
-                  </span>
+                  </div>
+                  {status.key !== 'fulfilled' && (
+                    <p className="mt-1.5 text-[11px] text-neutral-500">{status.description}</p>
+                  )}
                 </li>
               )
             })}

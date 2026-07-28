@@ -1307,6 +1307,28 @@ export const db = {
       .all(lim, off) as unknown as AdminRedemptionRow[]
   },
 
+  // 后台顶部概览使用数据库真实总数；不能拿「最新 50 条」页面数组长度冒充全局统计。
+  adminOverview(): AdminOverview {
+    const row = conn
+      .prepare(
+        `SELECT
+           (SELECT COUNT(*) FROM contributions WHERE verify_status='pooled') AS pooledAccounts,
+           (SELECT COUNT(*) FROM contributions WHERE verify_status='needs_review') AS needsReview,
+           (SELECT COUNT(*) FROM redemptions WHERE status='pending') AS pendingRedemptions,
+           (SELECT COUNT(*) FROM redeem_items WHERE enabled=1) AS enabledRedeemItems`,
+      )
+      .get() as unknown as AdminOverview
+    return { ...row }
+  },
+
+  // Readiness：轻量验证连接可查询且运行中的 schema 仍满足当前代码要求。
+  // 只抛异常给 /api/ready 转成脱敏 503，不把路径、SQL 或内部错误透给 UI。
+  assertReady(): void {
+    const ping = conn.prepare('SELECT 1 AS ok').get() as unknown as { ok: number }
+    if (ping?.ok !== 1) throw new Error('database ping failed')
+    assertSchemaCurrent(conn)
+  },
+
   // ===== 人工复核处理（P4-R3，§7.4）=====
   // needs_review 号（拿不到稳定 account_id 的残缺号 / 首检 OAuth 失效 reauth）现无任何自动出口＝死胡同。
   // 两动作都只走 transition CAS 改 verify_status，**完全不碰 daily_settlements / point_ledger**，故天然满足
@@ -1391,6 +1413,12 @@ export interface AdminRedemptionRow {
   cost: number
   status: string
   createdAt: number
+}
+export interface AdminOverview {
+  pooledAccounts: number
+  needsReview: number
+  pendingRedemptions: number
+  enabledRedeemItems: number
 }
 
 export interface PointRule {
