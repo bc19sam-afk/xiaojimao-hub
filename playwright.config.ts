@@ -3,12 +3,20 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
-const runtimeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'xjm-ui-r1-e2e-'))
-const dbPath = path.join(runtimeDir, 'app.db')
+// Playwright 会在 runner 与 worker 进程分别加载 config。首次加载创建隔离目录并通过环境变量
+// 传给 worker；worker 复用同一路径但不注册清理，避免失败后重启 worker 时误删正在使用的 DB。
+const inheritedDbPath = process.env.XJM_UI_E2E_DB_PATH
+const runtimeDir = inheritedDbPath
+  ? path.dirname(inheritedDbPath)
+  : fs.mkdtempSync(path.join(os.tmpdir(), 'xjm-ui-r1-e2e-'))
+const dbPath = inheritedDbPath ?? path.join(runtimeDir, 'app.db')
 
-process.once('exit', () => {
-  fs.rmSync(runtimeDir, { recursive: true, force: true })
-})
+if (!inheritedDbPath) {
+  process.env.XJM_UI_E2E_DB_PATH = dbPath
+  process.once('exit', () => {
+    fs.rmSync(runtimeDir, { recursive: true, force: true })
+  })
+}
 
 export default defineConfig({
   testDir: './e2e',
@@ -18,6 +26,7 @@ export default defineConfig({
   expect: { timeout: 5_000 },
   reporter: 'line',
   outputDir: path.join(runtimeDir, 'artifacts'),
+  projects: [{ name: 'chromium', use: { browserName: 'chromium' } }],
   use: {
     baseURL: 'http://127.0.0.1:3211',
     trace: 'retain-on-failure',
@@ -25,7 +34,7 @@ export default defineConfig({
     video: 'off',
   },
   webServer: {
-    command: 'npm run dev -- -p 3211',
+    command: 'npm run dev -- -H 127.0.0.1 -p 3211',
     url: 'http://127.0.0.1:3211/login',
     reuseExistingServer: false,
     timeout: 120_000,

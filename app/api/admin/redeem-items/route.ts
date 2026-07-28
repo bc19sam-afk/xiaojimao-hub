@@ -31,7 +31,11 @@ export async function PUT(req: NextRequest) {
   const old = id ? db.getRedeemItem(id) : undefined
   db.upsertRedeemItem(next)
   db.recordAudit(actor, auditRedeemItemUpsert(old, next))
-  return NextResponse.json({ ok: true, redeemItems: db.listRedeemItems(false) })
+  return NextResponse.json({
+    ok: true,
+    redeemItems: db.listRedeemItems(false),
+    overview: db.adminOverview(),
+  })
 }
 
 // 删除兑换项
@@ -43,5 +47,9 @@ export async function DELETE(req: NextRequest) {
   const old = db.getRedeemItem(id)
   db.deleteRedeemItem(id)
   db.recordAudit(actor, auditRedeemItemDelete(old, id))
-  return NextResponse.json({ ok: true, redeemItems: db.listRedeemItems(false) })
+  return NextResponse.json({
+    ok: true,
+    redeemItems: db.listRedeemItems(false),
+    overview: db.adminOverview(),
+  })
 }

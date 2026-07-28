@@ -12,18 +12,27 @@ export function loadingServiceProbe(): ServiceProbeResult {
   return { state: 'loading', summary: '正在检查', checkedAt: null }
 }
 
-function safeSummary(body: unknown): string {
-  if (!body || typeof body !== 'object') return ''
-  const summary = (body as { summary?: unknown }).summary
-  if (typeof summary !== 'string') return ''
-  return summary.replace(/\s+/g, ' ').trim().slice(0, 80)
+function publicUnavailableSummary(
+  endpoint: '/api/health' | '/api/ready',
+  body: unknown,
+): string {
+  const code = body && typeof body === 'object' ? (body as { code?: unknown }).code : undefined
+  if (endpoint === '/api/ready' && code === 'DATABASE_NOT_READY') return '数据库尚未就绪'
+  if (endpoint === '/api/health' && code === 'PROCESS_NOT_LIVE') return '进程探针报告不可用'
+  return endpoint === '/api/health' ? '进程状态检查不可用' : '数据库就绪检查不可用'
 }
 
-async function readJson(response: Response): Promise<unknown> {
+function isAbortError(error: unknown): boolean {
+  return !!error && typeof error === 'object' && (error as { name?: unknown }).name === 'AbortError'
+}
+
+async function readJson(response: Response): Promise<{ ok: true; body: unknown } | { ok: false }> {
   try {
-    return await response.json()
-  } catch {
-    return undefined
+    return { ok: true, body: await response.json() }
+  } catch (error) {
+    if (isAbortError(error)) throw error
+    if (error instanceof SyntaxError) return { ok: false }
+    throw error
   }
 }
 
@@ -38,13 +47,25 @@ export async function probeServiceEndpoint(
 
   try {
     const response = await fetcher(endpoint, { cache: 'no-store', signal: controller.signal })
+    const parsed = await readJson(response)
     const checkedAt = now()
-    const body = await readJson(response)
+
+    if (!parsed.ok) {
+      if (!response.ok) {
+        return {
+          state: 'unavailable',
+          summary: publicUnavailableSummary(endpoint, undefined),
+          checkedAt,
+        }
+      }
+      return { state: 'unknown', summary: '检查响应格式异常', checkedAt }
+    }
+    const body = parsed.body
 
     if (!response.ok) {
       return {
         state: 'unavailable',
-        summary: safeSummary(body) || `检查返回 HTTP ${response.status}`,
+        summary: publicUnavailableSummary(endpoint, body),
         checkedAt,
       }
     }
@@ -59,13 +80,13 @@ export async function probeServiceEndpoint(
 
     return {
       state: 'unavailable',
-      summary: safeSummary(body) || '服务报告不可用',
+      summary: publicUnavailableSummary(endpoint, body),
       checkedAt,
     }
-  } catch {
+  } catch (error) {
     return {
       state: 'unknown',
-      summary: controller.signal.aborted ? '检查超时' : '无法完成检查',
+      summary: controller.signal.aborted || isAbortError(error) ? '检查超时' : '无法完成检查',
       checkedAt: now(),
     }
   } finally {

@@ -91,7 +91,7 @@ export default function RedeemStore({ refreshKey, onRedeemed }: { refreshKey: nu
   }
 
   return (
-    <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-6">
+    <div className="min-w-0 rounded-2xl border border-white/10 bg-white/[0.03] p-6">
       <div className="mb-4 flex items-center justify-between">
         <h3 className="flex items-center gap-2 font-bold text-white">
           <GiftIcon size={18} weight="fill" className="text-[var(--brand-bright)]" />

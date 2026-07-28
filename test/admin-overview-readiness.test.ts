@@ -45,17 +45,28 @@ function contribution(id: string, verifyStatus: Contribution['verifyStatus']): C
 }
 
 test('后台概览使用数据库真实总数，不从最新 50 条页面数组猜测', () => {
-  db.insertUnique(contribution('pooled', 'pooled'))
+  for (let i = 0; i < 55; i++) {
+    db.insertUnique(contribution(`pooled-${i}`, 'pooled'))
+    db.createRedemption({
+      id: `pending-${i}`,
+      linuxdoId: 1,
+      itemId: 1,
+      itemName: `待处理-${i}`,
+      cost: 1,
+      status: 'pending',
+    })
+  }
   db.insertUnique(contribution('review', 'needs_review'))
-  db.createRedemption({ id: 'pending', linuxdoId: 1, itemId: 1, itemName: '待处理', cost: 1, status: 'pending' })
   db.createRedemption({ id: 'fulfilled', linuxdoId: 1, itemId: 1, itemName: '已完成', cost: 1, status: 'fulfilled' })
 
   assert.deepEqual(db.adminOverview(), {
-    pooledAccounts: 1,
+    pooledAccounts: 55,
     needsReview: 1,
-    pendingRedemptions: 1,
+    pendingRedemptions: 55,
     enabledRedeemItems: db.listRedeemItems(true).length,
   })
+  assert.equal(db.listContributionsAdmin(50).length, 50)
+  assert.equal(db.listRedemptionsAdmin(50).length, 50)
   assert.doesNotThrow(() => db.assertReady())
 })
 
@@ -64,7 +75,10 @@ test('readiness 只在依赖探活成功时返回 200，异常返回脱敏 503',
   const failed = readinessResult(() => {
     throw new Error('sqlite path=/private/secret.db token=secret')
   })
-  assert.deepEqual(failed, { status: 503, body: { ok: false, summary: '数据库尚未就绪' } })
+  assert.deepEqual(failed, {
+    status: 503,
+    body: { ok: false, code: 'DATABASE_NOT_READY', summary: '数据库尚未就绪' },
+  })
   assert.equal(JSON.stringify(failed).includes('private'), false)
   assert.equal(JSON.stringify(failed).includes('secret'), false)
 })

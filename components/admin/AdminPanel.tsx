@@ -106,6 +106,7 @@ interface AdminOverview {
 }
 interface PendingConfirmation extends ConfirmDialogRequest {
   run: () => Promise<void>
+  fallbackFocus: () => HTMLElement | null
 }
 
 const KINDS = [
@@ -147,6 +148,10 @@ export default function AdminPanel() {
   const [refreshingStatus, setRefreshingStatus] = useState(false)
   const [confirmation, setConfirmation] = useState<PendingConfirmation | null>(null)
   const statusRefreshInFlight = useRef(false)
+  const ruleHeadingRef = useRef<HTMLHeadingElement>(null)
+  const rateHeadingRef = useRef<HTMLHeadingElement>(null)
+  const itemHeadingRef = useRef<HTMLHeadingElement>(null)
+  const reviewHeadingRef = useRef<HTMLHeadingElement>(null)
   const [msg, setMsg] = useState('')
 
   const load = useCallback(async () => {
@@ -365,6 +370,7 @@ export default function AdminPanel() {
     const d = await res.json()
     if (res.ok) {
       setItems(d.redeemItems)
+      if (d.overview) setOverview(d.overview)
       flash('已保存')
     } else flash(d.error || '失败')
   }
@@ -404,6 +410,7 @@ export default function AdminPanel() {
       consequence: '删除后该规则立即停止发分；如需恢复，必须重新创建并保存。',
       confirmLabel: '确认删除',
       run: () => delRule(rule.id),
+      fallbackFocus: () => ruleHeadingRef.current,
     })
   }
 
@@ -414,6 +421,7 @@ export default function AdminPanel() {
       consequence: '删除后该套餐将不再按此单价结算；如无兜底规则，后续用量可能不再发分。',
       confirmLabel: '确认删除',
       run: () => delRate(rate.id),
+      fallbackFocus: () => rateHeadingRef.current,
     })
   }
 
@@ -424,6 +432,7 @@ export default function AdminPanel() {
       consequence: '该商品会从商店配置中删除；历史兑换记录仍保留，但此操作不能在当前页面撤销。',
       confirmLabel: '确认删除',
       run: () => delItem(item.id),
+      fallbackFocus: () => itemHeadingRef.current,
     })
   }
 
@@ -437,6 +446,7 @@ export default function AdminPanel() {
         : '该账号会被标记为已停用并退出待复核队列；历史记录与已有结算会保留。',
       confirmLabel: retry ? '确认重试' : '确认终止',
       run: () => doReview(row.id, action),
+      fallbackFocus: () => reviewHeadingRef.current,
     })
   }
 
@@ -508,7 +518,7 @@ export default function AdminPanel() {
             <ServiceStatusCard
               testId="readiness-status"
               title="Readiness"
-              subtitle="依赖就绪 / 可接流量"
+              subtitle="本地 SQLite / Schema / 写入"
               result={systemStatus.readiness}
             />
           </div>
@@ -521,7 +531,7 @@ export default function AdminPanel() {
 
         {/* 发分规则 */}
         <section className="mb-8 rounded-2xl border border-white/10 bg-white/[0.02] p-5">
-          <h2 className="mb-1 font-bold text-white">发分规则</h2>
+          <h2 ref={ruleHeadingRef} tabIndex={-1} className="mb-1 font-bold text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400">发分规则</h2>
           <p className="mb-4 text-xs text-neutral-500">
             账号验证通过后，按 (provider, 套餐) 发放积分。plan 填 <code>*</code> 作为该 provider 的兜底。改完点保存即时生效。
           </p>
@@ -538,7 +548,7 @@ export default function AdminPanel() {
 
         {/* 折算规则（按次单价，P4-R2 §3.4）：按 (provider, 套餐) 每次调用积分单价，可小数。plan 填 * 作兜底 */}
         <section className="mb-8 rounded-2xl border border-white/10 bg-white/[0.02] p-5">
-          <h2 className="mb-1 font-bold text-white">折算规则（按次单价）</h2>
+          <h2 ref={rateHeadingRef} tabIndex={-1} className="mb-1 font-bold text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400">折算规则（按次单价）</h2>
           <p className="mb-4 text-xs text-neutral-500">
             号在池后，按 cpamp 每日调用量折算积分：结算 = round(次数 × 单价)。单价可小数（如 <code>0.5</code>）。plan 填{' '}
             <code>*</code> 作该 provider 的兜底。改完点保存即时生效。改 <code>provider</code>/<code>plan</code> 需先删旧行再新增。
@@ -556,7 +566,7 @@ export default function AdminPanel() {
 
         {/* 兑换项 */}
         <section className="rounded-2xl border border-white/10 bg-white/[0.02] p-5">
-          <h2 className="mb-1 font-bold text-white">兑换项（商店）</h2>
+          <h2 ref={itemHeadingRef} tabIndex={-1} className="mb-1 font-bold text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400">兑换项（商店）</h2>
           <p className="mb-4 text-xs text-neutral-500">用户用积分兑换。履约接口后续接小鸡毛，现为占位。</p>
           <div className="space-y-2">
             <div className="grid grid-cols-[1.3fr_100px_1fr_1.4fr_auto_auto] gap-2 text-[11px] text-neutral-500">
@@ -734,7 +744,7 @@ export default function AdminPanel() {
         {/* 待人工复核（P4-R3，§7.4）：needs_review 号的人工出口。重试→转回首检队列；终止→停用（不删行、不碰结算表） */}
         <section className="mt-8 rounded-2xl border border-white/10 bg-white/[0.02] p-5">
           <div className="mb-1 flex items-center justify-between">
-            <h2 className="font-bold text-white">待人工复核</h2>
+            <h2 ref={reviewHeadingRef} tabIndex={-1} className="font-bold text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400">待人工复核</h2>
             <button
               onClick={loadReview}
               className="rounded-lg border border-white/10 bg-white/5 px-2.5 py-1 text-xs hover:bg-white/10"
@@ -891,6 +901,7 @@ export default function AdminPanel() {
           request={confirmation}
           onClose={() => setConfirmation(null)}
           onConfirm={confirmation.run}
+          fallbackFocus={confirmation.fallbackFocus}
         />
       )}
     </main>

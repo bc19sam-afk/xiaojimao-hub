@@ -3,6 +3,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { assertSchemaCurrent, migrate } from './migrate'
 import { env } from './env'
+import { assertDatabaseReady } from './readiness'
 
 // ============================================================================
 // SQLite 数据层（Node 26 内置 node:sqlite，免原生依赖）
@@ -1321,12 +1322,10 @@ export const db = {
     return { ...row }
   },
 
-  // Readiness：轻量验证连接可查询且运行中的 schema 仍满足当前代码要求。
+  // Readiness：验证连接、canonical schema/唯一约束与主库写锁；仅代表本地 SQLite 可供当前代码读写。
   // 只抛异常给 /api/ready 转成脱敏 503，不把路径、SQL 或内部错误透给 UI。
   assertReady(): void {
-    const ping = conn.prepare('SELECT 1 AS ok').get() as unknown as { ok: number }
-    if (ping?.ok !== 1) throw new Error('database ping failed')
-    assertSchemaCurrent(conn)
+    assertDatabaseReady(conn)
   },
 
   // ===== 人工复核处理（P4-R3，§7.4）=====

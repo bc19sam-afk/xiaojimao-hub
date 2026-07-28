@@ -13,10 +13,12 @@ export default function ConfirmDialog({
   request,
   onClose,
   onConfirm,
+  fallbackFocus,
 }: {
   request: ConfirmDialogRequest
   onClose: () => void
   onConfirm: () => Promise<void>
+  fallbackFocus?: () => HTMLElement | null
 }) {
   const dialogRef = useRef<HTMLDialogElement>(null)
   const cancelRef = useRef<HTMLButtonElement>(null)
@@ -35,9 +37,11 @@ export default function ConfirmDialog({
 
     return () => {
       if (dialog?.open) dialog.close()
-      returnFocusRef.current?.focus()
+      const origin = returnFocusRef.current
+      const target = origin?.isConnected ? origin : fallbackFocus?.()
+      if (target?.isConnected) target.focus()
     }
-  }, [])
+  }, [fallbackFocus])
 
   async function confirm() {
     if (inFlightRef.current) return

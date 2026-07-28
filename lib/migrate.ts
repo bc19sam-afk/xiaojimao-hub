@@ -606,3 +606,140 @@ export function migrate(db: DatabaseSync): number {
   }
   return version
 }
+
+interface SchemaColumnSignature {
+  name: string
+  type: string
+  notnull: number
+  defaultValue: string | null
+  pk: number
+}
+
+interface TableSchemaSignature {
+  columns: Map<string, SchemaColumnSignature>
+  indexes: string[]
+}
+
+type CanonicalSchemaManifest = Map<string, TableSchemaSignature>
+
+let canonicalSchemaManifest: CanonicalSchemaManifest | undefined
+
+function quotedIdentifier(value: string): string {
+  return `"${value.replaceAll('"', '""')}"`
+}
+
+function normalizedColumn(row: {
+  name: string
+  type: string
+  notnull: number
+  dflt_value: string | null
+  pk: number
+}): SchemaColumnSignature {
+  return {
+    name: row.name,
+    type: row.type.trim().replace(/\s+/g, ' ').toUpperCase(),
+    notnull: Number(row.notnull),
+    defaultValue: row.dflt_value == null ? null : String(row.dflt_value).trim().replace(/\s+/g, ' '),
+    pk: Number(row.pk),
+  }
+}
+
+function schemaManifest(db: DatabaseSync): CanonicalSchemaManifest {
+  const tables = db
+    .prepare(
+      `SELECT name FROM sqlite_schema
+       WHERE type='table' AND name NOT LIKE 'sqlite_%'
+       ORDER BY name`,
+    )
+    .all() as unknown as { name: string }[]
+  const manifest: CanonicalSchemaManifest = new Map()
+  for (const { name } of tables) {
+    const columns = db
+      .prepare(`PRAGMA table_info(${quotedIdentifier(name)})`)
+      .all() as unknown as {
+        name: string
+        type: string
+        notnull: number
+        dflt_value: string | null
+        pk: number
+      }[]
+    const indexes = db
+      .prepare(`PRAGMA index_list(${quotedIdentifier(name)})`)
+      .all() as unknown as {
+        name: string
+        unique: number
+        origin: string
+        partial: number
+      }[]
+    const indexSignatures = indexes.map((index) => {
+      const keyColumns = (
+        db.prepare(`PRAGMA index_xinfo(${quotedIdentifier(index.name)})`).all() as unknown as {
+          seqno: number
+          name: string | null
+          desc: number
+          coll: string | null
+          key: number
+        }[]
+      )
+        .filter((column) => column.key === 1)
+        .sort((a, b) => a.seqno - b.seqno)
+        .map((column) => ({
+          name: column.name,
+          desc: Number(column.desc),
+          coll: column.coll ?? null,
+        }))
+      return JSON.stringify({
+        unique: Number(index.unique),
+        origin: index.origin,
+        partial: Number(index.partial),
+        keyColumns,
+      })
+    }).sort()
+    manifest.set(name, {
+      columns: new Map(columns.map((row) => [row.name, normalizedColumn(row)])),
+      indexes: indexSignatures,
+    })
+  }
+  return manifest
+}
+
+function expectedSchemaManifest(): CanonicalSchemaManifest {
+  if (canonicalSchemaManifest) return canonicalSchemaManifest
+  const canonical = new DatabaseSync(':memory:')
+  try {
+    migrate(canonical)
+    canonicalSchemaManifest = schemaManifest(canonical)
+    return canonicalSchemaManifest
+  } finally {
+    canonical.close()
+  }
+}
+
+// Readiness 的 schema 形状校验直接从 migrations 在内存库生成最新版 manifest，避免维护第二份
+// 易漂移的表/列清单。目标库可以有向后兼容的额外表/列，但每个 canonical 表及其列签名必须存在。
+export function assertSchemaMatchesMigrations(db: DatabaseSync): void {
+  const expected = expectedSchemaManifest()
+  const actual = schemaManifest(db)
+  for (const [tableName, expectedTable] of expected) {
+    const actualTable = actual.get(tableName)
+    if (!actualTable) throw new Error(`[db] schema 缺少必需表 ${tableName}`)
+    for (const [columnName, expectedColumn] of expectedTable.columns) {
+      const actualColumn = actualTable.columns.get(columnName)
+      if (!actualColumn) throw new Error(`[db] schema ${tableName} 缺少必需列 ${columnName}`)
+      if (
+        actualColumn.type !== expectedColumn.type ||
+        actualColumn.notnull !== expectedColumn.notnull ||
+        actualColumn.defaultValue !== expectedColumn.defaultValue ||
+        actualColumn.pk !== expectedColumn.pk
+      ) {
+        throw new Error(`[db] schema ${tableName}.${columnName} 列签名与迁移定义不一致`)
+      }
+    }
+    const remainingIndexes = [...actualTable.indexes]
+    for (const expectedIndex of expectedTable.indexes) {
+      const index = remainingIndexes.indexOf(expectedIndex)
+      if (index === -1) throw new Error(`[db] schema ${tableName} 缺少迁移定义的索引或唯一约束`)
+      remainingIndexes.splice(index, 1)
+    }
+  }
+}

@@ -59,8 +59,8 @@ export default function Contributions({
   }
 
   return (
-    <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-6">
-      <div className="mb-4 flex items-center justify-between">
+    <div className="min-w-0 rounded-2xl border border-white/10 bg-white/[0.03] p-4 sm:p-6">
+      <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
         <h3 className="font-bold text-white">我的贡献记录</h3>
         <div className="flex gap-2">
           <button
@@ -114,14 +114,14 @@ export default function Contributions({
           </div>
         </div>
       ) : (
-        <div className="max-h-[420px] overflow-y-auto rounded-xl border border-white/5">
-          <table className="w-full text-sm">
+        <div className="max-h-[420px] max-w-full overflow-x-auto overflow-y-auto rounded-xl border border-white/5">
+          <table className="w-full min-w-[34rem] table-fixed text-sm">
             <thead className="sticky top-0 z-10">
               <tr className="border-b border-white/10 bg-[var(--ink-soft)] text-left text-xs text-neutral-500">
-                <th className="px-4 py-2.5 font-medium">账号</th>
-                <th className="px-4 py-2.5 font-medium">类型</th>
-                <th className="px-4 py-2.5 font-medium">状态</th>
-                <th className="px-4 py-2.5 font-medium">累计积分</th>
+                <th className="w-[44%] px-4 py-2.5 font-medium">账号</th>
+                <th className="w-[14%] px-4 py-2.5 font-medium">类型</th>
+                <th className="w-[22%] px-4 py-2.5 font-medium">状态</th>
+                <th className="w-[20%] px-4 py-2.5 font-medium">累计积分</th>
               </tr>
             </thead>
             <tbody>
@@ -131,8 +131,8 @@ export default function Contributions({
                 return (
                   <tr key={c.id} className="border-b border-white/5 last:border-0">
                     <td className="px-4 py-3">
-                      <div className="mono text-xs text-neutral-300">{c.email || c.accountId}</div>
-                      <div className="mono mt-0.5 text-[10px] uppercase text-neutral-600">
+                      <div className="mono break-all text-xs text-neutral-300">{c.email || c.accountId}</div>
+                      <div className="mono mt-0.5 break-all text-[10px] uppercase text-neutral-600">
                         {c.provider} · {c.plan}
                       </div>
                     </td>

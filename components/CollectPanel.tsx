@@ -134,7 +134,7 @@ export default function CollectPanel({ onDone }: { onDone: () => void }) {
   }
 
   return (
-    <div className="rounded-2xl border border-[var(--brand)]/25 bg-white/[0.03] p-4 shadow-[0_0_50px_-18px_rgba(16,163,127,0.45)] sm:p-6">
+    <div className="min-w-0 rounded-2xl border border-[var(--brand)]/25 bg-white/[0.03] p-4 shadow-[0_0_50px_-18px_rgba(16,163,127,0.45)] sm:p-6">
       <div className="mb-1 flex items-center gap-2">
         <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-400/15 px-2.5 py-1 text-xs font-semibold text-emerald-300">
           <GiftIcon size={14} weight="fill" /> 验证通过按类型发积分
