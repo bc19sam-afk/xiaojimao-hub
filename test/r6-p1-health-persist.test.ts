@@ -162,3 +162,102 @@ test('R6-P1①：空池 early return 也清零失败标志（防永久钉住）'
   assert.ok(!r2.inspectFailed, '🔴 空池后 throttled tick 也须传播清零 → 心跳可发（不被历史故障钉住）')
   assert.equal(worker.healthIsHealthy(r2), true)
 })
+
+// ============================================================================
+// R7-P2④（codex R6 指出）：任何抛错的巡检轮次都要跨节流窗记为失败
+//
+// 问题：lastHealthAt 在 try 开头就推进，而 db.byVerifyStatus / db.transition 等**非 CPA** 操作
+// 抛错时 inspectFailed 还是 false → finally 把这个 false 存进 lastInspectFailed → worker 只压掉
+// 当前这一次心跳（异常本身会让 tick 的 catch 判不健康），之后 5 分钟节流窗内**全部报健康**，
+// 即使故障还在。等于 R6-P1① 修的那个假绿换了个入口又回来了。
+//
+// 选型说明：总指挥倾向 (b)「只在扫描成功后才推进 lastHealthAt」，本轮选 (a)「抛错的轮次记为失败」。
+// 理由：(b) 会让**故障期间彻底失去节流**——每个 8s tick 都重新真跑、每轮都打 CPA/DB，正是
+// HEALTH_INTERVAL_MS 当初要防的持续满负荷（PR #18 的 codex xhigh 意见）；DB 抛错时还会变成
+// 每 8s 一次的重试风暴。(a) 保住节流语义，且健康信号同样在整个故障窗持续为真，两个目标都达成。
+// ============================================================================
+
+test('R7-P2④：DB 操作抛错的轮次 → 跨节流窗都判不健康', async () => {
+  collect.__resetHealthThrottle()
+  for (const c of db.byVerifyStatus(['pooled'])) db.transition(c.id, ['pooled'], 'stopped')
+  db.insertUnique(
+    makeContribution({ id: 'r7p2d-1', provider: 'grok', accountId: 'r7p2d-acc', plan: 'super', linuxdoId: 9105 }),
+  )
+
+  const base = Date.now()
+  // 让 byVerifyStatus 抛错（模拟库损坏/锁超时/磁盘故障）
+  const orig = db.byVerifyStatus
+  ;(db as unknown as { byVerifyStatus: unknown }).byVerifyStatus = () => {
+    throw new Error('db down')
+  }
+  let threw = false
+  try {
+    await collect.checkPooledHealth(base, { force: true })
+  } catch {
+    threw = true
+  } finally {
+    ;(db as unknown as { byVerifyStatus: unknown }).byVerifyStatus = orig
+  }
+  assert.equal(threw, true, '前置：DB 抛错应向上抛（tick 的 catch 会判不健康）')
+
+  // 🔴 核心：故障后节流窗内的 tick 必须仍判不健康。修复前 lastInspectFailed 被存成 false → 全报健康。
+  const r2 = await withCpa({ files: [authFile('grok', 'r7p2d-acc')] }, () =>
+    collect.checkPooledHealth(base + 30_000),
+  )
+  assert.equal(r2.skipped, true, '节流窗内应 skip')
+  assert.equal(
+    r2.inspectFailed,
+    true,
+    '🔴 R7-P2④ 核心：抛错的轮次要记为失败，否则窗内后续 ~36 个 tick 全报健康（假绿）',
+  )
+  assert.equal(worker.healthIsHealthy(r2), false, '🔴 消费侧判不健康 → 心跳持续抑制')
+
+  // 下一窗真跑成功 → 清零
+  const r3 = await withCpa({ files: [authFile('grok', 'r7p2d-acc')] }, () =>
+    collect.checkPooledHealth(base + 6 * 60_000),
+  )
+  assert.ok(!r3.skipped, '超窗后重新真跑')
+  assert.ok(!r3.inspectFailed, '真跑成功 → 清零')
+  assert.equal(worker.healthIsHealthy(r3), true, '恢复后判健康')
+})
+
+test('R7-P2④：抛错后节流仍然生效（不退化成每 tick 重跑）', async () => {
+  collect.__resetHealthThrottle()
+  for (const c of db.byVerifyStatus(['pooled'])) db.transition(c.id, ['pooled'], 'stopped')
+  db.insertUnique(
+    makeContribution({ id: 'r7p2d-2', provider: 'grok', accountId: 'r7p2d-acc2', plan: 'super', linuxdoId: 9106 }),
+  )
+
+  const base = Date.now()
+  const orig = db.byVerifyStatus
+  ;(db as unknown as { byVerifyStatus: unknown }).byVerifyStatus = () => {
+    throw new Error('db down')
+  }
+  try {
+    await collect.checkPooledHealth(base, { force: true }).catch(() => {})
+  } finally {
+    ;(db as unknown as { byVerifyStatus: unknown }).byVerifyStatus = orig
+  }
+
+  // 选型 (a) 的直接后果、也是选它的理由：lastHealthAt 已推进 ⇒ 窗内不再真打 CPA。
+  // 若改用 (b)（抛错就不推进时间戳），下面这次会真跑 → 故障期每 8s 一次重试风暴。
+  let inspectCalls = 0
+  const oi = cpa.inspect
+  const ol = cpa.listAuthFiles
+  cpa.inspect = async () => {
+    inspectCalls++
+    return []
+  }
+  cpa.listAuthFiles = async () => {
+    inspectCalls++
+    return []
+  }
+  try {
+    const r = await collect.checkPooledHealth(base + 30_000)
+    assert.equal(r.skipped, true, '🔴 抛错后窗内仍须节流（保住 HEALTH_INTERVAL_MS 的初衷）')
+  } finally {
+    cpa.inspect = oi
+    cpa.listAuthFiles = ol
+  }
+  assert.equal(inspectCalls, 0, '🔴 节流窗内不得再打 CPA（否则故障期变成每 8s 一次满负荷）')
+})

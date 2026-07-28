@@ -73,37 +73,39 @@ export function backupDb(dbPath: string, backupDir: string, keep: number, now: D
   //    rename 同目录内是原子的（不跨设备），故不存在「改到一半的文件名」。
   //    临时名以 `.tmp-` 打头：既不匹配 BACKUP_RE（不进轮转集），也不匹配 backupLocalDay 的文件名
   //    模式（不被当成「今天备过了」）——残缺产物再也影响不了任何判据。
-  //    ⚠️ 遗留清理：VACUUM 抛错（磁盘满等）由下面 catch 删掉临时文件，发布阶段抛错（拿不到锁等）
-  //    由 withPublishLock 外层的 catch 删（见下）；只有**硬杀**（SIGKILL/断电）会留下一个
+  //    ⚠️ 遗留清理：tmp 落盘后的**任何**失败路径都由下面那一个 catch 统一删掉（见不变量 B）；
+  //    只有**硬杀**（SIGKILL/断电）会留下一个
   //    .tmp-backup-*.db。它无害（不进任何判据），手动删即可。故意不自动清扫同目录的
   //    .tmp-*：手动 `scripts/backup.ts` 与 worker 的每日备份是两个进程，扫一遍会误删对方正在写的那份。
   const tmp = path.resolve(backupDir, `.tmp-backup-${ts}-${rand}.db`)
 
-  const src = new DatabaseSync(dbPath)
-  try {
-    src.exec('PRAGMA busy_timeout = 5000')
-    try {
-      src.prepare('VACUUM INTO ?').run(tmp)
-    } catch (err) {
-      fs.rmSync(tmp, { force: true }) // 失败时 VACUUM INTO 可能留下残缺目标文件
-      throw err
-    }
-  } finally {
-    src.close()
-  }
-  fs.chmodSync(tmp, 0o600) // 先收权限再改名：发布出去的那一刻权限已经是 0600，没有 0644 的窗口
-
-  // 🔴 R6-P2④（codex R5 终审）：发布锁失败时清理临时文件。
+  // 🔴 不变量 B（P6-R2 R7-P2⑤，codex R6 指出）：`tmp` 一旦落盘，**此后任何**失败路径都必须清掉它。
   //
-  //    VACUUM 成功 → tmp 已落盘 0600；接下来 withPublishLock 拿锁超时或 rename 失败（磁盘满等）
-  //    会抛错。修复前这里没 catch，tmp 留在目录里**占着磁盘空间**却不会被任何判据识别（不匹配
-  //    BACKUP_RE，轮转集看不见；不进 latestBackupDay）→ 只能手动清。
-  //    故发布锁失败路径也做 force:true 清理（同 VACUUM catch 一致）：操作已中止、产物不可用、留着无益。
-  //    ⚠️ 硬杀（SIGKILL/断电）仍会留 tmp——内核不给进程善终机会，无法从 JS 层清理。它是无害残留。
-  // 🔴 发布 + 轮转必须在同一把跨进程锁内（见上面 withPublishLock）：rename 与「按 mtime 留 keep-1」
-  //    之间若被另一个进程插进来发布，两边的 readdir 都看不到对方那份，就会各自把对方删掉。
-  //    锁内先 rename 再 readdir，保证「读到的目录内容」与「自己已发布」是同一个瞬间的视图。
+  //    历次复审是一条条堵的：R6-必修2 堵了 VACUUM 抛错，R6-P2④ 堵了发布锁/rename 抛错，而
+  //    `fs.chmodSync` 这一行仍在两者**之间**裸奔——备份卷拒绝 chmod（CIFS/FUSE 挂载、属主或 ACL
+  //    变了）时它先抛，两个 catch 都接不到，留下一个完整的 .tmp-backup-*.db。它不匹配 BACKUP_RE
+  //    也不进 latestBackupDay ⇒ 「今天没备过」恒成立 ⇒ worker 每个 tick 重试、每次再留一个，
+  //    直到把磁盘堆满（备份卷满 → 连锁到升级期备份也做不了）。
+  //
+  //    故不再按「点位」加 catch，改成**一个** try 包住 tmp 之后的全部步骤（VACUUM / chmod /
+  //    发布锁 / rename / 轮转），单一清理出口。将来在这中间插新步骤也自动被覆盖，不会再漏。
+  //    ⚠️ rename 成功之后才抛错（轮转阶段）时，tmp 已不存在，`force: true` 的 rmSync 是空操作
+  //       ——不会误删刚发布的 target。
+  //    ⚠️ 硬杀（SIGKILL/断电）仍会留 tmp：内核不给进程善终机会，JS 层无法清理。它是无害残留
+  //       （不进任何判据），由运维手动删；故意不自动清扫同目录 .tmp-*（见上面注释：会误删并发进程的）。
   try {
+    const src = new DatabaseSync(dbPath)
+    try {
+      src.exec('PRAGMA busy_timeout = 5000')
+      src.prepare('VACUUM INTO ?').run(tmp)
+    } finally {
+      src.close()
+    }
+    fs.chmodSync(tmp, 0o600) // 先收权限再改名：发布出去的那一刻权限已经是 0600，没有 0644 的窗口
+
+    // 🔴 发布 + 轮转必须在同一把跨进程锁内（见上面 withPublishLock）：rename 与「按 mtime 留 keep-1」
+    //    之间若被另一个进程插进来发布，两边的 readdir 都看不到对方那份，就会各自把对方删掉。
+    //    锁内先 rename 再 readdir，保证「读到的目录内容」与「自己已发布」是同一个瞬间的视图。
     withPublishLock(backupDir, () => {
       fs.renameSync(tmp, target)
 
@@ -118,7 +120,7 @@ export function backupDb(dbPath: string, backupDir: string, keep: number, now: D
       for (const old of others.slice(keep - 1)) fs.rmSync(old.p, { force: true })
     })
   } catch (err) {
-    fs.rmSync(tmp, { force: true }) // 发布失败，临时文件不再需要
+    fs.rmSync(tmp, { force: true }) // 任何失败：产物不可用且不被任何判据识别，留着只会堆磁盘
     throw err
   }
 

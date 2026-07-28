@@ -469,3 +469,81 @@ test('R6-P2④：发布锁被别人持有到超时 → 抛错且不留 .tmp- 残
     holder.close()
   }
 })
+
+// ============================================================================
+// R7-P2⑤（codex R6 指出）：chmod 失败也必须清临时文件（不变量 B 的第三个出口）
+//
+// 备份卷拒绝 chmod（CIFS/FUSE 挂载、属主/ACL 变化）时，`fs.chmodSync(tmp, 0o600)` 在
+// VACUUM 的 catch **之后**、发布锁的 catch **之前**抛出——修复前这两个 catch 都接不到它，
+// 留下一份完整大小（≈全库）的 .tmp-backup-*.db。它不匹配 BACKUP_RE、不进 latestBackupDay ⇒
+// 「今天没备过」恒成立 ⇒ worker 每 tick 重试、每次再留一个 → 堆满磁盘。
+//
+// 修复：把 tmp 落盘后的所有步骤收进**一个** try，单一清理出口（不再按点位加 catch）。
+//
+// 注入方式：桩掉 fs.chmodSync 只对 .tmp-backup-* 抛 EPERM——真实模拟「文件系统拒绝改权限」，
+// 不依赖构造特殊挂载点（本机造不出 CIFS）。VACUUM 此时已成功、tmp 已落盘，正是要钉的那个窗口。
+// ============================================================================
+test('R7-P2⑤：chmod 失败 → 抛错且不留 .tmp- 残留（不变量 B）', async () => {
+  const { latestBackupDay } = await import('../lib/backup.ts')
+  const dir = fs.mkdtempSync(path.join(tmpDir, 'p2e-chmod-'))
+  const { src, dbPath } = makeWalDb(dir, 20)
+  src.close()
+  const backupsDir = path.join(dir, 'backups')
+  const good = backupDb(dbPath, backupsDir, 3, new Date('2026-07-26T09:00:00'))
+
+  const orig = fs.chmodSync
+  let hit = 0
+  ;(fs as { chmodSync: typeof fs.chmodSync }).chmodSync = ((p: string, m: number) => {
+    if (typeof p === 'string' && path.basename(p).startsWith('.tmp-backup-')) {
+      hit++
+      const e = new Error("EPERM: operation not permitted, chmod '" + p + "'") as Error & { code: string }
+      e.code = 'EPERM'
+      throw e
+    }
+    return orig(p, m)
+  }) as typeof fs.chmodSync
+  try {
+    assert.throws(
+      () => backupDb(dbPath, backupsDir, 3, new Date('2026-07-27T09:00:00')),
+      /EPERM/,
+      '🔴 chmod 失败必须抛错（不能发布一个权限未收紧的备份）',
+    )
+  } finally {
+    ;(fs as { chmodSync: typeof fs.chmodSync }).chmodSync = orig
+  }
+  assert.equal(hit, 1, '前置：桩必须真的拦到了对 .tmp-backup-* 的 chmod')
+  assert.deepEqual(tmpLeftovers(backupsDir), [], '🔴 chmod 失败后不得留下 .tmp-backup-* 临时文件')
+  assert.ok(fs.existsSync(good), '🔴 已有备份不得被破坏')
+  assert.equal(latestBackupDay(backupsDir), '2026-07-26', '失败的这次不得被任何判据当成「已备份」')
+})
+
+// 反向：连续多次 chmod 失败也不堆积（本条是「堆满磁盘」那个后果的直接证明）
+test('R7-P2⑤ 反向：连续 5 次 chmod 失败后备份目录零 .tmp- 堆积', () => {
+  const dir = fs.mkdtempSync(path.join(tmpDir, 'p2e-pileup-'))
+  const { src, dbPath } = makeWalDb(dir, 20)
+  src.close()
+  const backupsDir = path.join(dir, 'backups')
+  backupDb(dbPath, backupsDir, 3, new Date('2026-07-26T09:00:00'))
+
+  const orig = fs.chmodSync
+  ;(fs as { chmodSync: typeof fs.chmodSync }).chmodSync = ((p: string, m: number) => {
+    if (typeof p === 'string' && path.basename(p).startsWith('.tmp-backup-')) {
+      const e = new Error('EPERM: operation not permitted') as Error & { code: string }
+      e.code = 'EPERM'
+      throw e
+    }
+    return orig(p, m)
+  }) as typeof fs.chmodSync
+  try {
+    for (let i = 0; i < 5; i++) {
+      assert.throws(() => backupDb(dbPath, backupsDir, 3, new Date(`2026-07-27T09:0${i}:00`)))
+    }
+  } finally {
+    ;(fs as { chmodSync: typeof fs.chmodSync }).chmodSync = orig
+  }
+  assert.deepEqual(
+    tmpLeftovers(backupsDir),
+    [],
+    '🔴 反复失败不得堆积临时文件（修复前每次留一个 ≈ 全库大小 → 磁盘满）',
+  )
+})

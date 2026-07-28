@@ -300,6 +300,14 @@ export async function processPending(): Promise<{
         probes = null
         inspectFailed = true // 仅置健康信号；跳过语义原样不动（见返回类型上的说明）
       }
+      // 🔴 R7-P2③（codex R6 指出）的收口点**不在这里**，在 lib/cpa.ts 的 realClient.inspect()：
+      //    那里原先有两条「不抛的失败路径」（run.id 缺失 / 30 轮轮询后结果仍未就绪）都 `return []`。
+      //    收口按不变量做——「inspect() 只在**巡检确实跑完且零结果**时返回 []，其余一律抛」——
+      //    于是上面这个 catch 自动接住，本函数一个字都不用改。
+      //    ⚠️ 绝不能在这里按 `probes.length === 0` 判故障：那会把「跑完了、本来就没结果」
+      //       （号刚落、cpamp 侧还没登记）也误报成 CPA 故障 → 心跳恒不发。已有两条测试钉住这一点
+      //       （inspection-mapping「inspect 正常（哪怕本轮一个号都没通过）」、health-dashboard
+      //       「R4-P2③ 反向」）。空数组在本层是**三义**的，只有 cpa.ts 那层还分得清。
       if (probes !== null) {
         const byKey = new Map(probes.map((r) => [probeKey(r.provider, r.accountId), r]))
         for (const c of codexPending) {
@@ -408,6 +416,9 @@ export async function checkPooledHealth(
         probes = null // 不可观测：本轮跳过所有 codex，绝不误判死
         inspectFailed = true // 仅置健康信号；跳过语义原样不动
       }
+      // 🔴 R7-P2③ 的收口点在 lib/cpa.ts 的 realClient.inspect()（理由同 processPending 那处注释）：
+      //    「巡检没跑成」改为抛错、由上面的 catch 接住；「跑完了但零结果」仍返回 [] 且**不算故障**。
+      //    在本层按 `probes.length === 0` 判故障是错的——分不清这两者，会把正常空结果误报成 CPA 挂了。
       if (probes !== null) {
         const byKey = new Map(probes.map((r) => [probeKey(r.provider, r.accountId), r]))
         for (const c of codexPooled) {
@@ -464,6 +475,24 @@ export async function checkPooledHealth(
     }
 
     return { checked: pooled.length, stopped, inspectFailed }
+  } catch (e) {
+    // 🔴 R7-P2④（codex R6 指出）：**任何抛错的轮次都算「没能完成有效巡检」**（不变量 A）。
+    //
+    //    上面 try 里除了两个 CPA 调用（各自已 catch），还有 db.byVerifyStatus / db.transition ——
+    //    库损坏、磁盘满、SQLITE_BUSY 等都会从这里抛出。修复前没有这个 catch：
+    //      · lastHealthAt 在 try 开头就推进了 → 后续 5 分钟节流窗全部 early return；
+    //      · inspectFailed 还是 false → finally 把 **false** 存进 lastInspectFailed；
+    //    结果 worker 只压掉当前这一次心跳（异常冒泡到 tick 的 catch），之后整个节流窗都报健康
+    //    ——故障还在，dead-man 却恢复沉默。
+    //
+    //    为什么选 (a)「抛错记为失败」而不是总指挥倾向的 (b)「只在扫描成功后才推进 lastHealthAt」：
+    //    (b) 会让**持续**故障（库损坏这类不会自愈的）每个 tick（8s）都重跑整段巡检 ——
+    //    含两次全量 CPA 调用（codex inspect 轮询可达 30s）。节流的存在本就是为了防这个（PR #18）。
+    //    崩溃循环下更糟：这正是项目一路在防的 churn。(a) 保留节流、同时让健康信号在整个窗内
+    //    持续为真，dead-man 该报的警一条不少，代价只是「故障恢复后最多晚 5 分钟才恢复心跳」——
+    //    而外部监视周期本就是 5 分钟量级，无实质差异。故取 (a)。
+    inspectFailed = true
+    throw e // 原样上抛：tick 的 catch 记日志 + healthy=false，抛错语义分毫不改
   } finally {
     // 🔴 R6-P1①：本轮真跑完成 → 更新持久化的失败标志（成功清零/失败保持），供后续 throttled tick 传播。
     //    放 finally 而非 return 前：`pooled.length === 0` 那条 early return 也要清零，否则「故障期间
