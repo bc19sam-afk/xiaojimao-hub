@@ -8,7 +8,8 @@
     "start": "next start",
     "migrate": "node scripts/migrate.ts",
     "backup": "node scripts/backup.ts",
-    "test": "node --import ./test/setup.mjs --test test/*.test.ts"
+    "test": "node --import ./test/setup.mjs --test test/*.test.ts",
+    "test:restore-real": "node --import ./test/setup.mjs --test test/restore-validator.real.ts && node --import ./test/setup.mjs --test test/restore-hidepid.real.ts"
   },
   "dependencies": {
     "@phosphor-icons/react": "^2.1.10",

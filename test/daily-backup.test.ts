@@ -6,6 +6,8 @@ import os from 'node:os'
 import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { backupDb, dailyBackupIfDue, latestBackupDay, parseBackupKeep } from '../lib/backup.ts'
+import { backupManifestPath } from '../lib/backup-manifest.ts'
+import { writeBackupManifestFixture } from './backup-manifest-fixture.ts'
 
 // ============================================================================
 // P6-R2 ②：每日自动备份（lib/backup.ts）
@@ -49,7 +51,12 @@ function fakeBackupAtLocal(dir: string, localIso: string, tag: string): string {
   const u = at.toISOString().replace(/\.\d+Z$/, '').replace(/:/g, '-')
   const name = `backup-${u}-${tag}.db`
   fs.mkdirSync(dir, { recursive: true })
-  fs.writeFileSync(path.join(dir, name), 'stub')
+  const snapshot = path.join(dir, name)
+  const d = new DatabaseSync(snapshot)
+  d.exec('CREATE TABLE t (id INTEGER PRIMARY KEY)')
+  d.close()
+  fs.chmodSync(snapshot, 0o600)
+  writeBackupManifestFixture(snapshot)
   return name
 }
 
@@ -100,6 +107,15 @@ test('latestBackupDay：目录不存在 / 空目录 → null', () => {
   assert.equal(latestBackupDay(path.join(tmpDir, 'nope')), null)
   const empty = fs.mkdtempSync(path.join(tmpDir, 'empty-'))
   assert.equal(latestBackupDay(empty), null)
+})
+
+test('latestBackupDay：legacy 裸 .db 或缺失/错配 manifest 不得冒充有效备份', () => {
+  const dir = fs.mkdtempSync(path.join(tmpDir, 'manifest-gate-'))
+  const bare = fakeBackupAtLocal(dir, '2026-07-26T09:00:00', 'bare001')
+  fs.rmSync(backupManifestPath(path.join(dir, bare)))
+  const mismatched = fakeBackupAtLocal(dir, '2026-07-27T09:00:00', 'bad0001')
+  fs.appendFileSync(path.join(dir, mismatched), 'tampered')
+  assert.equal(latestBackupDay(dir), null)
 })
 
 test('latestBackupDay：多份取最大日（按本地日，不是字符串排序碰巧）', () => {
@@ -268,12 +284,12 @@ test('R6⑤：首轮备份后立刻再调 → 缓存命中 → 不重复备份',
     const now = new Date('2026-07-27T12:00:00Z')
     const first = runDailyBackup(now)
     assert.strictEqual(first, true, '首轮应该备份')
-    const files1 = fs.readdirSync(dir).filter((f) => f.startsWith('backup-'))
+    const files1 = fs.readdirSync(dir).filter((f) => /^backup-.*\.db$/.test(f))
     assert.strictEqual(files1.length, 1)
     // 立刻再调（同一毫秒）→ 缓存命中
     const second = runDailyBackup(now)
     assert.strictEqual(second, false, '缓存命中应该跳过')
-    const files2 = fs.readdirSync(dir).filter((f) => f.startsWith('backup-'))
+    const files2 = fs.readdirSync(dir).filter((f) => /^backup-.*\.db$/.test(f))
     assert.strictEqual(files2.length, 1, '不应产生第二份')
   } finally {
     delete process.env.DB_PATH
@@ -298,7 +314,7 @@ test('R6⑤：首轮备份后 < 1 小时 → 缓存仍有效 → 不重验盘', 
   try {
     const t0 = new Date('2026-07-27T12:00:00Z')
     runDailyBackup(t0)
-    const files1 = fs.readdirSync(dir).filter((f) => f.startsWith('backup-'))
+    const files1 = fs.readdirSync(dir).filter((f) => /^backup-.*\.db$/.test(f))
     assert.strictEqual(files1.length, 1)
     // 外部删除今天的备份（模拟挂载点被换 / 误删）
     fs.rmSync(path.join(dir, files1[0]!))
@@ -306,7 +322,7 @@ test('R6⑤：首轮备份后 < 1 小时 → 缓存仍有效 → 不重验盘', 
     const t1 = new Date(t0.getTime() + 59 * 60_000)
     const second = runDailyBackup(t1)
     assert.strictEqual(second, false, '缓存窗内应跳过')
-    const files2 = fs.readdirSync(dir).filter((f) => f.startsWith('backup-'))
+    const files2 = fs.readdirSync(dir).filter((f) => /^backup-.*\.db$/.test(f))
     assert.strictEqual(files2.length, 0, '不应创建替补')
   } finally {
     delete process.env.DB_PATH
@@ -331,7 +347,7 @@ test('R6⑤：首轮备份后 ≥ 1 小时 → 复查磁盘 → 发现今天备�
   try {
     const t0 = new Date('2026-07-27T12:00:00Z')
     runDailyBackup(t0)
-    const files1 = fs.readdirSync(dir).filter((f) => f.startsWith('backup-'))
+    const files1 = fs.readdirSync(dir).filter((f) => /^backup-.*\.db$/.test(f))
     assert.strictEqual(files1.length, 1)
     // 外部删除今天的备份
     fs.rmSync(path.join(dir, files1[0]!))
@@ -339,7 +355,7 @@ test('R6⑤：首轮备份后 ≥ 1 小时 → 复查磁盘 → 发现今天备�
     const t1 = new Date(t0.getTime() + 3600_000)
     const second = runDailyBackup(t1)
     assert.strictEqual(second, true, '应创建替补备份')
-    const files2 = fs.readdirSync(dir).filter((f) => f.startsWith('backup-'))
+    const files2 = fs.readdirSync(dir).filter((f) => /^backup-.*\.db$/.test(f))
     assert.strictEqual(files2.length, 1, '应有一份替补')
   } finally {
     delete process.env.DB_PATH

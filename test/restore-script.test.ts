@@ -6,6 +6,8 @@ import path from 'node:path'
 import { spawn, spawnSync } from 'node:child_process'
 import { setTimeout as delay } from 'node:timers/promises'
 import { DatabaseSync } from 'node:sqlite'
+import { backupManifestPath } from '../lib/backup-manifest.ts'
+import { writeBackupManifestFixture } from './backup-manifest-fixture.ts'
 
 // ============================================================================
 // scripts/restore.sh 回归（P6-R2 复审必修 1 / 建议 3）
@@ -40,6 +42,77 @@ import { spawnSync } from 'node:child_process'
 
 const args = process.argv.slice(2)
 fs.appendFileSync(process.env.STUB_LOG, JSON.stringify(args) + '\\n')
+const validatorId = 'e'.repeat(64)
+const validatorStatePath = process.env.STUB_LOG + '.validator.json'
+const validatorImage = 'sha256:' + '1'.repeat(64)
+
+if (args[0] === 'image' && args[1] === 'inspect') {
+  if (process.env.TEST_VALIDATOR_IMAGE_INSPECT_FAIL === '1') process.exit(78)
+  const formatAt = args.indexOf('--format')
+  const format = formatAt >= 0 ? args[formatAt + 1] : ''
+  if (format.includes('.Id')) console.log(validatorImage)
+  else if (format.includes('.Config.Env')) console.log('[]')
+  else process.exit(79)
+  process.exit(0)
+}
+
+if (args[0] === 'create') {
+  if (process.env.TEST_VALIDATOR_CREATE_FAIL === '1') process.exit(78)
+  const mountAt = args.indexOf('--mount')
+  const commandAt = args.indexOf('-e')
+  const mount = mountAt >= 0 ? args[mountAt + 1] : ''
+  const sourceField = mount.split(',').find((field) => field.startsWith('src=')) || ''
+  const source = sourceField.slice(4)
+  const js = commandAt >= 0 ? args[commandAt + 1] : ''
+  if (!source || !js || !fs.existsSync(source)) process.exit(80)
+  fs.writeFileSync(validatorStatePath, JSON.stringify({ source, js }))
+  console.log(validatorId)
+  process.exit(0)
+}
+
+if (args[0] === 'inspect' && args.at(-1) === validatorId) {
+  if (process.env.TEST_VALIDATOR_INSPECT_FAIL === '1') process.exit(78)
+  const formatAt = args.indexOf('--format')
+  const format = formatAt >= 0 ? args[formatAt + 1] : ''
+  const validator = JSON.parse(fs.readFileSync(validatorStatePath, 'utf8'))
+  if (format.includes('XJM_VALIDATOR_MOUNT')) {
+    console.log(['XJM_VALIDATOR_MOUNT', 'bind', validator.source, '/snap.db', 'false'].join('\\t'))
+  } else if (format.includes('.Image')) console.log(validatorImage)
+  else if (format.includes('.HostConfig.NetworkMode')) console.log('none')
+  else if (format.includes('.HostConfig.ReadonlyRootfs')) console.log('true')
+  else if (format.includes('.HostConfig.CapDrop')) console.log('["ALL"]')
+  else if (format.includes('.HostConfig.SecurityOpt')) console.log('["no-new-privileges"]')
+  else if (format.includes('.Config.User')) console.log('0:0')
+  else if (format.includes('.Config.Entrypoint')) console.log('["node"]')
+  else if (format.includes('.Config.Cmd')) console.log(JSON.stringify(['-e', validator.js]))
+  else if (format.includes('.Config.Env')) {
+    console.log(process.env.TEST_VALIDATOR_ENV_DRIFT === '1' ? '["SERVICE_SECRET=leak"]' : '[]')
+  } else process.exit(79)
+  process.exit(0)
+}
+
+if (args[0] === 'start' && args.at(-1) === validatorId) {
+  if (process.env.TEST_VALIDATOR_START_FAIL === '1') process.exit(78)
+  const validator = JSON.parse(fs.readFileSync(validatorStatePath, 'utf8'))
+  const jail = fs.mkdtempSync(path.join(os.tmpdir(), 'xjm-validator-ro-'))
+  const inner = path.join(jail, 'snap.db')
+  fs.copyFileSync(validator.source, inner)
+  fs.chmodSync(inner, 0o444)
+  fs.chmodSync(jail, 0o500)
+  const rewritten = validator.js.split('/snap.db').join(inner)
+  const result = spawnSync(process.execPath, ['-e', rewritten], { stdio: 'inherit' })
+  fs.chmodSync(jail, 0o700)
+  fs.rmSync(jail, { recursive: true, force: true })
+  process.exit(result.status ?? 1)
+}
+
+if (args[0] === 'rm' && args.at(-1) === validatorId) {
+  if (process.env.TEST_VALIDATOR_RM_FAIL === '1') process.exit(78)
+  fs.rmSync(validatorStatePath, { force: true })
+  console.log(validatorId)
+  process.exit(0)
+}
+
 if (args[0] === 'inspect') {
   if (process.env.TEST_CONTAINER_MOUNT_MODE === 'inspect-fail') process.exit(78)
   const mode = process.env.TEST_CONTAINER_MOUNT_MODE || 'bind'
@@ -290,6 +363,20 @@ const stateFile = process.env.TEST_DOCKER_STATE
 const logFile = process.env.STUB_LOG
 const state = JSON.parse(fs.readFileSync(stateFile, 'utf8'))
 fs.appendFileSync(logFile, JSON.stringify(args) + '\\n')
+
+const validatorId = 'e'.repeat(64)
+if (
+  args[0] === 'image' ||
+  args[0] === 'create' ||
+  args[0] === 'rm' ||
+  ((args[0] === 'inspect' || args[0] === 'start') && args.at(-1) === validatorId)
+) {
+  const base = spawnSync(process.execPath, [process.env.TEST_BASE_DOCKER_STUB, ...args], {
+    stdio: 'inherit',
+    env: process.env,
+  })
+  process.exit(base.status ?? 1)
+}
 
 function save() { fs.writeFileSync(stateFile, JSON.stringify(state)) }
 function resolveId(ref) {
@@ -848,6 +935,10 @@ esac
     sudoPath,
     `#!/bin/sh
 printf '%s\\n' "$*" >> "$TEST_OWNER_PROBE_LOG"
+if [ "$1" = "id" ] && [ "$2" = "-u" ]; then
+  printf '%s\\n' 0
+  exit 0
+fi
 if [ "$1" = "cat" ] && [ "$2" = "--" ]; then
   case "$3" in
     /proc/sys/kernel/random/boot_id)
@@ -1050,6 +1141,7 @@ function makeDb(p: string, marker: string): void {
 function makeSnapshot(p: string, marker: string): void {
   fs.mkdirSync(path.dirname(p), { recursive: true })
   fs.rmSync(p, { force: true })
+  fs.rmSync(backupManifestPath(p), { force: true })
   const stage = p + '.stage'
   fs.rmSync(stage, { force: true })
   const d = new DatabaseSync(stage)
@@ -1067,6 +1159,22 @@ function makeSnapshot(p: string, marker: string): void {
     [1, 1],
     '前置：快照 fixture 必须是 journal 模式（头 1/1），否则会被 R7-P1① 守卫拒掉',
   )
+  fs.chmodSync(p, 0o600)
+  writeBackupManifestFixture(p)
+}
+
+function refreshSnapshotManifest(p: string): void {
+  fs.chmodSync(p, 0o600)
+  fs.rmSync(backupManifestPath(p), { force: true })
+  writeBackupManifestFixture(p)
+}
+
+function rewriteManifest(p: string, mutate: (value: Record<string, unknown>) => void): void {
+  const manifestPath = backupManifestPath(p)
+  const value = JSON.parse(fs.readFileSync(manifestPath, 'utf8')) as Record<string, unknown>
+  mutate(value)
+  fs.writeFileSync(manifestPath, JSON.stringify(value) + '\n', { mode: 0o600 })
+  fs.chmodSync(manifestPath, 0o600)
 }
 
 function readMarker(p: string): string {
@@ -1320,6 +1428,235 @@ test('必修1 回归：从 backup-*.db 常规还原仍正确，且现场存进 p
   assert.equal(readMarker(snap), 'SNAPSHOT-A', '快照本身不该被改动')
   // 现场留存走的是 VACUUM INTO（不是 cp）：桩 docker 收到过 run 调用
   assert.match(r.log, /"run"/, '现场留存必须借容器跑 VACUUM INTO，不能退化成 cp')
+  const preRestore = path.join(backupsDir, 'pre-restore.db')
+  assert.doesNotThrow(() => {
+    const manifest = JSON.parse(fs.readFileSync(backupManifestPath(preRestore), 'utf8')) as { name: string }
+    assert.equal(manifest.name, 'pre-restore.db')
+  }, '现场留存必须发布 matching manifest')
+})
+
+test('P6-R2 validator：不继承 Compose service，使用 exact image + 最小只读隔离容器', () => {
+  const { dataDir, backupsDir } = scene('isolated-validator-contract', 'CURRENT')
+  const snap = path.join(backupsDir, 'backup-validator-contract.db')
+  makeSnapshot(snap, 'VALIDATOR-SNAPSHOT')
+
+  const r = runRestore(dataDir, backupsDir, snap)
+  assert.equal(r.status, 0, `脚本应成功：\n${r.stdout}\n${r.stderr}`)
+  const calls = r.log
+    .trim()
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line) as string[])
+  const validatorCreate = calls.find(
+    (args) => args[0] === 'create' && args.some((arg) => arg.includes('dst=/snap.db')),
+  )
+  assert.ok(validatorCreate, '快照校验必须走 docker create，而不是 docker compose run')
+  assert.ok(validatorCreate.includes('--network') && validatorCreate.includes('none'))
+  assert.ok(validatorCreate.includes('--read-only'))
+  assert.ok(validatorCreate.includes('--cap-drop') && validatorCreate.includes('ALL'))
+  assert.ok(validatorCreate.includes('--security-opt') && validatorCreate.includes('no-new-privileges'))
+  assert.ok(validatorCreate.includes('--user') && validatorCreate.includes('0:0'))
+  const commandAt = validatorCreate.indexOf('-e')
+  assert.equal(validatorCreate[commandAt - 1], `sha256:${'1'.repeat(64)}`, '必须直接使用已捕获 exact image ID')
+  const mounts = validatorCreate
+    .map((arg, index) => validatorCreate[index - 1] === '--mount' ? arg : '')
+    .filter(Boolean)
+  assert.equal(mounts.length, 1)
+  assert.match(mounts[0], /dst=\/snap\.db,readonly$/)
+  assert.doesNotMatch(mounts[0], /\/app\/data/)
+  assert.ok(!calls.some(
+    (args) => args[0] === 'compose' && args[1] === 'run' && args.some((arg) => arg.includes('/snap.db')),
+  ))
+  assert.ok(calls.some((args) => args[0] === 'rm' && args.includes('-f')), 'validator 必须显式清理')
+})
+
+for (const validatorFailure of [
+  { label: 'image inspect 失败', env: { TEST_VALIDATOR_IMAGE_INSPECT_FAIL: '1' }, created: false },
+  { label: 'create 失败', env: { TEST_VALIDATOR_CREATE_FAIL: '1' }, created: false },
+  { label: 'inspect 失败', env: { TEST_VALIDATOR_INSPECT_FAIL: '1' }, created: true },
+  { label: 'service Env 漂入', env: { TEST_VALIDATOR_ENV_DRIFT: '1' }, created: true },
+  { label: '执行失败', env: { TEST_VALIDATOR_START_FAIL: '1' }, created: true },
+  { label: 'cleanup 失败', env: { TEST_VALIDATOR_RM_FAIL: '1' }, created: true },
+] as const) {
+  test(`P6-R2 validator fail-closed：${validatorFailure.label} 不得停 app 或改活库`, () => {
+    const { dataDir, backupsDir } = scene(`validator-fail-${validatorFailure.label}`, 'CURRENT')
+    const snap = path.join(backupsDir, 'backup-validator-failure.db')
+    makeSnapshot(snap, 'VALIDATOR-SNAPSHOT')
+    const liveBefore = fs.readFileSync(path.join(dataDir, 'app.db'))
+
+    const r = runRestore(dataDir, backupsDir, snap, validatorFailure.env)
+    assert.equal(r.status, 1, `${validatorFailure.label} 必须 fail-closed：\n${r.stdout}\n${r.stderr}`)
+    assert.doesNotMatch(r.log, /"stop"/, 'validator 失败必须发生在停 app 前')
+    assert.deepEqual(fs.readFileSync(path.join(dataDir, 'app.db')), liveBefore)
+    if (validatorFailure.created) assert.match(r.log, /\["rm","-f"/, '已 create 的 validator 必须尝试清理')
+  })
+}
+
+test('P6-R2-R8 provenance：hot rollback-journal 裸拷即使 1/1 + quick_check=ok 也因无 manifest 被拒', () => {
+  const { dataDir, backupsDir } = scene('hot-rollback-bare-copy', 'CURRENT')
+  const live = path.join(backupsDir, 'hot-live.db')
+  const snap = path.join(backupsDir, 'backup-hot-bare-copy.db')
+  const d = new DatabaseSync(live)
+  d.exec(`
+    PRAGMA journal_mode=DELETE;
+    PRAGMA synchronous=FULL;
+    PRAGMA cache_size=5;
+    PRAGMA cache_spill=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT NOT NULL);
+    BEGIN;
+  `)
+  const insert = d.prepare('INSERT INTO t(payload) VALUES (?)')
+  for (let i = 0; i < 5000; i++) insert.run('BASE'.padEnd(1000, 'x'))
+  d.exec('COMMIT; BEGIN IMMEDIATE;')
+  const update = d.prepare('UPDATE t SET payload=? WHERE id=?')
+  for (let i = 1; i <= 5000; i++) update.run('DIRTY'.padEnd(1000, 'y'), i)
+  assert.ok(fs.existsSync(live + '-journal'), '前置：真实 rollback journal 必须存在')
+  fs.copyFileSync(live, snap)
+  d.exec('ROLLBACK')
+  d.close()
+  fs.chmodSync(snap, 0o600)
+
+  const header = fs.readFileSync(snap).subarray(18, 20)
+  assert.deepEqual([...header], [1, 1], '前置：裸拷 header 仍是 1/1')
+  const copied = new DatabaseSync(`file:${snap}?immutable=1`, { readOnly: true })
+  const quick = copied.prepare('PRAGMA quick_check').get() as { quick_check: string }
+  const dirty = copied.prepare("SELECT count(*) AS n FROM t WHERE payload LIKE 'DIRTY%'").get() as { n: number }
+  copied.close()
+  assert.equal(quick.quick_check, 'ok', '前置：quick_check 仍会误报 ok')
+  assert.ok(dirty.n >= 4995, `前置：裸拷应含随后 rollback 的未提交行，实际 ${dirty.n}`)
+
+  const r = runRestore(dataDir, backupsDir, snap)
+  assert.equal(r.status, 1)
+  assert.match(r.stderr, /manifest|provenance|legacy 裸 \.db/i)
+  assert.doesNotMatch(r.log, /"stop"/, 'provenance 拒绝必须发生在停机前')
+  assert.equal(readMarker(path.join(dataDir, 'app.db')), 'CURRENT')
+})
+
+for (const manifestCase of [
+  { label: '缺 manifest', mutate: (p: string) => fs.rmSync(backupManifestPath(p)) },
+  { label: '错 version', mutate: (p: string) => rewriteManifest(p, (v) => { v.version = 2 }) },
+  { label: '错 method', mutate: (p: string) => rewriteManifest(p, (v) => { v.method = 'bare-copy' }) },
+  { label: '错 filename', mutate: (p: string) => rewriteManifest(p, (v) => { v.name = 'other.db' }) },
+  { label: '错 size', mutate: (p: string) => rewriteManifest(p, (v) => { v.size = Number(v.size) + 1 }) },
+  { label: '伪造 digest', mutate: (p: string) => rewriteManifest(p, (v) => { v.sha256 = '0'.repeat(64) }) },
+  { label: 'manifest 0644', mutate: (p: string) => fs.chmodSync(backupManifestPath(p), 0o644) },
+  { label: 'snapshot 0644', mutate: (p: string) => fs.chmodSync(p, 0o644) },
+  { label: 'manifest JSON 截断', mutate: (p: string) => fs.writeFileSync(backupManifestPath(p), '{"version":1', { mode: 0o600 }) },
+  { label: 'manifest 非规范序列化', mutate: (p: string) => {
+    const manifest = backupManifestPath(p)
+    const value = JSON.parse(fs.readFileSync(manifest, 'utf8'))
+    fs.writeFileSync(manifest, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 })
+    fs.chmodSync(manifest, 0o600)
+  } },
+] as const) {
+  test(`P6-R2-R8 manifest fail-closed：${manifestCase.label} 在停机前拒绝`, () => {
+    const { dataDir, backupsDir } = scene(`manifest-${manifestCase.label.replaceAll(' ', '-')}`, 'CURRENT')
+    const snap = path.join(backupsDir, 'backup-manifest-negative.db')
+    makeSnapshot(snap, 'SNAPSHOT')
+    manifestCase.mutate(snap)
+    const r = runRestore(dataDir, backupsDir, snap)
+    assert.equal(r.status, 1, `${manifestCase.label} 必须拒绝：\n${r.stdout}\n${r.stderr}`)
+    assert.doesNotMatch(r.log, /"stop"/, 'manifest 拒绝必须在停机前')
+    assert.equal(readMarker(path.join(dataDir, 'app.db')), 'CURRENT')
+  })
+}
+
+test('P6-R2-R8 manifest digest：合法 pair 的 snapshot 同大小字节翻转必须在停机前拒绝', () => {
+  const { dataDir, backupsDir } = scene('manifest-snapshot-byte-flip', 'CURRENT')
+  const snap = path.join(backupsDir, 'backup-manifest-byte-flip.db')
+  makeSnapshot(snap, 'SNAPSHOT-BYTE-FLIP')
+  const manifest = backupManifestPath(snap)
+  const manifestBefore = fs.readFileSync(manifest)
+  const snapshotBefore = fs.readFileSync(snap)
+  const mutated = Buffer.from(snapshotBefore)
+  const index = Math.max(100, Math.floor(mutated.length / 2))
+  mutated[index] ^= 0x01
+  fs.writeFileSync(snap, mutated, { mode: 0o600 })
+  fs.chmodSync(snap, 0o600)
+
+  assert.equal(fs.statSync(snap).size, snapshotBefore.length, 'mutation 必须保持 snapshot size 不变')
+  assert.deepEqual(fs.readFileSync(manifest), manifestBefore, 'mutation 不得改 manifest 字节')
+
+  const r = runRestore(dataDir, backupsDir, snap)
+  assert.equal(r.status, 1, `同大小 snapshot 篡改必须被 digest 拒绝：\n${r.stdout}\n${r.stderr}`)
+  assert.match(r.stderr, /SHA-256|digest|manifest/i)
+  assert.doesNotMatch(r.log, /"create"|"stop"/, 'digest 拒绝必须早于 validator create 与 app stop')
+  assert.equal(readMarker(path.join(dataDir, 'app.db')), 'CURRENT')
+})
+
+test('P6-R2-R8 manifest 并发半发布：最终名正在写入时必须立即拒绝且不停 app', async () => {
+  const { dataDir, backupsDir } = scene('manifest-concurrent-half-publish', 'CURRENT')
+  const snap = path.join(backupsDir, 'backup-manifest-half-published.db')
+  makeSnapshot(snap, 'SNAPSHOT-HALF-PUBLISHED')
+  const manifest = backupManifestPath(snap)
+  const body = fs.readFileSync(manifest, 'utf8')
+  fs.rmSync(manifest)
+  const ready = path.join(path.dirname(dataDir), 'manifest-writer-ready')
+  const release = path.join(path.dirname(dataDir), 'manifest-writer-release')
+  const writer = spawn(
+    process.execPath,
+    ['-e', `
+const fs = require('node:fs')
+const [manifest, ready, release, body] = process.argv.slice(1)
+const split = Math.max(1, Math.floor(body.length / 2))
+const fd = fs.openSync(manifest, 'wx', 0o600)
+try { fs.writeSync(fd, body.slice(0, split)); fs.fchmodSync(fd, 0o600) } finally { fs.closeSync(fd) }
+fs.writeFileSync(ready, '')
+const timer = setInterval(() => {
+  if (!fs.existsSync(release)) return
+  clearInterval(timer)
+  fs.appendFileSync(manifest, body.slice(split))
+}, 10)
+`, manifest, ready, release, body],
+    { stdio: ['ignore', 'pipe', 'pipe'] },
+  )
+  const writerExit = collectExit(writer, 10_000)
+  try {
+    await waitForFile(ready, 5_000)
+    const r = runRestore(dataDir, backupsDir, snap)
+    assert.equal(r.status, 1, `并发半发布 manifest 必须 fail closed：\n${r.stdout}\n${r.stderr}`)
+    assert.match(r.stderr, /manifest|JSON|内容异常|无法解析/i)
+    assert.doesNotMatch(r.log, /"create"|"stop"/, '半发布拒绝必须早于 validator create 与 app stop')
+    assert.equal(readMarker(path.join(dataDir, 'app.db')), 'CURRENT')
+  } finally {
+    fs.writeFileSync(release, '')
+    const result = await writerExit
+    assert.equal(result.code, 0, `manifest writer cleanup failed:\n${result.stdout}\n${result.stderr}`)
+  }
+})
+
+test('P6-R2-R8 manifest fail-closed：manifest symlink / 非 regular 一律拒绝', () => {
+  for (const kind of ['symlink', 'directory'] as const) {
+    const { dataDir, backupsDir } = scene(`manifest-nonregular-${kind}`, 'CURRENT')
+    const snap = path.join(backupsDir, 'backup-manifest-nonregular.db')
+    makeSnapshot(snap, 'SNAPSHOT')
+    const manifest = backupManifestPath(snap)
+    const body = fs.readFileSync(manifest)
+    fs.rmSync(manifest)
+    if (kind === 'symlink') {
+      const target = manifest + '.target'
+      fs.writeFileSync(target, body, { mode: 0o600 })
+      fs.symlinkSync(path.basename(target), manifest)
+    } else {
+      fs.mkdirSync(manifest)
+    }
+    const r = runRestore(dataDir, backupsDir, snap)
+    assert.equal(r.status, 1)
+    assert.doesNotMatch(r.log, /"stop"/)
+    assert.equal(readMarker(path.join(dataDir, 'app.db')), 'CURRENT')
+  }
+})
+
+test('P6-R2-R8 manifest fail-closed：snapshot symlink 即使目标 pair 合法也拒绝', () => {
+  const { dataDir, backupsDir } = scene('snapshot-symlink-reject', 'CURRENT')
+  const target = path.join(backupsDir, 'backup-real.db')
+  makeSnapshot(target, 'REAL')
+  const snap = path.join(backupsDir, 'backup-link.db')
+  fs.symlinkSync(path.basename(target), snap)
+  const r = runRestore(dataDir, backupsDir, snap)
+  assert.equal(r.status, 1)
+  assert.match(r.stderr, /符号链接/)
+  assert.doesNotMatch(r.log, /"stop"/)
 })
 
 // ② 建议 3：截断的快照必须在**任何破坏性步骤之前**被拦下
@@ -1330,6 +1667,7 @@ test('建议3：截断快照被 quick_check 拦下 → 退出 1，且没停过 a
   makeSnapshot(full, 'SNAPSHOT-B') // 用一致性快照当底本：确保拦下它的是 quick_check，不是 R7-P1① 的 WAL 守卫
   const snap = path.join(backupsDir, 'backup-2026-07-26T02-00-00-ffffff.db')
   fs.writeFileSync(snap, fs.readFileSync(full).subarray(0, 2048))
+  refreshSnapshotManifest(snap)
   assert.equal(
     fs.readFileSync(snap).subarray(0, 15).toString(),
     'SQLite format 3',
@@ -1364,6 +1702,7 @@ test('R7-P1①：纯 cp 出来的 wal 模式快照（非 VACUUM 产物）被拒�
   makeDb(live, 'SNAPSHOT-C')
   const snap = path.join(backupsDir, 'copied.db')
   fs.copyFileSync(live, snap)
+  refreshSnapshotManifest(snap)
   {
     const hdr = fs.readFileSync(snap).subarray(18, 20)
     assert.deepEqual([hdr[0], hdr[1]], [2, 2], '前置：这份快照确实是 wal 模式（文件头 2/2）')
@@ -1400,6 +1739,7 @@ for (const { label, bytes } of [
     buf[18] = bytes[0]
     buf[19] = bytes[1]
     fs.writeFileSync(snap, buf)
+    refreshSnapshotManifest(snap)
 
     const r = runRestore(dataDir, backupsDir, snap)
     assert.equal(r.status, 1, `未知 header ${label} 必须 fail-closed：\n${r.stdout}\n${r.stderr}`)
@@ -2728,7 +3068,11 @@ test('P6-R2 新建容器：Compose create 的停止态实例在换库前失败�
   const calls = fs.readFileSync(logFile, 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse)
   assert.equal(r.status, 73, `create 后换库前失败应保留注入退出码：\n${r.stdout}\n${r.stderr}`)
   assert.ok(calls.some((call) => call[0] === 'compose' && call[1] === 'create'), '前置：确实 create 了停止态容器')
-  assert.equal(calls.filter((call) => call[0] === 'start').length, 0, '刚 create 的停止态容器不得被失败路径启动')
+  assert.equal(
+    calls.filter((call) => call[0] === 'start' && call[1] === CONTAINER_A).length,
+    0,
+    '刚 create 的停止态 app 容器不得被失败路径启动（隔离 validator 的 start -a 不计入）',
+  )
   assert.ok(fs.existsSync(logFile + '.stopped'), '刚 create 的容器必须保持停止态')
   assert.equal(readMarker(path.join(dataDir, 'app.db')), 'CURRENT-CREATED-STOPPED')
 })
@@ -2761,7 +3105,11 @@ test('P6-R2 镜像回滚：--after-image-rollback 的停止态旧容器在 DB �
 
   const calls = fs.readFileSync(logFile, 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse)
   assert.equal(r.status, 73, `rollback DB 替换前失败应保留注入退出码：\n${r.stdout}\n${r.stderr}`)
-  assert.equal(calls.filter((call) => call[0] === 'start').length, 0, 'DB 尚未恢复时不得启动旧镜像')
+  assert.equal(
+    calls.filter((call) => call[0] === 'start' && call[1] === CONTAINER_A).length,
+    0,
+    'DB 尚未恢复时不得启动旧 app 镜像（隔离 validator 的 start -a 不计入）',
+  )
   assert.ok(fs.existsSync(logFile + '.stopped'), 'rollback 的停止态容器必须保持停止')
   assert.equal(readMarker(path.join(dataDir, 'app.db')), 'CURRENT-ROLLBACK-STOPPED')
 })
@@ -2835,6 +3183,8 @@ test('R4④：还原用私有 stage + mv 原子就位（非原地覆盖）', () 
     const snap = new DatabaseSync(snapshotPath)
     snap.exec('CREATE TABLE t(x); INSERT INTO t VALUES (42)')
     snap.close()
+    fs.chmodSync(snapshotPath, 0o600)
+    writeBackupManifestFixture(snapshotPath)
 
     // 造当前库
     const live = new DatabaseSync(dbPath)
@@ -2879,46 +3229,35 @@ test('R4④：还原用私有 stage + mv 原子就位（非原地覆盖）', () 
 // ============================================================================
 
 // ① 单层相对目标：snap.db -> pre-restore.db
-test('R4-P1②：快照是 pre-restore.db 的符号链接 → stop 前 stage 原内容再还原', () => {
+test('R4-P1②：快照是 pre-restore.db 的符号链接 → provenance fail-closed 拒绝', () => {
   const { dataDir, backupsDir } = scene('symlink-1hop', 'CURRENT-BROKEN')
   makeSnapshot(path.join(backupsDir, 'pre-restore.db'), 'ORIGINAL')
   const snap = path.join(backupsDir, 'snap.db')
   fs.symlinkSync('pre-restore.db', snap)
 
   const r = runRestore(dataDir, backupsDir, snap)
-  assert.equal(r.status, 0, `脚本应成功：\n${r.stdout}\n${r.stderr}`)
-  assert.equal(readMarker(path.join(dataDir, 'app.db')), 'ORIGINAL', '还原内容必须是快照真身')
-  // 🔴 修复前：未提前 stage → 现场留存段用当前 app.db 覆盖 pre-restore.db 真身，
-  //    后续 install 读到的是刚覆盖进去的 CURRENT-BROKEN，ORIGINAL 静默丢失。
-  //    修复后：stop 前已把 ORIGINAL 固化并校验进私有 stage；现场留存照常把 CURRENT-BROKEN 写进
-  //    pre-restore.db（给下次反悔），最终 mv 的仍是 stage 里的 ORIGINAL。
-  assert.equal(
-    readMarker(path.join(backupsDir, 'pre-restore.db')),
-    'CURRENT-BROKEN',
-    '🔴 pre-restore.db 应更新为本次还原前的现场（给下一次反悔）',
-  )
-  assert.ok(
-    !fs.existsSync(path.join(dataDir, '.restore-in-progress')),
-    '私有 stage/锁应在还原完成后清理',
-  )
+  assert.equal(r.status, 1, `symlink 必须拒绝：\n${r.stdout}\n${r.stderr}`)
+  assert.equal(readMarker(path.join(dataDir, 'app.db')), 'CURRENT-BROKEN')
+  assert.equal(readMarker(path.join(backupsDir, 'pre-restore.db')), 'ORIGINAL')
+  assert.doesNotMatch(r.log, /"stop"/)
 })
 
 // ② 多层链：mid.db -> snap.db -> pre-restore.db（循环解析到底后再 stage）
-test('R4-P1②：快照是两层符号链接 → 循环追踪到底，仍能拦下', () => {
+test('R4-P1②：快照是两层符号链接 → provenance fail-closed 拒绝', () => {
   const { dataDir, backupsDir } = scene('symlink-2hop', 'CURRENT')
   makeSnapshot(path.join(backupsDir, 'pre-restore.db'), 'ORIGINAL')
   fs.symlinkSync('pre-restore.db', path.join(backupsDir, 'snap.db'))
   fs.symlinkSync('snap.db', path.join(backupsDir, 'mid.db'))
 
   const r = runRestore(dataDir, backupsDir, path.join(backupsDir, 'mid.db'))
-  assert.equal(r.status, 0, `脚本应成功：\n${r.stdout}\n${r.stderr}`)
-  assert.equal(readMarker(path.join(dataDir, 'app.db')), 'ORIGINAL')
-  assert.equal(readMarker(path.join(backupsDir, 'pre-restore.db')), 'CURRENT')
-  assert.ok(!fs.existsSync(path.join(dataDir, '.restore-in-progress')), '私有 stage/锁应被清理')
+  assert.equal(r.status, 1)
+  assert.equal(readMarker(path.join(dataDir, 'app.db')), 'CURRENT')
+  assert.equal(readMarker(path.join(backupsDir, 'pre-restore.db')), 'ORIGINAL')
+  assert.doesNotMatch(r.log, /"stop"/)
 })
 
 // ③ 符号链接目标是绝对路径（readlink 返回 /... 时走的另一条分支）
-test('R4-P1②：符号链接目标为绝对路径 → 守卫同样识别', () => {
+test('R4-P1②：符号链接目标为绝对路径 → provenance fail-closed 拒绝', () => {
   const { dataDir, backupsDir } = scene('symlink-abs', 'CURRENT')
   const preRestore = path.join(backupsDir, 'pre-restore.db')
   makeSnapshot(preRestore, 'ORIGINAL')
@@ -2926,10 +3265,10 @@ test('R4-P1②：符号链接目标为绝对路径 → 守卫同样识别', () =
   fs.symlinkSync(preRestore, snap)
 
   const r = runRestore(dataDir, backupsDir, snap)
-  assert.equal(r.status, 0, `脚本应成功：\n${r.stdout}\n${r.stderr}`)
-  assert.equal(readMarker(path.join(dataDir, 'app.db')), 'ORIGINAL')
-  assert.equal(readMarker(preRestore), 'CURRENT')
-  assert.ok(!fs.existsSync(path.join(dataDir, '.restore-in-progress')))
+  assert.equal(r.status, 1)
+  assert.equal(readMarker(path.join(dataDir, 'app.db')), 'CURRENT')
+  assert.equal(readMarker(preRestore), 'ORIGINAL')
+  assert.doesNotMatch(r.log, /"stop"/)
 })
 
 // ④ 反向回归：普通快照不能被新逻辑误当成 pre-restore.db 拦下（否则现场留存整段失效）
@@ -2947,7 +3286,7 @@ test('R4-P1② 回归：普通备份文件仍走现场留存（不误拦）', ()
 
 // 校验与最终 install 必须使用**同一个已解析目标**。否则快照是 symlink 时，攻击者/误操作可在
 // quick_check 通过后、install 前把链接改指另一份库；脚本会“校验 A、安装 B”。stop 桩就在两步间换链。
-test('P6-R2 TOCTOU：快照 symlink 在校验后被改指 → 仍安装已校验的私有 stage', () => {
+test('P6-R2 TOCTOU：快照 symlink 不进入校验/换链窗口', () => {
   const { dataDir, backupsDir } = scene('symlink-toctou', 'CURRENT')
   const good = path.join(backupsDir, 'good.db')
   const swapped = path.join(backupsDir, 'swapped.db')
@@ -2989,13 +3328,10 @@ exec "${process.execPath}" "${path.join(binDir, 'docker-stub.mjs')}" "$@"
     encoding: 'utf8',
   })
 
-  assert.equal(r.status, 0, `恢复应成功：\n${r.stdout}\n${r.stderr}`)
-  assert.equal(fs.realpathSync(snap), fs.realpathSync(swapped), '前置：stop 桩确实已把 symlink 改指未校验库')
-  assert.equal(
-    readMarker(path.join(dataDir, 'app.db')),
-    'VALIDATED-GOOD',
-    '🔴 最终安装必须钉住 quick_check 校验过的 SNAPSHOT_ABS，不能重新解原始 symlink',
-  )
+  assert.equal(r.status, 1)
+  assert.equal(fs.realpathSync(snap), fs.realpathSync(good), '停机前拒绝，stop 桩不得有机会换链')
+  assert.equal(readMarker(path.join(dataDir, 'app.db')), 'CURRENT')
+  assert.doesNotMatch(fs.readFileSync(logFile, 'utf8'), /"stop"/)
 })
 
 // 不只 symlink：解析后的普通文件也可能在 quick_check 后被另一个进程用 rename 原子替换。
@@ -3253,7 +3589,193 @@ test('P6-R2 restore 互斥：已有状态锁时 exit 4，绝不 stop/start 或�
   assert.ok(fs.existsSync(lock), '别人的/异常中断的锁不得被本进程删除')
 })
 
+test('P6-R2 host-only control 预存目录：guard acquisition 前 fail-closed 且不得删除未知 control', () => {
+  const { dataDir, backupsDir } = scene('restore-control-preexisting', 'CURRENT-CONTROL-PREEXISTING')
+  const snap = path.join(backupsDir, 'backup-control-preexisting.db')
+  makeSnapshot(snap, 'SNAPSHOT-CONTROL-PREEXISTING')
+  const control = `${fs.realpathSync(dataDir)}.restore-control`
+  fs.mkdirSync(control, { mode: 0o700 })
+  const marker = path.join(control, 'foreign-note')
+  fs.writeFileSync(marker, 'leave me alone\n', { mode: 0o600 })
+
+  const r = runRestore(dataDir, backupsDir, snap)
+  assert.equal(r.status, 4, `预存 host-only control 必须 exit 4：\n${r.stdout}\n${r.stderr}`)
+  assert.doesNotMatch(r.log, /"stop"/, '未知 control 冲突必须发生在停机前')
+  assert.equal(fs.readFileSync(marker, 'utf8'), 'leave me alone\n')
+  assert.ok(fs.existsSync(control), '未知 host-only control 目录不得被 acquisition trap 删除')
+  assert.equal(fs.existsSync(`${control}.guard`), false, '冲突前不得留下本进程 guard')
+  assert.equal(readMarker(path.join(dataDir, 'app.db')), 'CURRENT-CONTROL-PREEXISTING')
+})
+
+test('P6-R2 control ownership：本进程取得 guard 后他人抢先创建 control 也不得被 cleanup 删除', () => {
+  const { dataDir, backupsDir } = scene('restore-control-foreign-after-guard', 'CURRENT-FOREIGN-RACE')
+  const snap = path.join(backupsDir, 'backup-control-foreign-race.db')
+  makeSnapshot(snap, 'SNAPSHOT-FOREIGN-RACE')
+  const control = `${fs.realpathSync(dataDir)}.restore-control`
+  const raceBin = path.join(path.dirname(dataDir), 'control-foreign-race-bin')
+  const foreignNote = path.join(control, 'foreign-note')
+  fs.mkdirSync(raceBin, { recursive: true })
+  fs.writeFileSync(
+    path.join(raceBin, 'docker'),
+    `#!/bin/sh\nexec "${process.execPath}" "${path.join(binDir, 'docker-stub.mjs')}" "$@"\n`,
+    { mode: 0o755 },
+  )
+  installReadyCurlStub(raceBin)
+  fs.writeFileSync(
+    path.join(raceBin, 'node'),
+    `#!/bin/sh
+if [ -f "$TEST_CONTROL_GUARD" ] && [ ! -e "$TEST_CONTROL_LOCK" ]; then
+  /bin/mkdir "$TEST_CONTROL_LOCK" || exit $?
+  printf '%s\n' FOREIGN-CONTROL > "$TEST_CONTROL_LOCK/foreign-note"
+  /bin/chmod 600 "$TEST_CONTROL_LOCK/foreign-note"
+  exit 73
+fi
+exec "${process.execPath}" "$@"
+`,
+    { mode: 0o755 },
+  )
+
+  const r = runRestore(dataDir, backupsDir, snap, {
+    PATH: `${raceBin}:${process.env.PATH}`,
+    TEST_CONTROL_LOCK: control,
+    TEST_CONTROL_GUARD: `${control}.guard`,
+  })
+  assert.equal(r.status, 4, `抢先出现的 foreign control 必须 fail-closed：\n${r.stdout}\n${r.stderr}`)
+  assert.equal(fs.readFileSync(foreignNote, 'utf8'), 'FOREIGN-CONTROL\n')
+  assert.ok(fs.existsSync(control), '本进程只有 guard，没有 control ownership token，不得删 foreign control')
+  assert.equal(fs.existsSync(`${control}.guard`), false, '本进程的 guard 应自行释放')
+  assert.equal(readMarker(path.join(dataDir, 'app.db')), 'CURRENT-FOREIGN-RACE')
+  assert.doesNotMatch(r.log, /"stop"/)
+})
+
 // ============================================================================
+for (const { mode, signal, exitCode } of [
+  { mode: 'owned', signal: 'SIGTERM' as const, exitCode: 143 },
+  { mode: 'owned', signal: 'SIGINT' as const, exitCode: 130 },
+  { mode: 'foreign', signal: 'SIGTERM' as const, exitCode: 143 },
+] as const) {
+  test(`P6-R2 control-lock trap：${signal} 命中 mkdir 窗口时${mode === 'owned' ? '不留 ownerless 锁' : '保留他人空锁'}`, async () => {
+    const { dataDir, backupsDir } = scene(`control-lock-signal-${mode}-${signal}`, 'CURRENT')
+    const snap = path.join(backupsDir, 'backup-control-lock-signal.db')
+    makeSnapshot(snap, 'SNAPSHOT')
+    const control = `${fs.realpathSync(dataDir)}.restore-control`
+    const signalBin = path.join(path.dirname(dataDir), 'control-lock-signal-bin')
+    const entered = path.join(path.dirname(dataDir), 'control-lock-mkdir-entered')
+    const controlGuard = `${control}.guard`
+    const ownershipFile = path.join(control, 'control-owner')
+    fs.mkdirSync(signalBin, { recursive: true })
+    fs.writeFileSync(
+      path.join(signalBin, 'docker'),
+      `#!/bin/sh\nexec "${process.execPath}" "${path.join(binDir, 'docker-stub.mjs')}" "$@"\n`,
+      { mode: 0o755 },
+    )
+    installReadyCurlStub(signalBin)
+    fs.writeFileSync(
+      path.join(signalBin, 'mkdir'),
+      `#!/bin/sh
+target=
+for arg in "$@"; do
+  case "$arg" in -*) ;; *) target="$arg" ;; esac
+done
+if [ "$target" = "$TEST_CONTROL_LOCK" ]; then
+  if [ "$TEST_CONTROL_LOCK_MODE" = "foreign" ]; then
+    /bin/mkdir "$target" || exit $?
+    /bin/rm -f "$TEST_CONTROL_GUARD"
+    printf '%s\\n' FOREIGN-GUARD > "$TEST_CONTROL_GUARD"
+    /bin/chmod 600 "$TEST_CONTROL_GUARD"
+    : > "$TEST_CONTROL_MKDIR_ENTERED"
+    while :; do sleep 1; done
+  fi
+fi
+exec /bin/mkdir "$@"
+`,
+      { mode: 0o755 },
+    )
+    fs.writeFileSync(
+      path.join(signalBin, 'chmod'),
+      `#!/bin/sh
+if [ "$1" = "700" ] && [ "$2" = "$TEST_CONTROL_LOCK" ]; then
+  if [ "$TEST_CONTROL_LOCK_MODE" = "foreign" ]; then
+    /bin/rm -f "$TEST_CONTROL_LOCK/control-owner" "$TEST_CONTROL_GUARD"
+    printf '%s\\n' FOREIGN-GUARD > "$TEST_CONTROL_GUARD"
+    /bin/chmod 600 "$TEST_CONTROL_GUARD"
+    : > "$TEST_CONTROL_MKDIR_ENTERED"
+    while :; do sleep 1; done
+  fi
+fi
+exec /bin/chmod "$@"
+`,
+      { mode: 0o755 },
+    )
+    const preload = path.join(signalBin, 'pause-control-owner-open.cjs')
+    fs.writeFileSync(
+      preload,
+      `const fs = require('node:fs')
+const originalOpenSync = fs.openSync
+fs.openSync = function patchedOpenSync(file, ...args) {
+  const target = String(file)
+  if (
+    process.env.TEST_CONTROL_LOCK_MODE === 'owned' &&
+    target === process.env.TEST_CONTROL_OWNERSHIP_FILE &&
+    fs.existsSync(process.env.TEST_CONTROL_LOCK) &&
+    !fs.existsSync(target)
+  ) {
+    fs.writeFileSync(process.env.TEST_CONTROL_MKDIR_ENTERED, '')
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1500)
+  }
+  return originalOpenSync.call(this, file, ...args)
+}
+`,
+      { mode: 0o600 },
+    )
+
+    const logFile = path.join(path.dirname(dataDir), 'stub.log')
+    fs.writeFileSync(logFile, '')
+    const child = spawn('sh', [RESTORE_SH, snap], {
+      cwd: REPO,
+      detached: true,
+      env: {
+        ...process.env,
+        PATH: `${signalBin}:${process.env.PATH}`,
+        STUB_LOG: logFile,
+        SUDO: '',
+        DATA_DIR: dataDir,
+        BACKUP_DIR: backupsDir,
+        TEST_CONTROL_LOCK: control,
+        TEST_CONTROL_LOCK_MODE: mode,
+        TEST_CONTROL_MKDIR_ENTERED: entered,
+        TEST_CONTROL_GUARD: controlGuard,
+        TEST_CONTROL_OWNERSHIP_FILE: ownershipFile,
+        NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --require=${preload}`.trim(),
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    const exited = collectExit(child, 20_000)
+    try {
+      await waitForFile(entered, 10_000)
+      killProcessGroup(child, signal)
+      const result = await exited
+      assert.equal(result.code, exitCode, `${signal} 应由前置 trap 转为 ${exitCode}：\n${result.stdout}\n${result.stderr}`)
+      assert.equal(result.signal, null)
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) {
+        try { killProcessGroup(child, 'SIGKILL') } catch {}
+      }
+    }
+
+    if (mode === 'owned') {
+      assert.ok(!fs.existsSync(control), '本进程已创建但尚未写状态的 control lock 必须被事务式 acquisition 清理')
+      assert.ok(!fs.existsSync(controlGuard), 'owned guard 必须与 control 一起清理')
+    } else {
+      assert.ok(fs.existsSync(control), 'guard 不匹配时即使 foreign control 为空也不得 rmdir')
+      assert.deepEqual(fs.readdirSync(control), [])
+      assert.equal(fs.readFileSync(controlGuard, 'utf8'), 'FOREIGN-GUARD\n', '未取得 guard 时绝不能删除他人 guard')
+    }
+    assert.equal(readMarker(path.join(dataDir, 'app.db')), 'CURRENT')
+    assert.doesNotMatch(fs.readFileSync(logFile, 'utf8'), /"stop"/)
+  })
+}
+
 // R7-P1②：真实 SIGTERM 命中「rename 已完成、正常 WAL 清理尚未执行」的竞态窗口
 //
 // 旧测试用 readiness 超时触发 EXIT，但那发生在正常路径已经执行 `rm -f "$DB-wal" "$DB-shm"`
@@ -3709,7 +4231,7 @@ test('P6-R2 残锁 owner：Linux /proc 明确确认 PID 已不存在时按 stale
   assert.ok(afterState.events.some((event) => event[0] === 'stop'))
 })
 
-test('P6-R2 残锁 owner：Linux 非 root 且 SUDO= 时，仅完整 /proc 枚举确认 PID 缺席才按 stale 收口', () => {
+test('P6-R2 hidepid：非 root 且 SUDO= 时，目标 stat 不可读必须保持 unknown', () => {
   const ownerPid = '4247'
   const c = ownerResidualCase(
     'owner-definitely-dead-linux-direct-proc',
@@ -3727,11 +4249,12 @@ test('P6-R2 残锁 owner：Linux 非 root 且 SUDO= 时，仅完整 /proc 枚举
   const probeCalls = fs.readFileSync(probeLog, 'utf8')
 
   assert.equal(r.status, 4)
-  assert.equal(afterState.containers[CONTAINER_A].running, false, '明确 dead owner 必须进入 stale containment')
-  assert.deepEqual(afterState.containers[CONTAINER_A].networks, [])
-  assert.ok(afterState.events.some((event) => event[0] === 'stop'))
+  assert.equal(afterState.containers[CONTAINER_A].running, true, '🔴 hidepid 下目标不可见不得推断 owner 已死')
+  assert.equal(afterState.containers[CONTAINER_A].networks.length, 1)
+  assert.ok(!afterState.events.some((event) => event[0] === 'stop' || event[0] === 'network-disconnect'))
   assert.match(probeCalls, new RegExp(`cat -- /proc/${ownerPid}/stat`))
-  assert.match(probeCalls, /find \/proc /, 'SUDO= 时仍必须通过严格 /proc 枚举确认目标 PID 缺席')
+  assert.doesNotMatch(probeCalls, /find \/proc /, '非 root 通道不得用 hidepid 下的不完整枚举推断 ESRCH')
+  assert.match(r.stderr, /无法确认|权限|unknown/i)
 })
 
 test('P6-R2 残锁自愈：replace 已完成且 sidecar/marker 已清但未启动时也先停并隔离 exact ID', () => {
@@ -4084,7 +4607,7 @@ fi
   const exited = collectExit(child)
   let r: Awaited<typeof exited>
   try {
-    await waitForFile(mvEntered)
+    await waitForFile(mvEntered, 20_000)
     assert.ok(
       fs.existsSync(path.join(dataDir, '.restore-in-progress', 'snapshot.db')),
       '前置：armed 后私有 stage 仍存在',
@@ -4200,6 +4723,9 @@ exec "${process.execPath}" "${path.join(binDir, 'docker-stub.mjs')}" "$@"
 
 test('P6-R2 readiness 严格接受：仅 200 + {"ok":true} 释放锁并宣告成功', () => {
   const { dataDir, backupsDir } = scene('ready-accepted', 'CURRENT')
+  const realDataDir = fs.realpathSync(dataDir)
+  const control = `${realDataDir}.restore-control`
+  const guard = `${realDataDir}.restore-control.guard`
   const snap = path.join(backupsDir, 'backup-ready-accepted.db')
   makeSnapshot(snap, 'SNAPSHOT-ACCEPTED')
   const r = runRestore(dataDir, backupsDir, snap, {
@@ -4212,6 +4738,15 @@ test('P6-R2 readiness 严格接受：仅 200 + {"ok":true} 释放锁并宣告成
   assert.equal(calls.filter((call) => call[0] === 'start' && call[1] === CONTAINER_A).length, 1)
   assert.equal(calls.filter((call) => call[0] === 'stop' && call[1] === CONTAINER_A).length, 1)
   assert.ok(!fs.existsSync(path.join(dataDir, '.restore-in-progress')), '只有 accepted 后才释放锁')
+  assert.ok(!fs.existsSync(control), '成功后 host-only control 必须释放')
+  assert.ok(!fs.existsSync(guard), '成功后 control guard 必须释放')
+  assert.deepEqual(
+    fs.readdirSync(path.dirname(realDataDir)).filter(
+      (name) => name.startsWith(`${path.basename(realDataDir)}.restore-control.guard.candidate.`),
+    ),
+    [],
+    '成功后不得遗留 guard candidate',
+  )
   assert.equal(readMarker(path.join(dataDir, 'app.db')), 'SNAPSHOT-ACCEPTED')
 })
 

@@ -4,56 +4,168 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { spawnSync } from 'node:child_process'
-
-// ============================================================================
-// scripts/sync-backups.sh 回归（P6-R2 R4③）
-//
-// 用桩 rsync 捕获参数，验证 --partial-dir 在位、不用裸 --partial。
-// ============================================================================
+import { backupManifestPath } from '../lib/backup-manifest.ts'
+import { writeBackupManifestFixture } from './backup-manifest-fixture.ts'
 
 const REPO = path.resolve(import.meta.dirname, '..')
 const SYNC_SH = path.join(REPO, 'scripts', 'sync-backups.sh')
 
-test('R4③：rsync 用 --partial-dir 而非裸 --partial（防半截文件污染异机候选集）', () => {
-  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'xjm-sync-'))
-  try {
-    const backupsDir = path.join(tmpRoot, 'backups')
-    fs.mkdirSync(backupsDir, { recursive: true })
-    fs.writeFileSync(path.join(backupsDir, 'backup-test.db'), 'dummy')
+function createPair(snapshot: string, contents: string): void {
+  fs.writeFileSync(snapshot, contents, { mode: 0o600 })
+  fs.chmodSync(snapshot, 0o600)
+  writeBackupManifestFixture(snapshot)
+}
 
-    const binDir = path.join(tmpRoot, 'bin')
-    fs.mkdirSync(binDir)
-    const logFile = path.join(tmpRoot, 'rsync.log')
+function installRsyncStub(root: string): { binDir: string; logFile: string } {
+  const binDir = path.join(root, 'bin')
+  fs.mkdirSync(binDir)
+  const logFile = path.join(root, 'rsync.log')
+  const stub = path.join(binDir, 'rsync')
+  fs.writeFileSync(
+    stub,
+    `#!/usr/bin/env node
+import fs from 'node:fs'
+import path from 'node:path'
 
-    // 桩 rsync：记录所有参数到日志
-    const rsyncStub = path.join(binDir, 'rsync')
-    fs.writeFileSync(
-      rsyncStub,
-      `#!/bin/sh
-echo "$@" > "${logFile}"
-exit 0
+const args = process.argv.slice(2)
+const listArg = args.find((arg) => arg.startsWith('--files-from='))
+if (!listArg) process.exit(70)
+const listPath = listArg.slice('--files-from='.length)
+const files = fs.readFileSync(listPath, 'utf8').trim().split('\\n').filter(Boolean)
+const source = args.at(-2)
+for (const file of files) {
+  if (!fs.existsSync(path.join(source, file))) process.exit(71)
+}
+fs.appendFileSync(process.env.RSYNC_LOG, JSON.stringify({ args, files, source }) + '\\n')
+const calls = fs.readFileSync(process.env.RSYNC_LOG, 'utf8').trim().split('\\n').length
+if (calls === 1 && process.env.MUTATE_SOURCE_AFTER_PAYLOAD === '1') {
+  fs.rmSync(path.join(process.env.BACKUP_DIR, process.env.MUTATE_NAME + '.manifest.json'), { force: true })
+  fs.appendFileSync(path.join(process.env.BACKUP_DIR, process.env.MUTATE_NAME), 'changed-after-stage')
+}
+if (calls === 2 && process.env.FAIL_MANIFEST_PHASE === '1') process.exit(72)
 `,
-      { mode: 0o755 },
-    )
+    { mode: 0o755 },
+  )
+  return { binDir, logFile }
+}
 
-    const r = spawnSync(SYNC_SH, ['user@host:/remote'], {
-      cwd: REPO,
-      env: {
-        ...process.env,
-        PATH: `${binDir}:${process.env.PATH}`,
-        BACKUP_DIR: backupsDir,
-      },
-      encoding: 'utf8',
-    })
+function runSync(root: string, extraEnv: NodeJS.ProcessEnv = {}) {
+  const backupsDir = path.join(root, 'backups')
+  fs.mkdirSync(backupsDir, { recursive: true })
+  const { binDir, logFile } = installRsyncStub(root)
+  const result = spawnSync(SYNC_SH, ['user@host:/remote'], {
+    cwd: REPO,
+    env: {
+      ...process.env,
+      PATH: `${binDir}:${process.env.PATH}`,
+      BACKUP_DIR: backupsDir,
+      RSYNC_LOG: logFile,
+      ...extraEnv,
+    },
+    encoding: 'utf8',
+  })
+  const calls = fs.existsSync(logFile)
+    ? fs.readFileSync(logFile, 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line) as {
+        args: string[]
+        files: string[]
+        source: string
+      })
+    : []
+  return { result, calls, backupsDir }
+}
 
-    assert.equal(r.status, 0, `脚本应成功退出（stderr: ${r.stderr})`)
-    const args = fs.readFileSync(logFile, 'utf8').trim()
-    assert.ok(
-      args.includes('--partial-dir=.rsync-partial'),
-      `应使用 --partial-dir（实际参数: ${args}）`,
-    )
-    assert.ok(!args.match(/\s--partial\s/), `不应有裸 --partial（实际参数: ${args}）`)
+test('R4③: rsync transfers only complete pairs, payload first and manifests last', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'xjm-sync-pair-'))
+  try {
+    const backupsDir = path.join(root, 'backups')
+    fs.mkdirSync(backupsDir, { recursive: true })
+    createPair(path.join(backupsDir, 'backup-2026-07-29T00-00-00-aaaaaa.db'), 'daily')
+    createPair(path.join(backupsDir, 'preupgrade.db'), 'pinned')
+
+    const { result, calls } = runSync(root)
+    assert.equal(result.status, 0, `sync should succeed: ${result.stderr}`)
+    assert.equal(calls.length, 2)
+    assert.deepEqual(calls[0]!.files.sort(), ['backup-2026-07-29T00-00-00-aaaaaa.db', 'preupgrade.db'])
+    assert.deepEqual(calls[1]!.files.sort(), [
+      'backup-2026-07-29T00-00-00-aaaaaa.db.manifest.json',
+      'preupgrade.db.manifest.json',
+    ])
+    for (const call of calls) {
+      assert.ok(call.args.includes('--partial-dir=.rsync-partial'))
+      assert.equal(call.args.includes('--partial'), false)
+      assert.equal(call.args.includes('--delete'), false)
+      assert.notEqual(path.resolve(call.source), path.resolve(`${backupsDir}/`), 'must transfer staged copies')
+    }
   } finally {
-    fs.rmSync(tmpRoot, { recursive: true, force: true })
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('P6-R2 sync: missing, orphan, mismatched, or non-regular pair fails before any remote call', () => {
+  for (const kind of ['empty', 'missing', 'orphan', 'digest', 'snapshot-symlink', 'manifest-symlink'] as const) {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), `xjm-sync-${kind}-`))
+    try {
+      const backupsDir = path.join(root, 'backups')
+      fs.mkdirSync(backupsDir, { recursive: true })
+      const snapshot = path.join(backupsDir, 'backup-2026-07-29T00-00-00-aaaaaa.db')
+      if (kind !== 'empty') createPair(snapshot, 'valid')
+      if (kind === 'missing') fs.rmSync(backupManifestPath(snapshot))
+      if (kind === 'orphan') fs.rmSync(snapshot)
+      if (kind === 'digest') fs.appendFileSync(snapshot, 'tampered')
+      if (kind === 'snapshot-symlink') {
+        const target = path.join(root, 'snapshot-target.db')
+        fs.renameSync(snapshot, target)
+        fs.symlinkSync(target, snapshot)
+      }
+      if (kind === 'manifest-symlink') {
+        const manifest = backupManifestPath(snapshot)
+        const target = path.join(root, 'manifest-target.json')
+        fs.renameSync(manifest, target)
+        fs.symlinkSync(target, manifest)
+      }
+
+      const { result, calls } = runSync(root)
+      assert.notEqual(result.status, 0, `${kind} must fail closed`)
+      assert.equal(calls.length, 0, `${kind} must not contact remote`)
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  }
+})
+
+test('P6-R2 sync: local retention/concurrent mutation cannot corrupt manifest publication', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'xjm-sync-concurrent-'))
+  try {
+    const backupsDir = path.join(root, 'backups')
+    fs.mkdirSync(backupsDir, { recursive: true })
+    const name = 'backup-2026-07-29T00-00-00-aaaaaa.db'
+    createPair(path.join(backupsDir, name), 'stable-before-sync')
+
+    const { result, calls } = runSync(root, {
+      MUTATE_SOURCE_AFTER_PAYLOAD: '1',
+      MUTATE_NAME: name,
+    })
+    assert.equal(result.status, 0, result.stderr)
+    assert.equal(calls.length, 2)
+    assert.equal(calls[0]!.source, calls[1]!.source, 'both phases must use one immutable staged set')
+    assert.notEqual(path.resolve(calls[0]!.source), path.resolve(`${backupsDir}/`))
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('P6-R2 sync: manifest-phase failure is reported after payload-only publication', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'xjm-sync-manifest-fail-'))
+  try {
+    const backupsDir = path.join(root, 'backups')
+    fs.mkdirSync(backupsDir, { recursive: true })
+    createPair(path.join(backupsDir, 'backup-2026-07-29T00-00-00-aaaaaa.db'), 'valid')
+    const { result, calls } = runSync(root, { FAIL_MANIFEST_PHASE: '1' })
+    assert.notEqual(result.status, 0)
+    assert.equal(calls.length, 2)
+    assert.ok(calls[0]!.files.every((name) => name.endsWith('.db')))
+    assert.ok(calls[1]!.files.every((name) => name.endsWith('.manifest.json')))
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
   }
 })

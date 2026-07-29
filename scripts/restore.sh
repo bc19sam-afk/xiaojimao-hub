@@ -106,14 +106,9 @@ fi
 #    **看着像绝对路径的垃圾**——拿它当 `-v` 源就等于把宿主根目录 `/` 挂进容器。而这不是理论情形：
 #    `data/backups` 按 §2 是 0700 且属主 uid1000，操作账号不是 1000 时 `cd` 必然 Permission denied。
 #    故显式判空并中止。
-# 🔴 R4-P1②：路径归一时解符号链接。恢复源可能是指向 pre-restore.db 的一层/多层链接；必须先
-# 解析到真实目标，再在 stop 前复制到 app 未挂载的 host-only 预校验副本。这样后面的现场留存即使
-# 覆盖原 pre-restore.db，最终还原仍使用已固化副本，不会静默丢掉二次反悔回滚点。
-#
-# `cd -P` 追踪目录段，再对 basename 段**循环** readlink 直到不再是链接。必须循环而不是解一层：
-# `snap.db -> mid.db -> pre-restore.db` 只解一层会留下仍会变化的中间链接。readlink 给相对目标时按其
-# 所在目录解析；给绝对目标时直接接着走下一轮。
-# 32 层上限用于兜住成环（`a -> b -> a`）——没有上限就是死循环，脚本挂在这里比误覆盖更糟。
+# `cd -P` 追踪目录段，再循环解析 basename 链接，32 层上限兜住成环。
+# 恢复输入本身会在调用本函数前显式拒绝 snapshot/manifest symlink；这个通用归一函数
+# 仍用于 DATA_DIR、DB 与容器 bind source 等已允许解析到物理路径的输入。
 # 断链/不存在：`-L` 在下一轮为假 → 直接返回已拼好的绝对路径（后续 head -c 15 / quick_check
 # 会拒绝不存在/不可读的文件，不归 abspath 管）。
 abspath() {
@@ -681,43 +676,145 @@ verify_captured_container_isolated() {
   fi
 }
 
-# 借 app 镜像里的 node 跑一段只读/备份 JS。本脚本本就依赖 docker compose（下面要 stop/start），
-# 不是新依赖；用 run 而非 exec，是因为恢复常发生在容器已停/崩溃循环时，exec 那会儿连不上。
-#
-# 🔴 显式 `-v` 挂载，**不依赖 compose 里那条 `./data:/app/data`**：那条只绑默认路径，`BACKUP_DIR`
-#    被改到别处时就对不上——脚本头与 docs §5.2 声称支持该覆盖项，此前却会把 pre-restore.db 写进
-#    容器内的临时层、宿主看不见（P6-R2 复审第 5 条：别让文档承诺代码不支持的能力）。
-#    容器内挂载点**写死**（/d、/b、/snapdir），宿主侧路径只经 -v 参数传入、绝不拼进 JS 源码：
-#    含空格/引号/`$` 的宿主路径既不会造成 JS 语法错，也不会被当代码执行。
-#    两个调用点的挂载数不同，故不做「可变参数」的通用封装——shell 里拼 -v 列表必须靠
-#    unquoted 词拆分，那正好在含空格的宿主路径上断掉（本仓库路径就是中文目录）。写死两个函数最稳。
+# 借已核验的 app image 跑一段只读快照校验 JS。这里不能使用 `docker compose run`：它会继承
+# service 的 env、网络和 /app/data bind，令不可信 snapshot 校验容器获得活库与秘密的额外边界。
+# 每次调用都显式 create/inspect/start/rm，并把待检快照作为唯一只读文件挂载。
+validator_cleanup_container() {
+  [ -n "${VALIDATOR_CONTAINER_ID:-}" ] || return 0
+  if docker rm -f "$VALIDATOR_CONTAINER_ID" >/dev/null 2>&1; then
+    VALIDATOR_CONTAINER_ID=""
+    return 0
+  fi
+  return 1
+}
 
-# 把 <宿主快照文件>本身挂成容器内的 /snap.db（ro），跑 JS。
-# 挂**文件**而非所在目录：目录里可能还有别的库/密钥，没必要整个暴露给一次性容器。
-#
-# 🔴 R6-P2③（codex R5 终审）：这一步必须以 **root** 跑（`--user 0:0`）。
-#
-#    镜像里是 `USER node`（uid 1000）。Linux 的 bind-mount **保留宿主 uid/gid 与权限位**，不做
-#    任何映射：运维用 root 从异机 scp/rsync 下来的快照通常是 `root:root 0600`（sync-backups.sh
-#    的产物、docs §5.3 的异机备份都是这个形态），容器里的 uid1000 对它 **没有读权限** →
-#    `new DatabaseSync` 直接 EACCES → 下面的 `||` 分支把一份**完全合法**的快照报成「截断/损坏」。
-#    而这发生在「还没停 app」的阶段，表现是恢复流程根本起不了步：运维手里明明有好快照却被拒。
-#
-#    为什么这一步可以提权（三条一起成立，缺一不可）：
-#      ① 纯只读——挂载带 `:ro`（内核层面禁写，容器内 root 也写不进去），JS 侧再叠
-#         `?immutable=1` + `readOnly: true`，SQLite 连 -wal/-shm 都不建；
-#      ② 只碰快照这一个**文件**，不挂 DATA_DIR、碰不到活库 app.db，跑挂了也不改变任何现场；
-#      ③ 一次性容器（`--rm --no-deps`），跑完即销毁，不留下以 root 运行的长驻进程。
-#    对比另一条路「先 stage 一份容器可读的副本」：那要在宿主上多复制一份**全库**（磁盘可能不够、
-#    还得保证副本不世界可读且异常路径下也清理掉），比只读提权的风险面更大。故选 --user 0:0。
-#
-#    ⚠️ 只有这个函数提权。node_in_data 会**写** pre-restore.db，仍保持镜像默认的 uid1000
-#       ——产物属主必须是 1000，容器起来才读得到（见下面 install 的 -o 1000 -g 1000）。
 node_with_snapshot() {
-  docker compose run --rm --no-deps -T \
+  _validator_snapshot="$1"
+  _validator_js="$2"
+  [ -n "${RESTORE_CONTAINER_IMAGE:-}" ] || {
+    echo "❌ 未取得已核验 app image ID，拒绝启动快照校验容器。" >&2
+    return 1
+  }
+
+  _validator_image_id=$(docker image inspect --format '{{.Id}}' "$RESTORE_CONTAINER_IMAGE" 2>/dev/null) || {
+    echo "❌ 无法核对快照校验所用 app image ID。" >&2
+    return 1
+  }
+  [ "$_validator_image_id" = "$RESTORE_CONTAINER_IMAGE" ] || {
+    echo "❌ 快照校验 image ID 与已捕获 app image 不一致，拒绝继续。" >&2
+    return 1
+  }
+  _validator_image_env=$(docker image inspect --format '{{json .Config.Env}}' "$RESTORE_CONTAINER_IMAGE" 2>/dev/null) || {
+    echo "❌ 无法读取已核验 app image 的基础 Env。" >&2
+    return 1
+  }
+
+  _validator_name="xjm-restore-validator-$$"
+  _validator_id=$(docker create \
+    --name "$_validator_name" \
+    --network none \
+    --mount "type=bind,src=$_validator_snapshot,dst=/snap.db,readonly" \
+    --read-only \
+    --cap-drop ALL \
+    --security-opt no-new-privileges \
     --user 0:0 \
-    -v "$1:/snap.db:ro" \
-    --entrypoint node app -e "$2"
+    --entrypoint node \
+    "$RESTORE_CONTAINER_IMAGE" -e "$_validator_js" 2>/dev/null) || {
+    echo "❌ 无法创建隔离快照校验容器。" >&2
+    return 1
+  }
+  if ! printf '%s\n' "$_validator_id" | grep -Eq '^[0-9a-f]{64}$'; then
+    VALIDATOR_CONTAINER_ID="$_validator_name"
+    echo "❌ 快照校验容器 ID 格式异常，拒绝执行。" >&2
+    validator_cleanup_container || true
+    return 1
+  fi
+  VALIDATOR_CONTAINER_ID="$_validator_id"
+
+  _validator_actual_image=$(docker inspect --format '{{.Image}}' "$_validator_id" 2>/dev/null) || {
+    echo "❌ 无法 inspect 快照校验容器 image。" >&2
+    validator_cleanup_container || true
+    return 1
+  }
+  _validator_actual_network=$(docker inspect --format '{{.HostConfig.NetworkMode}}' "$_validator_id" 2>/dev/null) || {
+    echo "❌ 无法 inspect 快照校验容器 network。" >&2
+    validator_cleanup_container || true
+    return 1
+  }
+  _validator_actual_mounts=$(docker inspect --format '{{range .Mounts}}{{printf "XJM_VALIDATOR_MOUNT\t%s\t%s\t%s\t%t\n" .Type .Source .Destination .RW}}{{end}}' "$_validator_id" 2>/dev/null) || {
+    echo "❌ 无法 inspect 快照校验容器 mounts。" >&2
+    validator_cleanup_container || true
+    return 1
+  }
+  _validator_actual_readonly=$(docker inspect --format '{{.HostConfig.ReadonlyRootfs}}' "$_validator_id" 2>/dev/null) || {
+    echo "❌ 无法 inspect 快照校验容器 rootfs。" >&2
+    validator_cleanup_container || true
+    return 1
+  }
+  _validator_actual_capdrop=$(docker inspect --format '{{json .HostConfig.CapDrop}}' "$_validator_id" 2>/dev/null) || {
+    echo "❌ 无法 inspect 快照校验容器 capabilities。" >&2
+    validator_cleanup_container || true
+    return 1
+  }
+  _validator_actual_security=$(docker inspect --format '{{json .HostConfig.SecurityOpt}}' "$_validator_id" 2>/dev/null) || {
+    echo "❌ 无法 inspect 快照校验容器 security options。" >&2
+    validator_cleanup_container || true
+    return 1
+  }
+  _validator_actual_user=$(docker inspect --format '{{.Config.User}}' "$_validator_id" 2>/dev/null) || {
+    echo "❌ 无法 inspect 快照校验容器 UID/GID。" >&2
+    validator_cleanup_container || true
+    return 1
+  }
+  _validator_actual_entrypoint=$(docker inspect --format '{{json .Config.Entrypoint}}' "$_validator_id" 2>/dev/null) || {
+    echo "❌ 无法 inspect 快照校验容器 entrypoint。" >&2
+    validator_cleanup_container || true
+    return 1
+  }
+  _validator_actual_command=$(docker inspect --format '{{json .Config.Cmd}}' "$_validator_id" 2>/dev/null) || {
+    echo "❌ 无法 inspect 快照校验容器 command。" >&2
+    validator_cleanup_container || true
+    return 1
+  }
+  _validator_actual_env=$(docker inspect --format '{{json .Config.Env}}' "$_validator_id" 2>/dev/null) || {
+    echo "❌ 无法 inspect 快照校验容器 Env。" >&2
+    validator_cleanup_container || true
+    return 1
+  }
+
+  if [ "$_validator_actual_image" != "$_validator_image_id" ] || \
+     [ "$_validator_actual_network" != "none" ] || \
+     [ "$_validator_actual_readonly" != "true" ] || \
+     [ "$_validator_actual_capdrop" != '["ALL"]' ] || \
+     [ "$_validator_actual_security" != '["no-new-privileges"]' ] || \
+     [ "$_validator_actual_user" != "0:0" ] || \
+     [ "$_validator_actual_entrypoint" != '["node"]' ] || \
+     ! printf '%s\n' "$_validator_actual_command" | grep -Eq '^\["-e",' || \
+     [ "$_validator_actual_env" != "$_validator_image_env" ]; then
+    echo "❌ 快照校验容器隔离属性与最小权限契约不符，拒绝执行。" >&2
+    validator_cleanup_container || true
+    return 1
+  fi
+  if ! printf '%s\n' "$_validator_actual_mounts" | awk -F '\t' -v expected="$_validator_snapshot" '
+    NF { rows++; if ($1 != "XJM_VALIDATOR_MOUNT" || $2 != "bind" || $3 != expected || $4 != "/snap.db" || $5 != "false") bad = 1 }
+    END { exit (rows == 1 && !bad) ? 0 : 1 }
+  '; then
+    echo "❌ 快照校验容器必须只有一个只读 /snap.db bind，拒绝执行。" >&2
+    validator_cleanup_container || true
+    return 1
+  fi
+
+  _validator_rc=0
+  if docker start -a "$_validator_id"; then
+    _validator_rc=0
+  else
+    _validator_rc=$?
+  fi
+  if ! validator_cleanup_container; then
+    echo "❌ 无法清理快照校验容器；拒绝继续恢复。" >&2
+    return 1
+  fi
+  return "$_validator_rc"
 }
 
 # 挂 <宿主 DATA_DIR>→/d、<宿主 BACKUP_DIR>→/b，跑 JS。
@@ -726,6 +823,105 @@ node_in_data() {
     -v "$1:/d" \
     -v "$2:/b" \
     --entrypoint node app -e "$3"
+}
+
+# Manifest provenance is checked on the host before any SQLite/container action.  This helper only
+# reads the two supplied regular files and hashes bytes; it never opens SQLite and never imports the
+# service environment.  The same strict canonical JSON contract is used by lib/backup.ts.
+verify_backup_manifest_pair() {
+  _manifest_snapshot="$1"
+  _manifest_path="$2"
+  _manifest_expected_name="$3"
+  $SUDO node - "$_manifest_snapshot" "$_manifest_path" "$_manifest_expected_name" <<'NODE'
+const fs = require('node:fs')
+const crypto = require('node:crypto')
+const [snapshot, manifestPath, expectedName] = process.argv.slice(2)
+function fail(message) { console.error(message); process.exit(1) }
+function regularPrivate(file, label) {
+  let st
+  try { st = fs.lstatSync(file) } catch { fail(`${label} 不存在或不可读取：${file}`) }
+  if (!st.isFile() || st.isSymbolicLink()) fail(`${label} 必须是 regular file：${file}`)
+  if ((st.mode & 0o777) !== 0o600) fail(`${label} 权限必须是 0600：${file}`)
+  return st
+}
+function sha256File(file) {
+  const hash = crypto.createHash('sha256')
+  const fd = fs.openSync(file, 'r')
+  const buffer = Buffer.allocUnsafe(1024 * 1024)
+  let offset = 0
+  try {
+    while (true) {
+      const read = fs.readSync(fd, buffer, 0, buffer.length, offset)
+      if (read === 0) break
+      hash.update(buffer.subarray(0, read))
+      offset += read
+    }
+  } finally {
+    fs.closeSync(fd)
+  }
+  return hash.digest('hex')
+}
+const st = regularPrivate(snapshot, '快照')
+const mst = regularPrivate(manifestPath, 'manifest')
+if (mst.size > 4096) fail(`manifest 过大：${manifestPath}`)
+const raw = fs.readFileSync(manifestPath, 'utf8')
+if (!raw.endsWith('\n') || raw.includes('\u0000')) fail(`manifest 内容异常：${manifestPath}`)
+let value
+try { value = JSON.parse(raw) } catch { fail(`manifest JSON 无法解析：${manifestPath}`) }
+if (!value || typeof value !== 'object' || Array.isArray(value)) fail(`manifest 必须是 JSON object：${manifestPath}`)
+const keys = Object.keys(value)
+if (keys.length !== 5 || value.version !== 1 || value.method !== 'sqlite-vacuum-into' ||
+    typeof value.name !== 'string' || typeof value.size !== 'number' ||
+    !Number.isSafeInteger(value.size) || value.size < 0 ||
+    typeof value.sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(value.sha256) ||
+    !/^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(value.name)) {
+  fail(`manifest 字段或格式不符合 v1 契约：${manifestPath}`)
+}
+const canonical = JSON.stringify({
+  version: value.version,
+  method: value.method,
+  name: value.name,
+  size: value.size,
+  sha256: value.sha256,
+}) + '\n'
+if (raw !== canonical) fail(`manifest 不是规范 v1 序列化格式：${manifestPath}`)
+if (value.name !== expectedName || value.size !== st.size) fail(`manifest 与快照文件名/大小不匹配：${snapshot}`)
+const digest = sha256File(snapshot)
+if (digest !== value.sha256) fail(`manifest SHA-256 与快照不匹配：${snapshot}`)
+process.stdout.write(`${st.size}\t${digest}\n`)
+NODE
+}
+
+write_backup_manifest_host() {
+  _manifest_snapshot="$1"
+  _manifest_path="$2"
+  _manifest_name="$3"
+  $SUDO node - "$_manifest_snapshot" "$_manifest_path" "$_manifest_name" <<'NODE'
+const fs = require('node:fs')
+const crypto = require('node:crypto')
+const [snapshot, manifestPath, name] = process.argv.slice(2)
+const st = fs.lstatSync(snapshot)
+if (!st.isFile() || st.isSymbolicLink() || (st.mode & 0o777) !== 0o600) process.exit(1)
+const hash = crypto.createHash('sha256')
+const input = fs.openSync(snapshot, 'r')
+const buffer = Buffer.allocUnsafe(1024 * 1024)
+let offset = 0
+try {
+  while (true) {
+    const read = fs.readSync(input, buffer, 0, buffer.length, offset)
+    if (read === 0) break
+    hash.update(buffer.subarray(0, read))
+    offset += read
+  }
+} finally {
+  fs.closeSync(input)
+}
+const sha256 = hash.digest('hex')
+const body = JSON.stringify({ version: 1, method: 'sqlite-vacuum-into', name, size: st.size, sha256 }) + '\n'
+const fd = fs.openSync(manifestPath, 'wx', 0o600)
+try { fs.writeFileSync(fd, body) } finally { fs.closeSync(fd) }
+fs.chmodSync(manifestPath, 0o600)
+NODE
 }
 
 # 非 uid1000 账号读写 ./data（0700、属主 1000）需要 sudo；已是 root 或显式 SUDO= 则不用。
@@ -790,9 +986,15 @@ read_linux_process_start_ticks() {
   printf '%s\n' "$_linux_ticks"
 }
 
+linux_process_presence_channel_is_privileged() {
+  _linux_presence_euid=$($SUDO id -u 2>/dev/null) || return 1
+  [ "$_linux_presence_euid" = "0" ]
+}
+
 read_linux_process_presence() {
   _linux_presence_pid="$1"
   case "$_linux_presence_pid" in 0|*[!0-9]*|'') return 1 ;; esac
+  linux_process_presence_channel_is_privileged || return 1
   _linux_pid_paths=$($SUDO find /proc \
     -mindepth 1 -maxdepth 1 -type d -name '[0-9]*' -print 2>/dev/null) || return 1
   _linux_presence=$(printf '%s\n' "$_linux_pid_paths" | awk -v expected="/proc/$_linux_presence_pid" '
@@ -969,10 +1171,12 @@ DB="$DATA_DIR/app.db"
 EARLY_RESTORE_LOCK="$DATA_DIR/.restore-in-progress"
 EARLY_RESTORE_CONTROL="${DATA_DIR}.restore-control"
 EARLY_CONTROL_ACCEPTED_HANDOFF="${DATA_DIR}.restore-control-accepted"
+EARLY_RESTORE_CONTROL_GUARD="${DATA_DIR}.restore-control.guard"
 EARLY_PUBLISHED_COMPOSE_PROJECT=""
 EARLY_PUBLISHED_COMPOSE_SERVICE=""
 
-if state_symlink_exists "$EARLY_RESTORE_CONTROL" || state_symlink_exists "$EARLY_CONTROL_ACCEPTED_HANDOFF"; then
+if state_symlink_exists "$EARLY_RESTORE_CONTROL" || state_symlink_exists "$EARLY_CONTROL_ACCEPTED_HANDOFF" || \
+   state_symlink_exists "$EARLY_RESTORE_CONTROL_GUARD"; then
   echo "❌ host-only restore 控制路径不能是符号链接：$EARLY_RESTORE_CONTROL" >&2
   exit 4
 fi
@@ -1015,9 +1219,9 @@ classify_early_restore_owner() {
         return 0
       fi
 
-      # stat 读取失败不能直接等价为 ESRCH：hidepid/权限拒绝同样会失败。沿同一 $SUDO/直接读取
-      # 通道严格枚举一层 /proc PID 目录，且要求稳定的 PID 1 恰好出现一次；只有完整枚举成功、
-      # 目标 PID 明确缺席时才算 definitely stale。枚举失败、PID 仍出现或格式异常一律 unknown。
+      # stat 读取失败不能直接等价为 ESRCH：hidepid/权限拒绝同样会失败。只有同一观察通道先经
+      # `id -u` 验证为 root，才允许严格枚举一层 /proc PID 目录并用目标缺席判 definitely stale。
+      # 非 root 即使看得到 PID 1，也可能因 hidepid 看不到 live cross-UID owner，必须保持 unknown。
       if _linux_presence=$(read_linux_process_presence "$_owner_pid"); then
         case "$_linux_presence" in
           absent)
@@ -1187,7 +1391,7 @@ report_early_owner_unknown() {
 }
 
 if state_path_exists "$EARLY_RESTORE_CONTROL" || state_file_exists "$EARLY_CONTROL_ACCEPTED_HANDOFF" || \
-   state_dir_exists "$EARLY_RESTORE_LOCK"; then
+   state_path_exists "$EARLY_RESTORE_CONTROL_GUARD" || state_dir_exists "$EARLY_RESTORE_LOCK"; then
   echo "🛑 已有另一个 restore 或上次异常中断的状态锁：$EARLY_RESTORE_LOCK" >&2
   classify_early_restore_owner
   _early_owner_metadata_present=0
@@ -1281,9 +1485,21 @@ fi
 
 validate_compose_data_bind
 
+# Strict provenance starts from the user-supplied pathname.  Do not resolve a symlink and then
+# bless its target: a supplied snapshot or manifest symlink is outside the controlled backup chain.
 [ -f "$SNAPSHOT" ] || { echo "❌ 快照不存在：$SNAPSHOT" >&2; exit 1; }
+if $SUDO test -L "$SNAPSHOT" 2>/dev/null; then
+  echo "❌ 恢复源快照不能是符号链接：$SNAPSHOT" >&2
+  exit 1
+fi
 
 SNAPSHOT_ABS="$(abspath "$SNAPSHOT")"
+SNAPSHOT_MANIFEST="${SNAPSHOT}.manifest.json"
+if $SUDO test -L "$SNAPSHOT_MANIFEST" 2>/dev/null; then
+  echo "❌ 恢复源 manifest 不能是符号链接：$SNAPSHOT_MANIFEST" >&2
+  exit 1
+fi
+SNAPSHOT_MANIFEST_ABS="$(abspath "$SNAPSHOT_MANIFEST")"
 DB_ABS="$(abspath "$DB")"
 
 # 🔴 快照 == 目标库：还原「自己盖自己」没有意义，且下面 install 会因 same file 报错（exit 64）而
@@ -1291,6 +1507,12 @@ DB_ABS="$(abspath "$DB")"
 if [ "$SNAPSHOT_ABS" = "$DB_ABS" ]; then
   echo "❌ 快照就是当前库本身（${DB}），还原它没有意义。" >&2
   exit 2
+fi
+
+if ! verify_backup_manifest_pair "$SNAPSHOT_ABS" "$SNAPSHOT_MANIFEST_ABS" "$(basename "$SNAPSHOT_ABS")" >/dev/null; then
+  echo "❌ 快照未通过受控 backup manifest provenance 校验，拒绝恢复：$SNAPSHOT" >&2
+  echo "   legacy 裸 .db、缺失/非规范/错配 manifest 均不兼容；请用本项目 VACUUM INTO 备份链重新产出 pair。" >&2
+  exit 1
 fi
 
 # 🔴 分叉守卫（docs §5.2）：标记在＝上次升级没走完。此时若直接 start，新镜像 entrypoint 见 schema
@@ -1333,7 +1555,12 @@ echo "→ 目标库：$DB"
 RESTORE_LOCK="$DATA_DIR/.restore-in-progress"
 RESTORE_CONTROL_LOCK="${DATA_DIR}.restore-control"
 RESTORE_CONTROL_ACCEPTED_HANDOFF="${DATA_DIR}.restore-control-accepted"
+RESTORE_CONTROL_GUARD="${DATA_DIR}.restore-control.guard"
+RESTORE_CONTROL_GUARD_CANDIDATE="${DATA_DIR}.restore-control.guard.candidate.$$"
+RESTORE_CONTROL_GUARD_VALUE=""
 RESTORE_VALIDATED_SNAPSHOT="$RESTORE_CONTROL_LOCK/snapshot.db"
+RESTORE_VALIDATED_MANIFEST="$RESTORE_CONTROL_LOCK/snapshot.manifest.json"
+RESTORE_CONTROL_OWNERSHIP_FILE="$RESTORE_CONTROL_LOCK/control-owner"
 RESTORE_CONTROL_ARMED_MARKER="$RESTORE_CONTROL_LOCK/replace-armed"
 RESTORE_CONTROL_SIDECARS_CLEAN_MARKER="$RESTORE_CONTROL_LOCK/sidecars-clean"
 RESTORE_CONTROL_UPGRADE_MARKER_CLEAN_MARKER="$RESTORE_CONTROL_LOCK/upgrade-marker-clean"
@@ -1357,10 +1584,13 @@ RESTORE_CONTROL_CONTAINER_SOURCE_FILE="$RESTORE_CONTROL_LOCK/container-data-sour
 RESTORE_CONTROL_CONTAINER_IMAGE_FILE="$RESTORE_CONTROL_LOCK/container-image"
 RESTORE_CONTROL_CONTAINER_WAS_RUNNING_FILE="$RESTORE_CONTROL_LOCK/container-was-running"
 PRE_RESTORE_TMP="$BACKUP_DIR/pre-restore.db.tmp"
+PRE_RESTORE_MANIFEST="$BACKUP_DIR/pre-restore.db.manifest.json"
 READY_BODY_TMP=""
 LOCK_HELD=0
+CONTROL_PHASE="unowned"
 STOP_ATTEMPTED=0
 RELEASE_FAILED=0
+VALIDATOR_CONTAINER_ID=""
 
 accepted_state_value() {
   printf 'v2 %s %s %s\n' \
@@ -1379,9 +1609,164 @@ restore_is_published() {
   [ "$(read_restore_state "$RESTORE_CONTROL_NETWORK_PUBLISHED")" = "$_published_expected" ]
 }
 
+create_restore_control_guard() {
+  $SUDO node - "$RESTORE_CONTROL_GUARD_CANDIDATE" "$RESTORE_CONTROL_GUARD" "$RESTORE_CONTROL_GUARD_VALUE" <<'NODE'
+const fs = require('node:fs')
+const [candidate, guard, value] = process.argv.slice(2)
+let fd
+try {
+  fd = fs.openSync(candidate, 'wx', 0o600)
+  fs.writeFileSync(fd, value + '\n')
+  fs.fchmodSync(fd, 0o600)
+} finally {
+  if (fd !== undefined) fs.closeSync(fd)
+}
+fs.linkSync(candidate, guard)
+NODE
+}
+
+restore_control_guard_owned() {
+  $SUDO node - "$RESTORE_CONTROL_GUARD_CANDIDATE" "$RESTORE_CONTROL_GUARD" "$RESTORE_CONTROL_GUARD_VALUE" <<'NODE'
+const fs = require('node:fs')
+const [candidate, guard, value] = process.argv.slice(2)
+function checked(file) {
+  const st = fs.lstatSync(file)
+  if (!st.isFile() || st.isSymbolicLink() || (st.mode & 0o777) !== 0o600) process.exit(1)
+  if (fs.readFileSync(file, 'utf8') !== value + '\n') process.exit(1)
+  return st
+}
+try {
+  const left = checked(candidate)
+  const right = checked(guard)
+  if (left.dev !== right.dev || left.ino !== right.ino) process.exit(1)
+} catch {
+  process.exit(1)
+}
+NODE
+}
+
+remove_owned_guard_candidate() {
+  $SUDO node - "$RESTORE_CONTROL_GUARD_CANDIDATE" "$RESTORE_CONTROL_GUARD_VALUE" <<'NODE'
+const fs = require('node:fs')
+const [candidate, value] = process.argv.slice(2)
+try {
+  const st = fs.lstatSync(candidate)
+  if (!st.isFile() || st.isSymbolicLink() || (st.mode & 0o777) !== 0o600) process.exit(1)
+  if (fs.readFileSync(candidate, 'utf8') !== value + '\n') process.exit(1)
+  fs.unlinkSync(candidate)
+} catch (error) {
+  if (error && error.code === 'ENOENT') process.exit(0)
+  process.exit(1)
+}
+NODE
+}
+
+restore_control_ownership_owned() {
+  $SUDO node - "$RESTORE_CONTROL_OWNERSHIP_FILE" "$RESTORE_CONTROL_GUARD_VALUE" <<'NODE'
+const fs = require('node:fs')
+const [file, value] = process.argv.slice(2)
+try {
+  const st = fs.lstatSync(file)
+  if (!st.isFile() || st.isSymbolicLink() || (st.mode & 0o777) !== 0o600) process.exit(1)
+  if (fs.readFileSync(file, 'utf8') !== value + '\n') process.exit(1)
+} catch {
+  process.exit(1)
+}
+NODE
+}
+
+create_restore_control_directory() {
+  $SUDO node - "$RESTORE_CONTROL_LOCK" "$RESTORE_CONTROL_OWNERSHIP_FILE" "$RESTORE_CONTROL_GUARD_VALUE" <<'NODE'
+const fs = require('node:fs')
+const [dir, ownershipFile, value] = process.argv.slice(2)
+let interrupted = 0
+let dirCreated = false
+let ownershipCreated
+const onInt = () => { interrupted = 130 }
+const onTerm = () => { interrupted = 143 }
+process.once('SIGINT', onInt)
+process.once('SIGTERM', onTerm)
+
+try {
+  // Signal callbacks run only after this synchronous block.  Thus mkdir and its ownership token
+  // become visible together from the parent trap's perspective, even if the child is signalled.
+  fs.mkdirSync(dir, { mode: 0o700 })
+  dirCreated = true
+  const fd = fs.openSync(ownershipFile, 'wx', 0o600)
+  ownershipCreated = fs.fstatSync(fd)
+  try {
+    fs.writeFileSync(fd, value + '\n')
+    fs.fchmodSync(fd, 0o600)
+  } finally {
+    fs.closeSync(fd)
+  }
+} catch (error) {
+  if (ownershipCreated) {
+    try {
+      const current = fs.lstatSync(ownershipFile)
+      if (current.dev === ownershipCreated.dev && current.ino === ownershipCreated.ino) {
+        fs.unlinkSync(ownershipFile)
+      }
+    } catch {}
+  }
+  if (dirCreated) {
+    try { fs.rmdirSync(dir) } catch {}
+  }
+  console.error(error instanceof Error ? error.message : String(error))
+  process.exitCode = 1
+}
+
+setImmediate(() => {
+  process.removeListener('SIGINT', onInt)
+  process.removeListener('SIGTERM', onTerm)
+  if (interrupted !== 0) process.exit(interrupted)
+})
+NODE
+}
+
+release_restore_control_guard() {
+  restore_control_guard_owned || {
+    echo "❌ restore control guard/candidate 所有权不匹配，拒绝释放。" >&2
+    return 1
+  }
+  if ! $SUDO rm -f "$RESTORE_CONTROL_GUARD"; then
+    echo "❌ 无法释放 restore control guard。" >&2
+    return 1
+  fi
+  if ! remove_owned_guard_candidate; then
+    echo "❌ guard 已移除但无法清理本进程 candidate；请人工核对。" >&2
+    return 1
+  fi
+}
+
+cleanup_control_acquisition() {
+  if ! restore_control_guard_owned; then
+    remove_owned_guard_candidate
+    return
+  fi
+  if restore_control_ownership_owned && state_dir_exists "$RESTORE_CONTROL_LOCK"; then
+    $SUDO rm -f \
+      "$RESTORE_CONTROL_OWNERSHIP_FILE" \
+      "$RESTORE_CONTROL_OWNER_PID_FILE" \
+      "$RESTORE_CONTROL_OWNER_START_FINGERPRINT_FILE" \
+      "$RESTORE_CONTROL_CONTAINER_ID_FILE" \
+      "$RESTORE_CONTROL_COMPOSE_PROJECT_FILE" \
+      "$RESTORE_CONTROL_COMPOSE_SERVICE_FILE" \
+      "$RESTORE_CONTROL_DATA_IDENTITY_FILE" \
+      "$RESTORE_CONTROL_CONTAINER_SOURCE_FILE" \
+      "$RESTORE_CONTROL_CONTAINER_IMAGE_FILE" \
+      "$RESTORE_CONTROL_CONTAINER_WAS_RUNNING_FILE" \
+      "$RESTORE_CONTROL_NETWORKS_FILE" || return 1
+    $SUDO rmdir "$RESTORE_CONTROL_LOCK" || return 1
+  fi
+  release_restore_control_guard
+}
+
 remove_restore_control_contents() {
   $SUDO rm -f \
     "$RESTORE_VALIDATED_SNAPSHOT" \
+    "$RESTORE_VALIDATED_MANIFEST" \
+    "$RESTORE_CONTROL_OWNERSHIP_FILE" \
     "$RESTORE_CONTROL_ARMED_MARKER" \
     "$RESTORE_CONTROL_SIDECARS_CLEAN_MARKER" \
     "$RESTORE_CONTROL_UPGRADE_MARKER_CLEAN_MARKER" \
@@ -1508,7 +1893,9 @@ release_public_restore_lock() {
 release_restore_lock() {
   release_public_restore_lock || return 1
   release_restore_control || return 1
-  clear_restore_control_handoff
+  release_restore_control_guard || return 1
+  clear_restore_control_handoff || return 1
+  CONTROL_PHASE="complete"
 }
 
 db_was_replaced() {
@@ -1814,6 +2201,31 @@ cleanup_restore() {
   _keep_lock=0
   _post_replace=0
 
+  if [ -n "$VALIDATOR_CONTAINER_ID" ]; then
+    if ! validator_cleanup_container; then
+      echo "❌ EXIT 收尾无法清理快照校验容器：$VALIDATOR_CONTAINER_ID" >&2
+      [ "$_exit_rc" -ne 0 ] || _exit_rc=1
+    fi
+  fi
+
+  if [ "$CONTROL_PHASE" = "acquiring" ]; then
+    cleanup_control_acquisition || {
+      echo "❌ control acquisition 收尾不完整；guard/现场已按所有权证据保留。" >&2
+      [ "$_exit_rc" -ne 0 ] || _exit_rc=1
+    }
+    if [ -n "$READY_BODY_TMP" ]; then
+      rm -f -- "$READY_BODY_TMP" 2>/dev/null || true
+      READY_BODY_TMP=""
+    fi
+    exit "$_exit_rc"
+  fi
+  if [ "$CONTROL_PHASE" != "active" ] || ! restore_control_guard_owned; then
+    remove_owned_guard_candidate || true
+    [ "$_exit_rc" -ne 0 ] || _exit_rc=1
+    echo "❌ restore control guard 所有权缺失或漂移；拒绝执行常规 cleanup。" >&2
+    exit "$_exit_rc"
+  fi
+
   if db_was_replaced; then
     _post_replace=1
     if ! clean_replaced_sidecars; then
@@ -1896,7 +2308,9 @@ cleanup_restore() {
 
   if [ "$_keep_lock" = "0" ]; then
     if [ "$_post_replace" = "0" ]; then
-      if ! release_public_restore_lock || ! discard_unreplaced_restore_control confirmed-unreplaced; then
+      if ! release_public_restore_lock || \
+         ! discard_unreplaced_restore_control confirmed-unreplaced || \
+         ! release_restore_control_guard; then
         _keep_lock=1
         [ "$_exit_rc" -ne 0 ] || _exit_rc=1
       fi
@@ -1917,7 +2331,23 @@ RESTORE_OWNER_START_FINGERPRINT=$(process_start_fingerprint "$$") || {
   exit 1
 }
 
-if ! $SUDO mkdir "$RESTORE_CONTROL_LOCK"; then
+RESTORE_CONTROL_GUARD_VALUE="v1 $$ $RESTORE_OWNER_START_FINGERPRINT"
+if state_path_exists "$RESTORE_CONTROL_GUARD" || state_symlink_exists "$RESTORE_CONTROL_GUARD" || \
+   state_path_exists "$RESTORE_CONTROL_GUARD_CANDIDATE" || state_symlink_exists "$RESTORE_CONTROL_GUARD_CANDIDATE"; then
+  echo "🛑 已存在未知 restore control guard/candidate，拒绝覆盖。" >&2
+  exit 4
+fi
+
+CONTROL_PHASE="acquiring"
+trap cleanup_restore EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+if ! create_restore_control_guard; then
+  echo "❌ 无法原子取得 restore control guard；恢复已中止。" >&2
+  exit 1
+fi
+if ! create_restore_control_directory; then
   if state_path_exists "$RESTORE_CONTROL_LOCK" || state_file_exists "$RESTORE_CONTROL_ACCEPTED_HANDOFF"; then
     echo "🛑 已有另一个 restore 或上次异常中断的 host-only 控制锁：$RESTORE_CONTROL_LOCK" >&2
     exit 4
@@ -1925,9 +2355,6 @@ if ! $SUDO mkdir "$RESTORE_CONTROL_LOCK"; then
   echo "❌ 无法创建 host-only restore 控制锁：$RESTORE_CONTROL_LOCK" >&2
   exit 1
 fi
-trap cleanup_restore EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
 # host-only control 必须先于 stop/任何 public 路径取得，且始终是唯一授权状态。DATA_DIR 仍由 app
 # uid1000 写入，故其中的 public 子目录即使 root-owned 也能被父目录 owner rename；app 未确认停止前
 # 绝不创建或写该目录。control 与后续停机期 public stage 都保持创建者所有、0700，不 chown 给 caller。
@@ -1972,10 +2399,20 @@ capture_container_networks || {
   echo "❌ 无法固化 app 容器网络身份；恢复已中止。" >&2
   exit 1
 }
+CONTROL_PHASE="active"
 
 echo "→ 固化恢复源到 app 不可见的 host-only 预校验副本（0600）：$RESTORE_VALIDATED_SNAPSHOT"
 if ! $SUDO install -m 600 "$SNAPSHOT_ABS" "$RESTORE_VALIDATED_SNAPSHOT"; then
   echo "❌ 无法复制恢复源到 host-only 预校验副本；app 未停、当前数据库未改动。" >&2
+  exit 1
+fi
+if ! $SUDO install -m 600 "$SNAPSHOT_MANIFEST_ABS" "$RESTORE_VALIDATED_MANIFEST"; then
+  echo "❌ 无法复制恢复源 manifest 到 host-only 预校验副本；app 未停、当前数据库未改动。" >&2
+  exit 1
+fi
+
+if ! verify_backup_manifest_pair "$RESTORE_VALIDATED_SNAPSHOT" "$RESTORE_VALIDATED_MANIFEST" "$(basename "$SNAPSHOT_ABS")" >/dev/null; then
+  echo "❌ host-only 快照/manifest pair 在复制后不一致；拒绝继续恢复。" >&2
   exit 1
 fi
 
@@ -2003,10 +2440,12 @@ echo "→ 校验快照完整性（PRAGMA quick_check + header 1/1 单文件格�
 #    数据却静默少了一截。本轮实测复现：源库 150 行（100 行已 checkpoint + 50 行只在 WAL 里），
 #    裸 cp 主文件 → quick_check=ok 但只有 100 行；VACUUM INTO 产物 → 150 行。
 #
-#    判据用**文件头 offset 18-19**（两个字节：file format write/read version），不是 PRAGMA：
-#      · 1/1 (0101) = 已知安全的 journal 单文件格式（VACUUM INTO 的产物）→ 接受
+#    格式判据用**文件头 offset 18-19**（两个字节：file format write/read version），不是 PRAGMA：
+#      · 1/1 (0101) = 本恢复器允许的 rollback-journal 格式形态；只有先通过受控 manifest pair 才接受
 #      · 2/2 (0202) = WAL 模式 → 主文件**可能**不自足，配套 -wal 才是完整状态 → 拒绝
-#      · 其他未知/混合值没有经过安全证明 → 一律 fail-closed 拒绝；不能把“不是 2”误当成安全
+#      · 其他未知/混合值不在允许格式集合 → 一律 fail-closed 拒绝；不能把“不是 2”误当成安全
+#    1/1 本身不证明生成方法或单文件一致性；hot rollback-journal 裸拷也可能是 1/1 + quick_check=ok。
+#    来源/字节绑定由前面的 manifest gate 提供，结构完整性由 quick_check 提供，三者不能互相替代。
 #    ⚠️ 实测澄清（codex 建议用 `PRAGMA journal_mode` 判，本轮验证后改用文件头）：immutable=1 打开时
 #       `PRAGMA journal_mode` 对两种快照**都返回 delete**（immutable 让 SQLite 完全绕开 WAL 机制、
 #       报的是"当前连接的有效模式"而非文件真实形态）——照 PRAGMA 判会全部放行，等于没修。文件头
@@ -2023,7 +2462,8 @@ echo "→ 校验快照完整性（PRAGMA quick_check + header 1/1 单文件格�
 node_with_snapshot "$RESTORE_VALIDATED_SNAPSHOT" '
   const fs = require("fs")
   const { DatabaseSync } = require("node:sqlite")
-  // 先看文件头：offset 18/19 = write/read format version。仅 1/1 是本恢复器已知安全的单文件形态。
+  // 先看文件头：offset 18/19 = write/read format version。这里只做格式 allowlist；
+  // 1/1 不是 VACUUM provenance，来源与字节绑定已由前面的 manifest pair gate 独立验证。
   const fd = fs.openSync("/snap.db", "r")
   const hdr = Buffer.alloc(20)
   try {
@@ -2052,18 +2492,18 @@ node_with_snapshot "$RESTORE_VALIDATED_SNAPSHOT" '
 ❌ 快照是 WAL 模式的主文件，拒绝使用：${SNAPSHOT}
    WAL 库的已提交数据可能只在配套的 -wal 文件里，单独还原这个主文件会**静默丢数据**
    （结构完好、quick_check 通过、readiness 也过，但内容少一截）。
-   请改用 VACUUM INTO 产出的一致性快照——data/backups/backup-*.db 就是（scripts/backup.ts
-   与 worker 每日备份的产物）。若手里只有这个 WAL 库，先在**它自己的**机器上转成一致性快照：
-     docker compose run --rm --no-deps -T --entrypoint node app -e \\
-       'const {DatabaseSync}=require("node:sqlite");const d=new DatabaseSync("<该库路径>");d.exec("VACUUM INTO \"<输出路径>\"");d.close()'
+   请从源库重新走本项目受控 VACUUM INTO 备份发布链，取得同目录的 payload + manifest pair；
+   data/backups/backup-*.db 与相邻 manifest 才是支持的恢复输入。只有孤立 WAL 主文件时，
+   在找回其原始 source/WAL 环境并由受控备份链重新产出 pair 前，不得恢复或手工补 manifest。
    注：干净关闭的 WAL 库其实内容完整，但磁盘上与「活动库裸 cp」无法区分，故一并拒绝（宁可误拒）。
 EOF
     echo "   已中止，${DB} 未被改动，app 也未停。" >&2
     exit 1
   fi
   if [ "$_vrc" = "3" ]; then
-    echo "❌ 快照 header bytes 18/19 不是已知安全的 1/1，拒绝使用：${SNAPSHOT}" >&2
-    echo "   本恢复器只接受 VACUUM INTO 产出的 1/1 journal 单文件格式；未知或混合值一律 fail-closed。" >&2
+    echo "❌ 快照 header bytes 18/19 不在允许的 1/1 格式集合，拒绝使用：${SNAPSHOT}" >&2
+    echo "   本恢复器要求受控 manifest pair + 1/1 格式 + quick_check；1/1 本身不证明 VACUUM INTO 来源。" >&2
+    echo "   未知或混合 header 值一律 fail-closed。" >&2
     echo "   已中止，${DB} 未被改动，app 也未停。" >&2
     exit 1
   fi
@@ -2103,6 +2543,10 @@ if ! $SUDO install -m 600 "$RESTORE_VALIDATED_SNAPSHOT" "$RESTORE_STAGE"; then
 fi
 if ! $SUDO cmp -s "$RESTORE_VALIDATED_SNAPSHOT" "$RESTORE_STAGE"; then
   echo "❌ replace stage 与 host-only 已校验副本不一致；拒绝替换数据库。" >&2
+  exit 1
+fi
+if ! verify_backup_manifest_pair "$RESTORE_STAGE" "$RESTORE_VALIDATED_MANIFEST" "$(basename "$SNAPSHOT_ABS")" >/dev/null; then
+  echo "❌ replace stage 与受控 manifest 的文件名/大小/SHA-256 不匹配；当前数据库未改动。" >&2
   exit 1
 fi
 node_with_snapshot "$RESTORE_STAGE" '
@@ -2166,7 +2610,17 @@ if [ -f "$DB" ]; then
   }
   # Node 片段已先设 umask 077；宿主再 chmod 一次作纵深防御。
   $SUDO chmod 600 "$PRE_RESTORE_TMP"
+  # manifest 是 pair 的提交标志：先撤下旧提交标志，再发布新 DB payload，最后生成新 manifest。
+  $SUDO rm -f "$PRE_RESTORE_MANIFEST"
   $SUDO mv -- "$PRE_RESTORE_TMP" "$PRE_RESTORE"   # 就位（同目录 mv 原子）
+  if ! write_backup_manifest_host "$PRE_RESTORE" "$PRE_RESTORE_MANIFEST" "pre-restore.db"; then
+    echo "❌ 现场留存数据库已生成，但 manifest 发布失败；拒绝继续换库。" >&2
+    exit 1
+  fi
+  verify_backup_manifest_pair "$PRE_RESTORE" "$PRE_RESTORE_MANIFEST" "pre-restore.db" >/dev/null || {
+    echo "❌ 现场留存 pair 二次校验失败；拒绝继续换库。" >&2
+    exit 1
+  }
 else
   echo "→ 当前无 ${DB}，跳过现场留存"
 fi
@@ -2324,11 +2778,9 @@ while :; do
         exit 1
       fi
       verify_restore_identity "控制锁释放前" || exit 1
-      if ! release_restore_control; then
-        RELEASE_FAILED=1
-        exit 1
-      fi
-      if ! clear_restore_control_handoff; then
+      # release_restore_control 先把 accepted 原子交接到 handoff；随后释放 guard，
+      # 最后才删 handoff。若 guard 释放失败，published 证据仍在，EXIT cleanup 不会反向停掉已验收实例。
+      if ! release_restore_lock; then
         RELEASE_FAILED=1
         exit 1
       fi

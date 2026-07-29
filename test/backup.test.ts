@@ -7,6 +7,13 @@ import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { spawn } from 'node:child_process'
 import { backupDb } from '../lib/backup.ts'
+import {
+  BACKUP_MANIFEST_METHOD,
+  BACKUP_MANIFEST_VERSION,
+  backupManifestPath,
+  readBackupManifest,
+  verifyBackupPair,
+} from '../lib/backup-manifest.ts'
 
 // ⚠️ 测试库隔离（红线）：全程临时目录。backupDb 收显式路径，
 // 不 import lib/db.ts、不碰 DB_PATH，绝不读写真实 data/app.db。
@@ -305,6 +312,52 @@ test('原子发布：产物权限 0600（chmod 在 rename 之前）', () => {
   src.close()
   const p = backupDb(dbPath, path.join(dir, 'backups'), 3)
   assert.equal(fs.statSync(p).mode & 0o777, 0o600)
+  assert.equal(fs.statSync(backupManifestPath(p)).mode & 0o777, 0o600)
+})
+
+test('manifest v1：受控 VACUUM 产物绑定方法、文件名、大小与 SHA-256', () => {
+  const dir = fs.mkdtempSync(path.join(tmpDir, 'manifest-contract-'))
+  const { src, dbPath } = makeWalDb(dir, 10)
+  const snapshot = backupDb(dbPath, path.join(dir, 'backups'), 3)
+  src.close()
+
+  const manifest = verifyBackupPair(snapshot)
+  assert.equal(manifest.version, BACKUP_MANIFEST_VERSION)
+  assert.equal(manifest.method, BACKUP_MANIFEST_METHOD)
+  assert.equal(manifest.name, path.basename(snapshot))
+  assert.equal(manifest.size, fs.statSync(snapshot).size)
+  assert.match(manifest.sha256, /^[0-9a-f]{64}$/)
+  assert.deepEqual(readBackupManifest(backupManifestPath(snapshot)), manifest)
+})
+
+test('manifest fail-closed：缺失或过期 digest 的 pair 不进入有效备份集合', async () => {
+  const { latestBackupDay } = await import('../lib/backup.ts')
+  const dir = fs.mkdtempSync(path.join(tmpDir, 'manifest-invalid-'))
+  const { src, dbPath } = makeWalDb(dir, 10)
+  src.close()
+  const backupsDir = path.join(dir, 'backups')
+  const missing = backupDb(dbPath, backupsDir, 3, new Date('2026-07-26T09:00:00'))
+  fs.rmSync(backupManifestPath(missing))
+  assert.equal(latestBackupDay(backupsDir), null)
+
+  const stale = backupDb(dbPath, backupsDir, 3, new Date('2026-07-27T09:00:00'))
+  fs.appendFileSync(stale, 'tampered')
+  assert.equal(latestBackupDay(backupsDir), null)
+})
+
+test('retention：只按完整 pair 轮转，删除时 manifest 与数据库一起消失', async () => {
+  const dir = fs.mkdtempSync(path.join(tmpDir, 'manifest-retention-'))
+  const { src, dbPath } = makeWalDb(dir, 2)
+  src.close()
+  const backupsDir = path.join(dir, 'backups')
+  const first = backupDb(dbPath, backupsDir, 1, new Date('2026-07-26T09:00:00'))
+  const firstManifest = backupManifestPath(first)
+  await sleep(10)
+  const second = backupDb(dbPath, backupsDir, 1, new Date('2026-07-27T09:00:00'))
+  assert.equal(fs.existsSync(first), false)
+  assert.equal(fs.existsSync(firstManifest), false)
+  assert.equal(fs.existsSync(second), true)
+  assert.equal(fs.existsSync(backupManifestPath(second)), true)
 })
 
 // ============================================================================

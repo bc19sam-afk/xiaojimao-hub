@@ -2,6 +2,15 @@ import { DatabaseSync } from 'node:sqlite'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
+import {
+  BACKUP_MANIFEST_METHOD,
+  BACKUP_MANIFEST_VERSION,
+  type BackupManifest,
+  backupManifestPath,
+  isCompleteBackupPair,
+  sha256File,
+  verifyBackupPair,
+} from './backup-manifest.ts'
 
 // ============================================================================
 // WAL 安全一致性备份（P0-B-3）
@@ -13,6 +22,75 @@ import path from 'node:path'
 
 const BACKUP_RE = /^backup-.*\.db$/
 const DEFAULT_BACKUP_KEEP = 7
+
+function assertSafeManifestName(name: string): void {
+  if (!/^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(name) || name === '.' || name === '..') {
+    throw new Error(`备份文件名异常：${JSON.stringify(name)}`)
+  }
+}
+
+function writeControlledBackupManifest(
+  snapshotPath: string,
+  manifestPath: string,
+  name: string,
+): BackupManifest {
+  assertSafeManifestName(name)
+  const snapshotStat = fs.lstatSync(snapshotPath)
+  if (!snapshotStat.isFile() || snapshotStat.isSymbolicLink() || (snapshotStat.mode & 0o777) !== 0o600) {
+    throw new Error(`快照必须是 0600 regular file：${snapshotPath}`)
+  }
+  const manifest: BackupManifest = {
+    version: BACKUP_MANIFEST_VERSION,
+    method: BACKUP_MANIFEST_METHOD,
+    name,
+    size: snapshotStat.size,
+    sha256: sha256File(snapshotPath),
+  }
+  const payload = `${JSON.stringify(manifest)}\n`
+  const fd = fs.openSync(manifestPath, 'wx', 0o600)
+  const created = fs.fstatSync(fd)
+  let failure: unknown
+  try {
+    fs.writeFileSync(fd, payload, { encoding: 'utf8' })
+    fs.fchmodSync(fd, 0o600)
+  } catch (error) {
+    failure = error
+  }
+  try {
+    fs.closeSync(fd)
+  } catch (error) {
+    failure ??= error
+  }
+  if (failure !== undefined) {
+    try {
+      const current = fs.lstatSync(manifestPath)
+      if (current.dev === created.dev && current.ino === created.ino) fs.unlinkSync(manifestPath)
+    } catch (cleanupError) {
+      if ((cleanupError as NodeJS.ErrnoException).code !== 'ENOENT') {
+        throw new AggregateError([failure, cleanupError], `manifest 写入失败且无法清理：${manifestPath}`)
+      }
+    }
+    throw failure
+  }
+  return manifest
+}
+
+function lstatIfExists(filePath: string): fs.Stats | null {
+  try {
+    return fs.lstatSync(filePath)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
+    throw error
+  }
+}
+
+function removeOwnedFile(filePath: string, owned: fs.Stats): void {
+  const current = fs.lstatSync(filePath)
+  if (current.dev !== owned.dev || current.ino !== owned.ino) {
+    throw new Error(`pin rollback 拒绝删除所有权已漂移的文件：${filePath}`)
+  }
+  fs.unlinkSync(filePath)
+}
 
 // 手动备份与 worker 自动备份共用同一严格解析器。仅“未配置/空字符串”使用默认 7；任何非空脏值
 // 都必须在 VACUUM、发布锁与轮转之前失败，绝不能 parseInt 截断或静默回退后删除既有备份。
@@ -48,7 +126,7 @@ export function parseBackupKeep(raw: string | undefined): number {
 const LOCK_FILE = '.backup.lock'
 const LOCK_TIMEOUT_MS = 10_000
 
-function withPublishLock<T>(backupDir: string, fn: () => T): T {
+export function withBackupPublishLock<T>(backupDir: string, fn: () => T): T {
   const lock = new DatabaseSync(path.resolve(backupDir, LOCK_FILE))
   try {
     lock.exec(`PRAGMA busy_timeout = ${LOCK_TIMEOUT_MS}`)
@@ -64,6 +142,73 @@ function withPublishLock<T>(backupDir: string, fn: () => T): T {
   } finally {
     lock.close() // 事务未提交时 close 即回滚并释放锁；进程被杀则由内核释放
   }
+}
+
+export function pinBackupPair(sourcePath: string, targetPath: string): void {
+  const source = path.resolve(sourcePath)
+  const target = path.resolve(targetPath)
+  if (source === target || path.dirname(source) !== path.dirname(target)) {
+    throw new Error('pin 只允许同一备份目录内的 pair 改名')
+  }
+  const sourceManifest = backupManifestPath(source)
+  const targetManifest = backupManifestPath(target)
+
+  withBackupPublishLock(path.dirname(source), () => {
+    const sourcePair = verifyBackupPair(source, sourceManifest, path.basename(source))
+    if (lstatIfExists(target) || lstatIfExists(targetManifest)) {
+      throw new Error(`pin 目标已存在：${target}`)
+    }
+
+    let targetPayloadOwned: fs.Stats | null = null
+    let targetManifestOwned: fs.Stats | null = null
+    let sourcePayloadRemoved = false
+    try {
+      // A hard link gives pin an atomic no-clobber payload move in this same-directory contract.
+      fs.linkSync(source, target)
+      targetPayloadOwned = fs.lstatSync(target)
+      fs.unlinkSync(source)
+      sourcePayloadRemoved = true
+
+      writeControlledBackupManifest(target, targetManifest, path.basename(target))
+      targetManifestOwned = fs.lstatSync(targetManifest)
+      const targetPair = verifyBackupPair(target, targetManifest, path.basename(target))
+      if (targetPair.sha256 !== sourcePair.sha256 || targetPair.size !== sourcePair.size) {
+        throw new Error('pin 后 pair digest/size 漂移')
+      }
+      fs.rmSync(sourceManifest)
+    } catch (error) {
+      const rollbackErrors: unknown[] = []
+      if (sourcePayloadRemoved && targetPayloadOwned) {
+        try {
+          const current = fs.lstatSync(target)
+          if (current.dev !== targetPayloadOwned.dev || current.ino !== targetPayloadOwned.ino) {
+            throw new Error(`pin rollback 无法从所有权已漂移的 target 恢复 source：${target}`)
+          }
+          fs.linkSync(target, source)
+        } catch (rollbackError) {
+          rollbackErrors.push(rollbackError)
+        }
+      }
+      if (targetManifestOwned) {
+        try {
+          removeOwnedFile(targetManifest, targetManifestOwned)
+        } catch (rollbackError) {
+          rollbackErrors.push(rollbackError)
+        }
+      }
+      if (targetPayloadOwned) {
+        try {
+          removeOwnedFile(target, targetPayloadOwned)
+        } catch (rollbackError) {
+          rollbackErrors.push(rollbackError)
+        }
+      }
+      if (rollbackErrors.length > 0) {
+        throw new AggregateError([error, ...rollbackErrors], 'pin 失败且未能完整恢复 source pair')
+      }
+      throw error
+    }
+  })
 }
 
 // 备份 dbPath 到 backupDir/backup-<时间戳到秒>-<随机>.db（权限 0600），
@@ -94,6 +239,8 @@ export function backupDb(dbPath: string, backupDir: string, keep: number, now: D
   //    ⚠️ 本实现没有对 tmp、最终文件或目录执行 fsync；不承诺宿主掉电后 tmp/最终名/缺失状态或落盘
   //    顺序。rename 的保证仅限进程可见 namespace，不是断电持久性协议。
   const tmp = path.resolve(backupDir, `.tmp-backup-${ts}-${rand}.db`)
+  const manifest = backupManifestPath(target)
+  const manifestTmp = path.resolve(backupDir, `.tmp-backup-${ts}-${rand}.db.manifest.json`)
 
   // 🔴 不变量 B（P6-R2 R7-P2⑤，codex R6 指出）：`tmp` 一旦落盘，**此后任何**失败路径都必须清掉它。
   //
@@ -111,6 +258,8 @@ export function backupDb(dbPath: string, backupDir: string, keep: number, now: D
   //       先创建 0600 空文件；后续 chmod 只是发布前纵深防御，不增加宿主掉电持久性保证。
   //       遗留文件由运维手动删；故意不自动清扫同目录 .tmp-*（会误删并发进程正在写的文件）。
   let tmpOwned = false
+  let manifestTmpOwned = false
+  let pairPublished = false
   try {
     // SQLite 允许 VACUUM INTO 写入“已存在但为空”的文件。先用 wx+0600 创建，既避免进程级 umask
     // 的全局副作用，也保证 SIGKILL 落在任意写入时刻，磁盘上的临时全库从第一字节起就不宽于 0600。
@@ -126,12 +275,19 @@ export function backupDb(dbPath: string, backupDir: string, keep: number, now: D
       src.close()
     }
     fs.chmodSync(tmp, 0o600) // 先收权限再改名：发布出去的那一刻权限已经是 0600，没有 0644 的窗口
+    writeControlledBackupManifest(tmp, manifestTmp, path.basename(target))
+    manifestTmpOwned = true
 
-    // 🔴 发布 + 轮转必须在同一把跨进程锁内（见上面 withPublishLock）：rename 与「按 mtime 留 keep-1」
+    // 🔴 发布 + 轮转必须在同一把跨进程锁内（见上面 withBackupPublishLock）：rename 与「按 mtime 留 keep-1」
     //    之间若被另一个进程插进来发布，两边的 readdir 都看不到对方那份，就会各自把对方删掉。
     //    锁内先 rename 再 readdir，保证「读到的目录内容」与「自己已发布」是同一个瞬间的视图。
-    withPublishLock(backupDir, () => {
+    withBackupPublishLock(backupDir, () => {
       fs.renameSync(tmp, target)
+      tmpOwned = false
+      // manifest 是 pair 的提交标志：只有快照已完整 rename 到最终名后才发布它。
+      fs.renameSync(manifestTmp, manifest)
+      manifestTmpOwned = false
+      pairPublished = true
 
       // 保留策略：刚产出的这份必留，其余按 mtime 新→旧排序再留 keep-1 份，更旧的删掉
       const others = fs
@@ -139,12 +295,23 @@ export function backupDb(dbPath: string, backupDir: string, keep: number, now: D
         .filter((f) => BACKUP_RE.test(f))
         .map((f) => path.resolve(backupDir, f))
         .filter((p) => p !== target)
+        .filter((p) => isCompleteBackupPair(p))
         .map((p) => ({ p, mtime: fs.statSync(p).mtimeMs }))
         .sort((a, b) => b.mtime - a.mtime)
-      for (const old of others.slice(keep - 1)) fs.rmSync(old.p, { force: true })
+      for (const old of others.slice(keep - 1)) {
+        // 删除顺序与发布相反：先移除 manifest 提交标志，再删数据库 payload。
+        fs.rmSync(backupManifestPath(old.p), { force: true })
+        fs.rmSync(old.p, { force: true })
+      }
     })
   } catch (err) {
-    if (tmpOwned) fs.rmSync(tmp, { force: true }) // 只清本进程创建的 tmp；随机名碰撞时不能删别人的文件
+    if (!pairPublished) {
+      if (manifestTmpOwned) fs.rmSync(manifestTmp, { force: true })
+      if (tmpOwned) fs.rmSync(tmp, { force: true }) // 只清本进程创建的 tmp；随机名碰撞时不能删别人的文件
+      // 数据库 rename 成功但 manifest 尚未提交时，最终名不是可恢复 pair，正常失败路径把它收回。
+      fs.rmSync(manifest, { force: true })
+      fs.rmSync(target, { force: true })
+    }
     throw err
   }
 
@@ -199,7 +366,10 @@ export function latestBackupDay(dir: string): string | null {
   let latest: string | null = null
   for (const f of files) {
     const day = backupLocalDay(f)
-    if (day !== null && (latest === null || day > latest)) latest = day // 'YYYY-MM-DD' 定长，字典序即日序
+    if (day === null) continue
+    const snapshot = path.resolve(dir, f)
+    if (!isCompleteBackupPair(snapshot)) continue
+    if (latest === null || day > latest) latest = day // 'YYYY-MM-DD' 定长，字典序即日序
   }
   return latest
 }
@@ -211,7 +381,7 @@ function hasBackupOnLocalDay(dir: string, day: string): boolean {
   } catch {
     return false
   }
-  return files.some((f) => backupLocalDay(f) === day)
+  return files.some((f) => backupLocalDay(f) === day && isCompleteBackupPair(path.resolve(dir, f)))
 }
 
 // 当天（now 所在的服务器本地自然日）若尚无备份 → 备一份并返回 true；已有则跳过返回 false。

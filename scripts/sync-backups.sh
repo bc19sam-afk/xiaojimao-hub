@@ -2,7 +2,7 @@
 # =============================================================================
 # 异机备份同步（P6-R2，见 docs/deploy.md §5.3）
 #
-# 把宿主 data/backups/ 整目录 rsync 到远端。**宿主侧运行**，容器内不做 ssh
+# 把宿主 data/backups/ 中受控备份 pair rsync 到远端。**宿主侧运行**，容器内不做 ssh
 # （容器不该持有远端私钥；镜像也没装 rsync/ssh）。
 #
 # 用法：
@@ -31,18 +31,71 @@ if [ ! -d "$BACKUP_DIR" ]; then
 fi
 
 command -v rsync >/dev/null 2>&1 || { echo "❌ 未找到 rsync，请先安装" >&2; exit 1; }
+command -v node >/dev/null 2>&1 || { echo "❌ 未找到 node，无法验证备份 manifest" >&2; exit 1; }
 
-# -a 保权限属主时间戳（备份文件是 0600，别在传输中放宽）；-z 压缩；
-# --partial-dir=.rsync-partial：断点续传时，未完成文件落在隐藏子目录 .rsync-partial/ 下，
-# 传输完成后才原子移到最终名 backup-*.db（P6-R2 R4③）。旧行为 --partial 会把半截文件直接留在
-# 最终名下 → rsync 中断时异机目录里躺着「看起来像备份的残缺库」→ 恢复时误选风险。
-# 结尾斜杠：同步**目录内容**到远端目录下。含 preupgrade.db / pre-restore.db（钉住的回滚点，一并异机保存）。
-#
-# --exclude '.tmp-*'：`lib/backup.ts` 的原子发布会先写 `.tmp-backup-*.db`，正常路径下写完即 rename，
-# 但**硬杀/断电**会留下残缺的临时文件（见 backup.ts 顶部说明）。rsync 默认**不跳过隐藏文件**，
-# 会把这种半截库同步到异机。它在远端不消费任何判据（远端不跑轮转/latestBackupDay），纯占空间，
-# 但异机目录里躺着「看起来像备份的残缺库」本身就是恢复时的误选风险，故排除。
-# 也顺带避开「正在写的那一份」——同步与备份撞车时传半截文件毫无意义。
-echo "→ 同步 $BACKUP_DIR/ → $REMOTE"
-rsync -az --partial-dir=.rsync-partial --exclude '.tmp-*' "$BACKUP_DIR/" "$REMOTE"
-echo "✅ 同步完成（未启用 --delete：远端只增不减，清理策略见 docs/deploy.md §5.3）"
+# 先把可枚举的受控 pair 固化到私有临时目录，再复核副本。这样本地 BACKUP_KEEP
+# 正好在同步期间轮转删除/替换源文件，也不会让远端得到 payload/manifest 跨世代组合。
+# 枚举范围只含本项目生成的 backup-*.db 及两个钉住回滚点；.tmp-* 和任意裸 .db 不进入传输集。
+BACKUP_DIR=$(cd "$BACKUP_DIR" && pwd -P)
+STAGE=$(mktemp -d "${TMPDIR:-/tmp}/xjm-backup-sync.XXXXXX")
+chmod 700 "$STAGE"
+PAYLOAD_LIST="$STAGE/.payloads"
+MANIFEST_LIST="$STAGE/.manifests"
+: > "$PAYLOAD_LIST"
+: > "$MANIFEST_LIST"
+chmod 600 "$PAYLOAD_LIST" "$MANIFEST_LIST"
+cleanup() {
+  rm -rf "$STAGE"
+}
+trap cleanup EXIT
+trap 'cleanup; exit 130' HUP INT TERM
+
+PAIR_COUNT=0
+stage_pair() {
+  snapshot=$1
+  name=${snapshot##*/}
+  manifest="${snapshot}.manifest.json"
+  if ! node scripts/backup-manifest.ts verify "$snapshot" "$manifest" "$name" >/dev/null; then
+    echo "❌ 备份 pair 不完整、非常规文件或 digest/manifest 已漂移：$snapshot" >&2
+    exit 1
+  fi
+  cp "$snapshot" "$STAGE/$name"
+  cp "$manifest" "$STAGE/$name.manifest.json"
+  chmod 600 "$STAGE/$name" "$STAGE/$name.manifest.json"
+  if ! node scripts/backup-manifest.ts verify "$STAGE/$name" "$STAGE/$name.manifest.json" "$name" >/dev/null; then
+    echo "❌ 备份 pair 固化期间发生并发漂移：$snapshot" >&2
+    exit 1
+  fi
+  printf '%s\n' "$name" >> "$PAYLOAD_LIST"
+  printf '%s\n' "$name.manifest.json" >> "$MANIFEST_LIST"
+  PAIR_COUNT=$((PAIR_COUNT + 1))
+}
+
+for snapshot in "$BACKUP_DIR"/backup-*.db "$BACKUP_DIR"/preupgrade.db "$BACKUP_DIR"/pre-restore.db; do
+  [ -e "$snapshot" ] || [ -L "$snapshot" ] || continue
+  stage_pair "$snapshot"
+done
+
+# manifest-only 是半发布或不完整删除；即使其他 pair 有效，也在联络远端前整体 fail closed。
+for manifest in "$BACKUP_DIR"/backup-*.db.manifest.json "$BACKUP_DIR"/preupgrade.db.manifest.json "$BACKUP_DIR"/pre-restore.db.manifest.json; do
+  [ -e "$manifest" ] || [ -L "$manifest" ] || continue
+  snapshot=${manifest%.manifest.json}
+  if [ ! -e "$snapshot" ] && [ ! -L "$snapshot" ]; then
+    echo "❌ 发现缺少 payload 的孤立 manifest：$manifest" >&2
+    exit 1
+  fi
+done
+
+if [ "$PAIR_COUNT" -eq 0 ]; then
+  echo "❌ 没有可同步的完整备份 pair：$BACKUP_DIR" >&2
+  exit 1
+fi
+
+# -a 保留固化副本的 0600 权限；-z 压缩。--partial-dir 使中断 payload 只留在隐藏目录。
+# pair 的远端提交顺序是 payload-first / manifest-last：第一阶段失败不会发布 manifest；
+# 第二阶段失败最多留下无 manifest 的 payload，restore 必须拒绝。不使用 --delete；远端保留清理
+# 也必须先删 manifest 提交标志，再删同名 payload。
+echo "→ 同步 $PAIR_COUNT 个备份 pair：$BACKUP_DIR/ → $REMOTE"
+rsync -az --partial-dir=.rsync-partial --files-from="$PAYLOAD_LIST" "$STAGE/" "$REMOTE"
+rsync -az --partial-dir=.rsync-partial --files-from="$MANIFEST_LIST" "$STAGE/" "$REMOTE"
+echo "✅ 同步完成（payload 先于 manifest；未启用 --delete）"
