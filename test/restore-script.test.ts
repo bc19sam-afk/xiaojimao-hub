@@ -876,11 +876,75 @@ if [ "$1" = "test" ] && [ "$2" = "-d" ]; then
     exit $?
   fi
 fi
+if [ "$1" = "find" ] && [ "$2" = "/proc" ]; then
+  case "$TEST_OWNER_PROC_MODE" in
+    denied) exit 13 ;;
+    dead)
+      printf '%s\\n' /proc/1
+      exit 0
+      ;;
+  esac
+  printf '%s\\n' /proc/1 "/proc/$TEST_OWNER_PID"
+  exit 0
+fi
 exec "$@"
 `,
     { mode: 0o755 },
   )
   return { sudoPath, probeLog }
+}
+
+function installDirectLinuxOwnerProbeBin(dir: string): { probeLog: string } {
+  const probeLog = path.join(dir, 'owner-direct-probe.log')
+  fs.writeFileSync(probeLog, '')
+  fs.writeFileSync(
+    path.join(dir, 'uname'),
+    '#!/bin/sh\nprintf \'%s\\n\' Linux\n',
+    { mode: 0o755 },
+  )
+  fs.writeFileSync(
+    path.join(dir, 'id'),
+    `#!/bin/sh
+case "$1" in
+  -u) printf '%s\\n' 2001 ;;
+  -g) printf '%s\\n' 2001 ;;
+  *) exec /usr/bin/id "$@" ;;
+esac
+`,
+    { mode: 0o755 },
+  )
+  fs.writeFileSync(
+    path.join(dir, 'cat'),
+    `#!/bin/sh
+printf 'cat %s\\n' "$*" >> "$TEST_OWNER_PROBE_LOG"
+if [ "$1" = "--" ]; then
+  case "$2" in
+    /proc/sys/kernel/random/boot_id)
+      printf '%s\\n' "$TEST_OWNER_BOOT_ID"
+      exit 0
+      ;;
+    /proc/*/stat)
+      exit 1
+      ;;
+  esac
+fi
+exec /bin/cat "$@"
+`,
+    { mode: 0o755 },
+  )
+  fs.writeFileSync(
+    path.join(dir, 'find'),
+    `#!/bin/sh
+printf 'find %s\\n' "$*" >> "$TEST_OWNER_PROBE_LOG"
+if [ "$1" = "/proc" ]; then
+  printf '%s\\n' /proc/1
+  exit 0
+fi
+exec /usr/bin/find "$@"
+`,
+    { mode: 0o755 },
+  )
+  return { probeLog }
 }
 
 function ownerResidualCase(
@@ -3643,6 +3707,31 @@ test('P6-R2 残锁 owner：Linux /proc 明确确认 PID 已不存在时按 stale
   assert.equal(afterState.containers[CONTAINER_A].running, false, '明确 dead owner 必须进入 stale containment')
   assert.deepEqual(afterState.containers[CONTAINER_A].networks, [])
   assert.ok(afterState.events.some((event) => event[0] === 'stop'))
+})
+
+test('P6-R2 残锁 owner：Linux 非 root 且 SUDO= 时，仅完整 /proc 枚举确认 PID 缺席才按 stale 收口', () => {
+  const ownerPid = '4247'
+  const c = ownerResidualCase(
+    'owner-definitely-dead-linux-direct-proc',
+    ownerPid,
+    linuxOwnerFingerprint('777777777'),
+  )
+  const { probeLog } = installDirectLinuxOwnerProbeBin(c.dockerBin)
+
+  const r = runStatefulRestore(c.dataDir, c.backupsDir, c.snap, c.dockerBin, c.stateFile, {
+    SUDO: '',
+    TEST_OWNER_PROBE_LOG: probeLog,
+    TEST_OWNER_BOOT_ID: OWNER_TEST_BOOT_ID,
+  })
+  const afterState = readDockerState(c.stateFile)
+  const probeCalls = fs.readFileSync(probeLog, 'utf8')
+
+  assert.equal(r.status, 4)
+  assert.equal(afterState.containers[CONTAINER_A].running, false, '明确 dead owner 必须进入 stale containment')
+  assert.deepEqual(afterState.containers[CONTAINER_A].networks, [])
+  assert.ok(afterState.events.some((event) => event[0] === 'stop'))
+  assert.match(probeCalls, new RegExp(`cat -- /proc/${ownerPid}/stat`))
+  assert.match(probeCalls, /find \/proc /, 'SUDO= 时仍必须通过严格 /proc 枚举确认目标 PID 缺席')
 })
 
 test('P6-R2 残锁自愈：replace 已完成且 sidecar/marker 已清但未启动时也先停并隔离 exact ID', () => {

@@ -790,6 +790,26 @@ read_linux_process_start_ticks() {
   printf '%s\n' "$_linux_ticks"
 }
 
+read_linux_process_presence() {
+  _linux_presence_pid="$1"
+  case "$_linux_presence_pid" in 0|*[!0-9]*|'') return 1 ;; esac
+  _linux_pid_paths=$($SUDO find /proc \
+    -mindepth 1 -maxdepth 1 -type d -name '[0-9]*' -print 2>/dev/null) || return 1
+  _linux_presence=$(printf '%s\n' "$_linux_pid_paths" | awk -v expected="/proc/$_linux_presence_pid" '
+    NF {
+      records++
+      if ($0 !~ /^\/proc\/[0-9]+$/) invalid = 1
+      if ($0 == "/proc/1") init++
+      if ($0 == expected) found++
+    }
+    END {
+      if (invalid || records == 0 || init != 1 || found > 1) exit 1
+      print (found == 1 ? "present" : "absent")
+    }
+  ') || return 1
+  printf '%s\n' "$_linux_presence"
+}
+
 read_darwin_process_identity() {
   _darwin_pid="$1"
   case "$_darwin_pid" in 0|*[!0-9]*|'') return 1 ;; esac
@@ -995,16 +1015,22 @@ classify_early_restore_owner() {
         return 0
       fi
 
-      # stat 读取失败不能直接等价为 ESRCH：hidepid/权限拒绝同样会失败。只有 root 或显式
-      # $SUDO 已能读取 boot_id，且同一提权路径确认 /proc 可遍历、目标 PID 目录确实不存在时，
-      # 才能把 owner 判为 definitely stale；其余一律 unknown，绝不 containment。
-      if { [ "$CALLER_UID" = "0" ] || [ -n "$SUDO" ]; } && \
-         $SUDO test -d /proc 2>/dev/null && \
-         ! $SUDO test -d "/proc/$_owner_pid" 2>/dev/null; then
-        EARLY_OWNER_STATE="stale"
-        EARLY_OWNER_DETAIL="提权后的 /proc 明确确认 owner PID 已不存在"
+      # stat 读取失败不能直接等价为 ESRCH：hidepid/权限拒绝同样会失败。沿同一 $SUDO/直接读取
+      # 通道严格枚举一层 /proc PID 目录，且要求稳定的 PID 1 恰好出现一次；只有完整枚举成功、
+      # 目标 PID 明确缺席时才算 definitely stale。枚举失败、PID 仍出现或格式异常一律 unknown。
+      if _linux_presence=$(read_linux_process_presence "$_owner_pid"); then
+        case "$_linux_presence" in
+          absent)
+            EARLY_OWNER_STATE="stale"
+            EARLY_OWNER_DETAIL="完整 /proc PID 枚举明确确认 owner 已不存在"
+            ;;
+          present)
+            EARLY_OWNER_DETAIL="owner PID 仍存在，但 /proc stat 无法读取或权限不足"
+            ;;
+          *) EARLY_OWNER_DETAIL="Linux /proc PID 枚举格式异常，无法确认 owner" ;;
+        esac
       else
-        EARLY_OWNER_DETAIL="owner PID 可能存在，但 /proc stat 无法读取或权限不足"
+        EARLY_OWNER_DETAIL="Linux /proc PID 枚举失败或权限不足，无法确认 owner"
       fi
       ;;
     darwin-ps)
