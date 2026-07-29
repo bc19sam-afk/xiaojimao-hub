@@ -985,6 +985,27 @@ exec "$@"
   return { sudoPath, probeLog }
 }
 
+function verifiedDeadOwnerRetryEnv(root: string, control: string): NodeJS.ProcessEnv {
+  if (process.platform !== 'linux') return {}
+
+  const ownerPid = fs.readFileSync(path.join(control, 'owner-pid'), 'utf8').trim()
+  const fingerprint = fs.readFileSync(path.join(control, 'owner-start-fingerprint'), 'utf8').trim()
+  const match = /^v2 linux-proc ([0-9a-f-]{36}) ([0-9]+)$/.exec(fingerprint)
+  assert.ok(match, `Linux 残锁必须保留可解析的 owner 指纹：${fingerprint}`)
+
+  const probeDir = path.join(root, 'verified-dead-owner-probe')
+  fs.mkdirSync(probeDir, { recursive: true })
+  const { sudoPath, probeLog } = installLinuxOwnerProbeBin(probeDir)
+  return {
+    SUDO: sudoPath,
+    TEST_OWNER_PROBE_LOG: probeLog,
+    TEST_OWNER_BOOT_ID: match[1],
+    TEST_OWNER_PID: ownerPid,
+    TEST_OWNER_CURRENT_TICKS: match[2],
+    TEST_OWNER_PROC_MODE: 'dead',
+  }
+}
+
 function installDirectLinuxOwnerProbeBin(dir: string): { probeLog: string } {
   const probeLog = path.join(dir, 'owner-direct-probe.log')
   fs.writeFileSync(probeLog, '')
@@ -2347,7 +2368,14 @@ test('P6-R2 方案A SIGKILL：app-started / ready 前实例保持断网，重试
     assert.ok(!fs.existsSync(path.join(control, 'network-published')))
   })
 
-  const retry = runStatefulRestore(dataDir, backupsDir, snap, dockerBin, stateFile)
+  const retry = runStatefulRestore(
+    dataDir,
+    backupsDir,
+    snap,
+    dockerBin,
+    stateFile,
+    verifiedDeadOwnerRetryEnv(root, control),
+  )
   const afterRetry = readDockerState(stateFile)
   const ownerPidFile = path.join(control, 'owner-pid')
   const ownerFingerprintFile = path.join(control, 'owner-start-fingerprint')
@@ -2383,7 +2411,14 @@ test('P6-R2 方案A SIGKILL：ready-accepted / reconnect 前可验收但仍断�
     assert.deepEqual(state.containers[CONTAINER_A].networks, [], 'connect 生效前仍必须零网络')
   })
 
-  const retry = runStatefulRestore(dataDir, backupsDir, snap, dockerBin, stateFile)
+  const retry = runStatefulRestore(
+    dataDir,
+    backupsDir,
+    snap,
+    dockerBin,
+    stateFile,
+    verifiedDeadOwnerRetryEnv(root, control),
+  )
   const afterRetry = readDockerState(stateFile)
   assert.equal(retry.status, 4)
   assert.equal(afterRetry.containers[CONTAINER_A].running, false)
@@ -2407,7 +2442,14 @@ test('P6-R2 方案A SIGKILL：connect 已生效 / network-published 前，重试
     assert.equal(state.containers[CONTAINER_A].networks.length, 1, '前置：network connect 已真实生效')
   })
 
-  const retry = runStatefulRestore(dataDir, backupsDir, snap, dockerBin, stateFile)
+  const retry = runStatefulRestore(
+    dataDir,
+    backupsDir,
+    snap,
+    dockerBin,
+    stateFile,
+    verifiedDeadOwnerRetryEnv(root, control),
+  )
   const afterRetry = readDockerState(stateFile)
   assert.equal(retry.status, 4)
   assert.equal(afterRetry.containers[CONTAINER_A].running, false)
@@ -3968,7 +4010,12 @@ fi
   assert.ok(!fs.existsSync(path.join(lock, 'snapshot.db')), 'stage 已被 mv，当前文件系统状态可判定数据库已替换')
   assert.ok(fs.existsSync(wal) && fs.existsSync(shm), '不可捕获信号下旧 sidecar 仍在，必须靠锁阻止误启动/再还原')
 
-  const retry = runRestore(dataDir, backupsDir, snap)
+  const retry = runRestore(
+    dataDir,
+    backupsDir,
+    snap,
+    verifiedDeadOwnerRetryEnv(path.dirname(dataDir), control),
+  )
   assert.equal(retry.status, 4, '🔴 下一次 restore 必须被持久锁阻断，不能踩着未清 sidecar 继续')
   assert.match(retry.stderr, /数据库.*已替换.*尚未验收|旧 WAL\/SHM 尚待确认/)
   assert.match(retry.log, /"stop"/, '下一次 restore 必须先按残锁 exact ID 尝试停机')
@@ -4831,7 +4878,7 @@ test('P6-R2 network publication：第二个 connect 失败时回滚为全隔离�
 })
 
 test('P6-R2 network publication：重连失败且撤回不完整时停实例并记录 ambiguous-publication', () => {
-  const { dataDir, backupsDir, snap, dockerBin, stateFile } = publicationCase('publication-network-rollback-fail')
+  const { root, dataDir, backupsDir, snap, dockerBin, stateFile } = publicationCase('publication-network-rollback-fail')
   const state = readDockerState(stateFile)
   state.containers[CONTAINER_A].networks.push({
     name: 'stub-network-2',
@@ -4861,7 +4908,14 @@ test('P6-R2 network publication：重连失败且撤回不完整时停实例并�
   assert.ok(afterState.events.some((event) => event[0] === 'network-disconnect-failed'))
 
   const stopCountBeforeRetry = afterState.events.filter((event) => event[0] === 'stop' && event[1] === CONTAINER_A).length
-  const retry = runStatefulRestore(dataDir, backupsDir, snap, dockerBin, stateFile)
+  const retry = runStatefulRestore(
+    dataDir,
+    backupsDir,
+    snap,
+    dockerBin,
+    stateFile,
+    verifiedDeadOwnerRetryEnv(root, control),
+  )
   const afterRetry = readDockerState(stateFile)
   assert.equal(retry.status, 4)
   assert.match(retry.stderr, /accepted|readiness.*接受|network-published|停止.*隔离/i)
@@ -4975,7 +5029,7 @@ fi
 })
 
 test('P6-R2 accepted 控制锁释放：状态 unlink 失败时保留 trusted 0600 handoff 与明确诊断', () => {
-  const { dataDir, backupsDir, snap, dockerBin, stateFile } = publicationCase('control-release-unlink-fail')
+  const { root, dataDir, backupsDir, snap, dockerBin, stateFile } = publicationCase('control-release-unlink-fail')
   const physicalDataDir = fs.realpathSync(dataDir)
   const control = `${physicalDataDir}.restore-control`
   const trustedHandoff = `${physicalDataDir}.restore-control-accepted`
@@ -5008,6 +5062,7 @@ done
   assert.ok(fs.existsSync(failedOnce), '前置：状态 unlink 首次故障注入已命中')
 
   const retry = runStatefulRestore(dataDir, backupsDir, snap, dockerBin, stateFile, {
+    ...verifiedDeadOwnerRetryEnv(root, control),
     TEST_FAIL_UNLINK_TARGET: readyBody,
   })
   assert.equal(retry.status, 4)
