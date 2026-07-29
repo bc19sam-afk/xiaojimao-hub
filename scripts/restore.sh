@@ -679,6 +679,8 @@ verify_captured_container_isolated() {
 # 借已核验的 app image 跑一段只读快照校验 JS。这里不能使用 `docker compose run`：它会继承
 # service 的 env、网络和 /app/data bind，令不可信 snapshot 校验容器获得活库与秘密的额外边界。
 # 每次调用都显式 create/inspect/start/rm，并把待检快照作为唯一只读文件挂载。
+# validator 使用本次实际挂载文件的数值 owner UID/GID：这是读取该 0600 bind 所需的最小身份。
+# 默认 sudo 路径生成的 host-only 副本可能本来就是 root-owned；caller-owned 文件不能无条件提权到 root。
 validator_cleanup_container() {
   [ -n "${VALIDATOR_CONTAINER_ID:-}" ] || return 0
   if docker rm -f "$VALIDATOR_CONTAINER_ID" >/dev/null 2>&1; then
@@ -709,6 +711,18 @@ node_with_snapshot() {
     return 1
   }
 
+  # Docker bind mount preserves the mounted file's numeric ownership.  Read it with the
+  # already-established host privilege boundary, then use exactly that identity in the
+  # validator.  Fail closed on any metadata ambiguity; do not fall back to root.
+  _validator_owner=$(${SUDO-} node -e 'const fs=require("node:fs"),st=fs.lstatSync(process.argv[1]);if(!st.isFile()||st.isSymbolicLink()||(st.mode&0o777)!==0o600)process.exit(1);if(!Number.isSafeInteger(st.uid)||!Number.isSafeInteger(st.gid)||st.uid<0||st.gid<0)process.exit(1);process.stdout.write(String(st.uid)+":"+String(st.gid))' "$_validator_snapshot" 2>/dev/null) || {
+    echo "❌ 无法确认 0600 快照的数值 owner UID/GID，拒绝启动校验容器。" >&2
+    return 1
+  }
+  if ! printf '%s\n' "$_validator_owner" | grep -Eq '^[0-9]+:[0-9]+$'; then
+    echo "❌ 快照 owner UID/GID 格式异常，拒绝启动校验容器。" >&2
+    return 1
+  fi
+
   _validator_name="xjm-restore-validator-$$"
   _validator_id=$(docker create \
     --name "$_validator_name" \
@@ -717,7 +731,7 @@ node_with_snapshot() {
     --read-only \
     --cap-drop ALL \
     --security-opt no-new-privileges \
-    --user 0:0 \
+    --user "$_validator_owner" \
     --entrypoint node \
     "$RESTORE_CONTAINER_IMAGE" -e "$_validator_js" 2>/dev/null) || {
     echo "❌ 无法创建隔离快照校验容器。" >&2
@@ -787,7 +801,7 @@ node_with_snapshot() {
      [ "$_validator_actual_readonly" != "true" ] || \
      [ "$_validator_actual_capdrop" != '["ALL"]' ] || \
      [ "$_validator_actual_security" != '["no-new-privileges"]' ] || \
-     [ "$_validator_actual_user" != "0:0" ] || \
+     [ "$_validator_actual_user" != "$_validator_owner" ] || \
      [ "$_validator_actual_entrypoint" != '["node"]' ] || \
      ! printf '%s\n' "$_validator_actual_command" | grep -Eq '^\["-e",' || \
      [ "$_validator_actual_env" != "$_validator_image_env" ]; then

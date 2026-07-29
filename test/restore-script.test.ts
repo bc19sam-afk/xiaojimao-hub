@@ -64,8 +64,10 @@ if (args[0] === 'create') {
   const sourceField = mount.split(',').find((field) => field.startsWith('src=')) || ''
   const source = sourceField.slice(4)
   const js = commandAt >= 0 ? args[commandAt + 1] : ''
+  const userAt = args.indexOf('--user')
+  const user = userAt >= 0 ? args[userAt + 1] : ''
   if (!source || !js || !fs.existsSync(source)) process.exit(80)
-  fs.writeFileSync(validatorStatePath, JSON.stringify({ source, js }))
+  fs.writeFileSync(validatorStatePath, JSON.stringify({ source, js, user }))
   console.log(validatorId)
   process.exit(0)
 }
@@ -82,7 +84,7 @@ if (args[0] === 'inspect' && args.at(-1) === validatorId) {
   else if (format.includes('.HostConfig.ReadonlyRootfs')) console.log('true')
   else if (format.includes('.HostConfig.CapDrop')) console.log('["ALL"]')
   else if (format.includes('.HostConfig.SecurityOpt')) console.log('["no-new-privileges"]')
-  else if (format.includes('.Config.User')) console.log('0:0')
+  else if (format.includes('.Config.User')) console.log(validator.user)
   else if (format.includes('.Config.Entrypoint')) console.log('["node"]')
   else if (format.includes('.Config.Cmd')) console.log(JSON.stringify(['-e', validator.js]))
   else if (format.includes('.Config.Env')) {
@@ -1476,7 +1478,9 @@ test('P6-R2 validator：不继承 Compose service，使用 exact image + 最小�
   assert.ok(validatorCreate.includes('--read-only'))
   assert.ok(validatorCreate.includes('--cap-drop') && validatorCreate.includes('ALL'))
   assert.ok(validatorCreate.includes('--security-opt') && validatorCreate.includes('no-new-privileges'))
-  assert.ok(validatorCreate.includes('--user') && validatorCreate.includes('0:0'))
+  const snapshotStat = fs.statSync(snap)
+  const expectedUser = `${snapshotStat.uid}:${snapshotStat.gid}`
+  assert.ok(validatorCreate.includes('--user') && validatorCreate.includes(expectedUser))
   const commandAt = validatorCreate.indexOf('-e')
   assert.equal(validatorCreate[commandAt - 1], `sha256:${'1'.repeat(64)}`, '必须直接使用已捕获 exact image ID')
   const mounts = validatorCreate
@@ -3445,24 +3449,20 @@ test('R4-P1②：符号链接成环 → exit 1 拒绝运行，不死循环', () 
 })
 
 // ============================================================================
-// R6-P2③（codex R5 终审）：node_with_snapshot 以 uid 1000 跑时读不到 root 属主的 0600 快照
+// R6-P2③（codex R5 终审）：node_with_snapshot 必须以 snapshot owner 读取 0600 快照
 //
 // 问题：运维从异机 rsync/scp 下来的备份通常是 `root:root 0600`（sync-backups.sh 产物），镜像
 // 默认 `USER node`(uid1000)，bind-mount **不做 uid 映射**直接保留宿主权限 → 容器内 1000 对
 // 文件判不可读 → quick_check 里 `new DatabaseSync` 抛 EACCES，守卫却把合法快照报成「截断/损坏」，
 // 恢复流程根本起不了步。
 //
-// 修复：node_with_snapshot 加 `--user 0:0`。纯只读操作（`:ro` + `?immutable=1` + `readOnly: true`）、
-// 只碰单一快照文件不碰活库、一次性容器 --rm，三条都成立故提权安全。node_in_data 仍保持 uid1000
-// （会写文件、产物属主必须是 1000）。
+// 修复：node_with_snapshot 传入当次实际挂载文件的数值 owner UID/GID。这样 caller-owned 0600
+// 文件不再无条件使用 root；默认 sudo 路径生成的 host-only 副本若本来就是 root-owned，仍会使用 0:0。
 //
-// 回归测试：跑真实脚本，钉它调 quick_check 时传了 `--user 0:0`。桩 docker 的 `:ro` 复刻
-// （0o500 目录）保证测试环境和真容器一样：同目录不可写 + SQLite 建不了 -wal/-shm。修复前脚本
-// 不带 --user、桩会以当前进程 uid 读 0600 文件 → 桩的 node 进程看到 EACCES、quick_check 失败
-// 退码非零；修复后带 --user 0:0、桩跳过该 flag（不提权、只记录）但测试进程对自己建的文件仍可读
-// → 成功。真容器里的差异更直接：不带 --user 时 uid1000 对 root:root 0600 没读权限；带了就能读。
+// 回归测试：跑真实脚本，钉它调 quick_check 时传了 snapshot owner UID/GID。桩 docker 的 `:ro`
+// 复刻（0o500 目录）保证测试环境和真容器一样：同目录不可写 + SQLite 建不了 -wal/-shm。
 // ============================================================================
-test('R6-P2③：快照 0600 时 quick_check 以 root 读（--user 0:0）', () => {
+test('R6-P2③：快照 0600 时 quick_check 以 snapshot owner UID/GID 读', () => {
   const { dataDir, backupsDir } = scene('root-snap', 'CURRENT')
   const snap = path.join(backupsDir, 'backup-from-remote.db')
   makeSnapshot(snap, 'REMOTE')
@@ -3472,14 +3472,17 @@ test('R6-P2③：快照 0600 时 quick_check 以 root 读（--user 0:0）', () =
   assert.equal(r.status, 0, `脚本应成功：\n${r.stdout}\n${r.stderr}`)
   assert.equal(readMarker(path.join(dataDir, 'app.db')), 'REMOTE')
 
-  // 桩日志里 quick_check 的那行调用必须带 --user 0:0。找「含 immutable=1 的那行」（其它 run 不带这个）
+  // 本沙箱固定 SUDO=''，两份私有副本与原 snapshot 同 owner；真实 Docker helper 另有 inspect 断言。
+  const stat = fs.statSync(snap)
+  const expectedUser = `${stat.uid}:${stat.gid}`
+  // 桩日志里 quick_check 的那行调用必须带 snapshot owner UID/GID。找「含 immutable=1 的那行」（其它 run 不带这个）
   const calls = r.log.split('\n').filter((l) => l.includes('immutable=1'))
   assert.equal(calls.length, 2, 'host-only 预校验与停机后同文件系统 stage 必须各跑一次 quick_check')
   for (const call of calls) {
     const argv = JSON.parse(call)
     const userIdx = argv.indexOf('--user')
-    assert.ok(userIdx >= 0, '🔴 quick_check 必须带 --user（修复前缺此参数 → uid1000 读不了 root:root 0600）')
-    assert.equal(argv[userIdx + 1], '0:0', '🔴 必须提权到 root')
+    assert.ok(userIdx >= 0, '🔴 quick_check 必须带 --user（镜像默认用户未必能读取宿主 0600 snapshot）')
+    assert.equal(argv[userIdx + 1], expectedUser, '🔴 必须使用可读取 0600 snapshot 的最小 UID/GID')
   }
 })
 

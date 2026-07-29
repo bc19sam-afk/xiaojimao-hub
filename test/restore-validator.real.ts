@@ -313,8 +313,9 @@ test('real Docker snapshot validator enforces the isolated exact-image contract'
       assert.ok(inspected.HostConfig.SecurityOpt?.includes('no-new-privileges'))
     })
 
-    await t.test('runs Node as root only for the read-only snapshot', () => {
-      assert.equal(inspected.Config.User, '0:0')
+    await t.test('runs Node as the snapshot owner only for the read-only snapshot', () => {
+      const snapshotStat = fs.statSync(snapshot)
+      assert.equal(inspected.Config.User, `${snapshotStat.uid}:${snapshotStat.gid}`)
       assert.deepEqual(inspected.Config.Entrypoint, ['node'])
       assert.equal(inspected.Config.Cmd?.[0], '-e')
     })
@@ -396,8 +397,8 @@ const validatorContractMutations: Array<{ label: string; mutate: (source: string
     mutate: (source) => source.replace(/\n    --security-opt no-new-privileges \\\n/, '\n'),
   },
   {
-    label: 'root UID/GID',
-    mutate: (source) => source.replace(/\n    --user 0:0 \\\n/, '\n'),
+    label: 'snapshot owner UID/GID',
+    mutate: (source) => source.replace(/\n    --user "\$_validator_owner" \\\n/, '\n'),
   },
   {
     label: 'explicit Node entrypoint',
