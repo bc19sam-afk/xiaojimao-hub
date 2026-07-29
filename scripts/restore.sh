@@ -15,7 +15,8 @@
 #
 # 环境变量：
 #   SUDO=        仅当宿主 UID 与容器 uid1000 明确隔离（常见于 macOS Docker Desktop）时可置空；
-#                Linux uid1000 调用者必须保留默认 sudo（或用 root），否则无法隔离锁/stage 与 app
+#                Linux uid1000 调用者必须保留默认 sudo（或用 root），否则无法隔离锁/stage 与 app；
+#                Linux 跨 UID 残锁 owner 的 boot_id + /proc starttime 核验也通过这条提权路径完成
 #   DATA_DIR     宿主数据目录，默认 data。🔴 **必须与 docker-compose.yml 里绑到 /app/data 的宿主
 #                路径一致**（默认那条是 `./data:/app/data`）：脚本按它定位要还原的库文件，容器按
 #                compose 那条绑定定位它实际读的库——两者必须指同一个目录，否则还原了个 app 根本
@@ -754,19 +755,115 @@ read_restore_state() {
   $SUDO cat -- "$1" 2>/dev/null || true
 }
 
+read_restore_state_strict() {
+  $SUDO cat -- "$1" 2>/dev/null
+}
+
+read_linux_boot_id() {
+  _linux_boot_id=$($SUDO cat -- /proc/sys/kernel/random/boot_id 2>/dev/null) || return 1
+  printf '%s\n' "$_linux_boot_id" \
+    | grep -Eq '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' \
+    || return 1
+  printf '%s\n' "$_linux_boot_id"
+}
+
+read_linux_process_start_ticks() {
+  _linux_pid="$1"
+  case "$_linux_pid" in 0|*[!0-9]*|'') return 1 ;; esac
+  _linux_stat=$($SUDO cat -- "/proc/$_linux_pid/stat" 2>/dev/null) || return 1
+  _linux_ticks=$(printf '%s\n' "$_linux_stat" | awk -v expected_pid="$_linux_pid" '
+    NR == 1 {
+      if (index($0, expected_pid " (") != 1) invalid = 1
+      line = $0
+      sub(/^.*\) /, "", line)
+      count = split(line, fields, /[[:space:]]+/)
+      if (count < 20 || fields[20] !~ /^[0-9]+$/) invalid = 1
+      ticks = fields[20]
+      next
+    }
+    { invalid = 1 }
+    END {
+      if (NR != 1 || invalid) exit 1
+      print ticks
+    }
+  ') || return 1
+  printf '%s\n' "$_linux_ticks"
+}
+
+read_darwin_process_identity() {
+  _darwin_pid="$1"
+  case "$_darwin_pid" in 0|*[!0-9]*|'') return 1 ;; esac
+  _darwin_record=$($SUDO env LC_ALL=C ps -o uid= -o lstart= -p "$_darwin_pid" 2>/dev/null | awk '
+    NF >= 6 {
+      count++
+      uid = $1
+      $1 = ""
+      sub(/^[[:space:]]+/, "", $0)
+      start = $0
+    }
+    END {
+      if (count != 1 || uid !~ /^[0-9]+$/ || start == "") exit 1
+      print uid "\t" start
+    }
+  ') || return 1
+  _darwin_uid=$(printf '%s\n' "$_darwin_record" | awk -F '\t' '{ print $1 }')
+  _darwin_start=$(printf '%s\n' "$_darwin_record" | awk -F '\t' '{ print $2 }')
+  _darwin_checksum=$(printf '%s' "$_darwin_start" | cksum | awk '
+    NR == 1 && $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ { print $1 ":" $2; valid = 1; next }
+    { invalid = 1 }
+    END { if (!valid || invalid || NR != 1) exit 1 }
+  ') || return 1
+  printf '%s %s\n' "$_darwin_uid" "$_darwin_checksum"
+}
+
 process_start_fingerprint() {
   _fingerprint_pid="$1"
-  case "$_fingerprint_pid" in *[!0-9]*|'') return 1 ;; esac
-  LC_ALL=C ps -o lstart= -p "$_fingerprint_pid" 2>/dev/null | awk '
-    NF { count++; line = $0 }
-    END {
-      if (count != 1) exit 1
-      sub(/^[[:space:]]+/, "", line)
-      sub(/[[:space:]]+$/, "", line)
-      if (line == "") exit 1
-      print line
+  case "$_fingerprint_pid" in 0|*[!0-9]*|'') return 1 ;; esac
+  _fingerprint_platform=$(uname -s 2>/dev/null) || return 1
+  case "$_fingerprint_platform" in
+    Linux)
+      _fingerprint_boot_id=$(read_linux_boot_id) || return 1
+      _fingerprint_start_ticks=$(read_linux_process_start_ticks "$_fingerprint_pid") || return 1
+      printf 'v2 linux-proc %s %s\n' "$_fingerprint_boot_id" "$_fingerprint_start_ticks"
+      ;;
+    Darwin)
+      _fingerprint_darwin=$(read_darwin_process_identity "$_fingerprint_pid") || return 1
+      _fingerprint_uid=$(printf '%s\n' "$_fingerprint_darwin" | awk '{ print $1 }')
+      _fingerprint_checksum=$(printf '%s\n' "$_fingerprint_darwin" | awk '{ print $2 }')
+      printf 'v2 darwin-ps %s %s\n' "$_fingerprint_uid" "$_fingerprint_checksum"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+parse_owner_fingerprint() {
+  _owner_parsed=$(printf '%s\n' "$1" | awk '
+    NR == 1 && NF == 4 && $1 == "v2" && ($2 == "linux-proc" || $2 == "darwin-ps") {
+      print $2 "\t" $3 "\t" $4
+      valid = 1
+      next
     }
-  '
+    { invalid = 1 }
+    END { if (NR != 1 || !valid || invalid) exit 1 }
+  ') || return 1
+  PARSED_OWNER_KIND=$(printf '%s\n' "$_owner_parsed" | awk -F '\t' '{ print $1 }')
+  PARSED_OWNER_FIELD1=$(printf '%s\n' "$_owner_parsed" | awk -F '\t' '{ print $2 }')
+  PARSED_OWNER_FIELD2=$(printf '%s\n' "$_owner_parsed" | awk -F '\t' '{ print $3 }')
+  case "$PARSED_OWNER_KIND" in
+    linux-proc)
+      printf '%s\n' "$PARSED_OWNER_FIELD1" \
+        | grep -Eq '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' \
+        || return 1
+      printf '%s\n' "$PARSED_OWNER_FIELD2" | grep -Eq '^[0-9]+$' || return 1
+      ;;
+    darwin-ps)
+      printf '%s\n' "$PARSED_OWNER_FIELD1" | grep -Eq '^[0-9]+$' || return 1
+      printf '%s\n' "$PARSED_OWNER_FIELD2" | grep -Eq '^[0-9]+:[0-9]+$' || return 1
+      ;;
+    *) return 1 ;;
+  esac
 }
 
 parse_accepted_state() {
@@ -860,14 +957,103 @@ if state_symlink_exists "$EARLY_RESTORE_CONTROL" || state_symlink_exists "$EARLY
   exit 4
 fi
 
-early_restore_owner_is_live() {
-  _owner_pid=$(read_restore_state "$EARLY_RESTORE_CONTROL/owner-pid")
-  case "$_owner_pid" in *[!0-9]*|'') return 1 ;; esac
-  _owner_fingerprint=$(read_restore_state "$EARLY_RESTORE_CONTROL/owner-start-fingerprint")
-  [ -n "$_owner_fingerprint" ] || return 1
-  kill -0 "$_owner_pid" 2>/dev/null || return 1
-  _current_owner_fingerprint=$(process_start_fingerprint "$_owner_pid") || return 1
-  [ "$_current_owner_fingerprint" = "$_owner_fingerprint" ]
+classify_early_restore_owner() {
+  EARLY_OWNER_STATE="unknown"
+  EARLY_OWNER_DETAIL="owner PID/指纹缺失、格式无效或不可读取"
+  _owner_pid=$(read_restore_state_strict "$EARLY_RESTORE_CONTROL/owner-pid") || return 0
+  case "$_owner_pid" in 0|*[!0-9]*|'') return 0 ;; esac
+  _owner_fingerprint=$(read_restore_state_strict "$EARLY_RESTORE_CONTROL/owner-start-fingerprint") || return 0
+  parse_owner_fingerprint "$_owner_fingerprint" || return 0
+  _owner_platform=$(uname -s 2>/dev/null) || {
+    EARLY_OWNER_DETAIL="无法确认宿主平台"
+    return 0
+  }
+
+  case "$PARSED_OWNER_KIND" in
+    linux-proc)
+      if [ "$_owner_platform" != "Linux" ]; then
+        EARLY_OWNER_DETAIL="锁内是 Linux /proc 指纹，但当前宿主不是 Linux"
+        return 0
+      fi
+      _current_boot_id=$(read_linux_boot_id) || {
+        EARLY_OWNER_DETAIL="无法经提权路径读取 Linux boot_id"
+        return 0
+      }
+      if [ "$_current_boot_id" != "$PARSED_OWNER_FIELD1" ]; then
+        EARLY_OWNER_STATE="stale"
+        EARLY_OWNER_DETAIL="boot_id 已变化，锁内 owner 属于此前启动周期"
+        return 0
+      fi
+      if _current_start_ticks=$(read_linux_process_start_ticks "$_owner_pid"); then
+        if [ "$_current_start_ticks" = "$PARSED_OWNER_FIELD2" ]; then
+          EARLY_OWNER_STATE="live"
+          EARLY_OWNER_DETAIL="PID、boot_id 与 /proc starttime ticks 均匹配"
+        else
+          EARLY_OWNER_STATE="stale"
+          EARLY_OWNER_DETAIL="PID 存在但 /proc starttime ticks 不匹配（PID reuse）"
+        fi
+        return 0
+      fi
+
+      # stat 读取失败不能直接等价为 ESRCH：hidepid/权限拒绝同样会失败。只有 root 或显式
+      # $SUDO 已能读取 boot_id，且同一提权路径确认 /proc 可遍历、目标 PID 目录确实不存在时，
+      # 才能把 owner 判为 definitely stale；其余一律 unknown，绝不 containment。
+      if { [ "$CALLER_UID" = "0" ] || [ -n "$SUDO" ]; } && \
+         $SUDO test -d /proc 2>/dev/null && \
+         ! $SUDO test -d "/proc/$_owner_pid" 2>/dev/null; then
+        EARLY_OWNER_STATE="stale"
+        EARLY_OWNER_DETAIL="提权后的 /proc 明确确认 owner PID 已不存在"
+      else
+        EARLY_OWNER_DETAIL="owner PID 可能存在，但 /proc stat 无法读取或权限不足"
+      fi
+      ;;
+    darwin-ps)
+      if [ "$_owner_platform" != "Darwin" ]; then
+        EARLY_OWNER_DETAIL="锁内是 Darwin ps 指纹，但当前宿主不是 Darwin"
+        return 0
+      fi
+      if _current_owner_fingerprint=$(process_start_fingerprint "$_owner_pid"); then
+        if [ "$_current_owner_fingerprint" = "$_owner_fingerprint" ]; then
+          EARLY_OWNER_STATE="live"
+          EARLY_OWNER_DETAIL="PID、UID 与 Darwin 启动时间指纹均匹配"
+        else
+          EARLY_OWNER_STATE="stale"
+          EARLY_OWNER_DETAIL="PID 存在但 Darwin 启动时间指纹不匹配（PID reuse）"
+        fi
+        return 0
+      fi
+      if [ "$CALLER_UID" = "0" ] || [ -n "$SUDO" ] || [ "$CALLER_UID" = "$PARSED_OWNER_FIELD1" ]; then
+        # `ps -p` 的 rc=1 既可能是 PID 不存在，也可能是 sudo 认证/权限失败，不能据此判 stale。
+        # 只有同一观察通道成功枚举完整 PID 列表、且严格确认目标缺席时，才算 definitely stale。
+        if _darwin_pid_list=$($SUDO env LC_ALL=C ps -axo pid= 2>/dev/null); then
+          _darwin_presence=$(printf '%s\n' "$_darwin_pid_list" | awk -v expected="$_owner_pid" '
+            NF {
+              records++
+              if (NF != 1 || $1 !~ /^[0-9]+$/) invalid = 1
+              if ($1 == 1) init++
+              if ($1 == expected) found++
+            }
+            END {
+              if (invalid || records == 0 || init != 1 || found > 1) exit 1
+              print (found == 1 ? "present" : "absent")
+            }
+          ') || _darwin_presence="unknown"
+          case "$_darwin_presence" in
+            present) EARLY_OWNER_DETAIL="owner PID 仍存在，但 Darwin 启动时间指纹不可读取" ;;
+            absent)
+              EARLY_OWNER_STATE="stale"
+              EARLY_OWNER_DETAIL="提权后的 Darwin PID 枚举明确确认 owner 已不存在"
+              ;;
+            *) EARLY_OWNER_DETAIL="Darwin PID 枚举格式异常，无法确认 owner" ;;
+          esac
+        else
+          EARLY_OWNER_DETAIL="Darwin ps/sudo 查询失败，无法确认 owner"
+        fi
+      else
+        EARLY_OWNER_DETAIL="跨 UID Darwin owner 无提权观测能力"
+      fi
+      ;;
+  esac
 }
 
 container_absence_is_confirmed() {
@@ -969,10 +1155,30 @@ early_unpublished_restore_requires_containment() {
       ! state_path_exists "$EARLY_RESTORE_LOCK/snapshot.db"; }
 }
 
+report_early_owner_unknown() {
+  echo "   ❌ 无法安全确认锁内 owner 是否仍存活：${EARLY_OWNER_DETAIL}。" >&2
+  echo "   为避免把跨 UID/权限受限的活跃 restore 误判为 stale，本次不停止容器、不改网络或 accepted 状态。" >&2
+}
+
 if state_path_exists "$EARLY_RESTORE_CONTROL" || state_file_exists "$EARLY_CONTROL_ACCEPTED_HANDOFF" || \
    state_dir_exists "$EARLY_RESTORE_LOCK"; then
   echo "🛑 已有另一个 restore 或上次异常中断的状态锁：$EARLY_RESTORE_LOCK" >&2
-  if early_restore_is_published; then
+  classify_early_restore_owner
+  _early_owner_metadata_present=0
+  if state_file_exists "$EARLY_RESTORE_CONTROL/owner-pid" || \
+     state_file_exists "$EARLY_RESTORE_CONTROL/owner-start-fingerprint"; then
+    _early_owner_metadata_present=1
+  fi
+  _early_handoff_without_owner=0
+  if [ "$_early_owner_metadata_present" = "0" ] && state_file_exists "$EARLY_CONTROL_ACCEPTED_HANDOFF"; then
+    _early_handoff_without_owner=1
+  fi
+
+  if [ "$EARLY_OWNER_STATE" = "live" ]; then
+    echo "   状态显示：锁内 owner 仍存活且指纹匹配；按并发 restore 处理，不干扰其容器。" >&2
+  elif [ "$EARLY_OWNER_STATE" = "unknown" ] && [ "$_early_handoff_without_owner" = "0" ]; then
+    report_early_owner_unknown
+  elif early_restore_is_published; then
     _published_cleanup_failed=0
     _published_container_exists=1
     if ! docker inspect "$EARLY_PUBLISHED_CONTAINER_ID" >/dev/null 2>&1; then
@@ -999,8 +1205,8 @@ if state_path_exists "$EARLY_RESTORE_CONTROL" || state_file_exists "$EARLY_CONTR
       fi
       echo "   ❌ 已发布残锁的 Docker 状态无法完整确认；请立即核对 exact 与替代实例。" >&2
     fi
-  elif early_restore_owner_is_live; then
-    echo "   状态显示：锁内 owner PID 仍存活；按并发 restore 处理，不干扰其容器。" >&2
+  elif [ "$EARLY_OWNER_STATE" = "unknown" ]; then
+    report_early_owner_unknown
   elif early_unpublished_restore_requires_containment; then
     _stale_stop_failed=0
     _stale_container_id=$(read_restore_state "$EARLY_RESTORE_CONTROL/container-id")

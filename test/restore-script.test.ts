@@ -816,6 +816,123 @@ function readDockerState(stateFile: string): DockerState {
   return JSON.parse(fs.readFileSync(stateFile, 'utf8')) as DockerState
 }
 
+const OWNER_TEST_BOOT_ID = '11111111-2222-4333-8444-555555555555'
+
+function linuxOwnerFingerprint(startTicks: string, bootId = OWNER_TEST_BOOT_ID): string {
+  return `v2 linux-proc ${bootId} ${startTicks}`
+}
+
+function installLinuxOwnerProbeBin(
+  dir: string,
+): { sudoPath: string; probeLog: string } {
+  const probeLog = path.join(dir, 'owner-probe.log')
+  const sudoPath = path.join(dir, 'sudo-owner-probe')
+  fs.writeFileSync(probeLog, '')
+  fs.writeFileSync(
+    path.join(dir, 'uname'),
+    '#!/bin/sh\nprintf \'%s\\n\' Linux\n',
+    { mode: 0o755 },
+  )
+  fs.writeFileSync(
+    path.join(dir, 'id'),
+    `#!/bin/sh
+case "$1" in
+  -u) printf '%s\\n' 2001 ;;
+  -g) printf '%s\\n' 2001 ;;
+  *) exec /usr/bin/id "$@" ;;
+esac
+`,
+    { mode: 0o755 },
+  )
+  fs.writeFileSync(
+    sudoPath,
+    `#!/bin/sh
+printf '%s\\n' "$*" >> "$TEST_OWNER_PROBE_LOG"
+if [ "$1" = "cat" ] && [ "$2" = "--" ]; then
+  case "$3" in
+    /proc/sys/kernel/random/boot_id)
+      printf '%s\\n' "$TEST_OWNER_BOOT_ID"
+      exit 0
+      ;;
+    /proc/*/stat)
+      case "$TEST_OWNER_PROC_MODE" in
+        denied) exit 13 ;;
+        dead) exit 1 ;;
+      esac
+      pid=\${3#/proc/}
+      pid=\${pid%/stat}
+      ticks="$TEST_OWNER_CURRENT_TICKS"
+      # field 2 (comm) intentionally contains spaces and a ')' so production must
+      # strip through the final ") " before taking field 22 (remaining field 20).
+      printf '%s\\n' "$pid (root restore ) worker) S 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 $ticks 0"
+      exit 0
+      ;;
+  esac
+fi
+if [ "$1" = "test" ] && [ "$2" = "-d" ]; then
+  if [ "$3" = "/proc" ]; then exit 0; fi
+  if [ "$3" = "/proc/$TEST_OWNER_PID" ]; then
+    [ "$TEST_OWNER_PROC_MODE" != "dead" ]
+    exit $?
+  fi
+fi
+exec "$@"
+`,
+    { mode: 0o755 },
+  )
+  return { sudoPath, probeLog }
+}
+
+function ownerResidualCase(
+  name: string,
+  ownerPid: string,
+  ownerFingerprint: string,
+): {
+  dataDir: string
+  backupsDir: string
+  snap: string
+  control: string
+  dockerBin: string
+  stateFile: string
+} {
+  const root = fs.mkdtempSync(path.join(tmpDir, name + '-'))
+  const dataDir = path.join(root, 'data')
+  const backupsDir = path.join(dataDir, 'backups')
+  fs.mkdirSync(backupsDir, { recursive: true })
+  makeDb(path.join(dataDir, 'app.db'), 'CURRENT')
+  const snap = path.join(backupsDir, 'backup-owner-probe.db')
+  makeSnapshot(snap, 'UNUSED')
+  const control = `${fs.realpathSync(dataDir)}.restore-control`
+  fs.mkdirSync(control, { mode: 0o700 })
+  fs.writeFileSync(path.join(control, 'app-started'), '', { mode: 0o600 })
+  fs.writeFileSync(path.join(control, 'container-id'), CONTAINER_A + '\n', { mode: 0o600 })
+  fs.writeFileSync(path.join(control, 'compose-project'), 'xiaojimao-hub\n', { mode: 0o600 })
+  fs.writeFileSync(path.join(control, 'compose-service'), 'app\n', { mode: 0o600 })
+  fs.writeFileSync(path.join(control, 'owner-pid'), ownerPid + '\n', { mode: 0o600 })
+  fs.writeFileSync(path.join(control, 'owner-start-fingerprint'), ownerFingerprint + '\n', { mode: 0o600 })
+  const { dir: dockerBin, stateFile } = installStatefulDockerBin(root)
+  fs.writeFileSync(stateFile, JSON.stringify(makeDockerState(dataDir)))
+  return { dataDir, backupsDir, snap, control, dockerBin, stateFile }
+}
+
+function writeDefinitelyStaleOwnerEvidence(control: string): void {
+  const ownerPid = String(process.pid)
+  let fingerprint: string
+  if (process.platform === 'linux') {
+    const currentBootId = fs.readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim()
+    const staleBootId = currentBootId === '00000000-0000-4000-8000-000000000000'
+      ? 'ffffffff-ffff-4fff-8fff-ffffffffffff'
+      : '00000000-0000-4000-8000-000000000000'
+    fingerprint = linuxOwnerFingerprint('1', staleBootId)
+  } else if (process.platform === 'darwin') {
+    fingerprint = `v2 darwin-ps ${process.getuid?.() ?? 0} 0:0`
+  } else {
+    throw new Error(`owner residual fixture 仅支持 Linux/Darwin，当前为 ${process.platform}`)
+  }
+  fs.writeFileSync(path.join(control, 'owner-pid'), ownerPid + '\n', { mode: 0o600 })
+  fs.writeFileSync(path.join(control, 'owner-start-fingerprint'), fingerprint + '\n', { mode: 0o600 })
+}
+
 before(() => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'xjm-restore-'))
   originalTmpDir = process.env.TMPDIR
@@ -1828,10 +1945,20 @@ test('P6-R2 方案A SIGKILL：app-started / ready 前实例保持断网，重试
 
   const retry = runStatefulRestore(dataDir, backupsDir, snap, dockerBin, stateFile)
   const afterRetry = readDockerState(stateFile)
+  const ownerPidFile = path.join(control, 'owner-pid')
+  const ownerFingerprintFile = path.join(control, 'owner-start-fingerprint')
+  const persistedOwnerFingerprint = fs.readFileSync(ownerFingerprintFile, 'utf8').trim()
   assert.equal(retry.status, 4)
   assert.equal(afterRetry.containers[CONTAINER_A].running, false, '🔴 未验收残锁必须先停 exact A')
   assert.deepEqual(afterRetry.containers[CONTAINER_A].networks, [], '未验收残锁必须确认 A 仍隔离')
   assert.ok(fs.existsSync(control), '残锁与 app-started 证据必须保留')
+  assert.equal(fs.statSync(ownerPidFile).mode & 0o777, 0o600, 'owner PID 状态必须保持 0600')
+  assert.equal(fs.statSync(ownerFingerprintFile).mode & 0o777, 0o600, 'owner 指纹状态必须保持 0600')
+  assert.match(
+    persistedOwnerFingerprint,
+    /^v2 (?:linux-proc [0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12} [0-9]+|darwin-ps [0-9]+ [0-9]+:[0-9]+)$/,
+    'owner 指纹必须使用单行、版本化、严格可解析的格式',
+  )
 })
 
 test('P6-R2 方案A SIGKILL：ready-accepted / reconnect 前可验收但仍断网，重试收口后 exit 4', async () => {
@@ -3282,6 +3409,7 @@ test('P6-R2 残锁自愈：app-started 但未 accepted 时下一次 restore 必�
   )
   fs.writeFileSync(path.join(control, 'compose-project'), 'xiaojimao-hub\n', { mode: 0o600 })
   fs.writeFileSync(path.join(control, 'compose-service'), 'app\n', { mode: 0o600 })
+  writeDefinitelyStaleOwnerEvidence(control)
   const { dir: dockerBin, stateFile } = installStatefulDockerBin(root)
   fs.writeFileSync(stateFile, JSON.stringify(makeDockerState(dataDir)))
 
@@ -3293,63 +3421,228 @@ test('P6-R2 残锁自愈：app-started 但未 accepted 时下一次 restore 必�
   assert.equal(readMarker(path.join(dataDir, 'app.db')), 'CURRENT', '残锁处置不得修改数据库')
 })
 
-test('P6-R2 残锁 owner：PID 被复用但启动指纹不匹配时必须按 stale 收口未验收实例', () => {
-  const root = fs.mkdtempSync(path.join(tmpDir, 'stale-owner-pid-reused-'))
-  const dataDir = path.join(root, 'data')
-  const backupsDir = path.join(dataDir, 'backups')
-  fs.mkdirSync(backupsDir, { recursive: true })
-  makeDb(path.join(dataDir, 'app.db'), 'CURRENT')
-  const snap = path.join(backupsDir, 'backup-stale-owner.db')
-  makeSnapshot(snap, 'UNUSED')
-  const control = `${fs.realpathSync(dataDir)}.restore-control`
-  fs.mkdirSync(control, { mode: 0o700 })
-  fs.writeFileSync(path.join(control, 'app-started'), '', { mode: 0o600 })
-  fs.writeFileSync(path.join(control, 'container-id'), CONTAINER_A + '\n', { mode: 0o600 })
-  fs.writeFileSync(path.join(control, 'compose-project'), 'xiaojimao-hub\n', { mode: 0o600 })
-  fs.writeFileSync(path.join(control, 'compose-service'), 'app\n', { mode: 0o600 })
-  fs.writeFileSync(path.join(control, 'owner-pid'), `${process.pid}\n`, { mode: 0o600 })
-  fs.writeFileSync(path.join(control, 'owner-start-fingerprint'), 'definitely-not-this-process\n', { mode: 0o600 })
-  const { dir: dockerBin, stateFile } = installStatefulDockerBin(root)
-  fs.writeFileSync(stateFile, JSON.stringify(makeDockerState(dataDir)))
+test('P6-R2 残锁 owner：跨 UID 的 Linux /proc 指纹匹配时不得 stop 或断网', () => {
+  const ownerPid = '4242'
+  const ownerTicks = '987654321'
+  const c = ownerResidualCase(
+    'live-root-owner-nonroot-retry',
+    ownerPid,
+    linuxOwnerFingerprint(ownerTicks),
+  )
+  const { sudoPath, probeLog } = installLinuxOwnerProbeBin(c.dockerBin)
 
-  const r = runStatefulRestore(dataDir, backupsDir, snap, dockerBin, stateFile)
-  const afterState = readDockerState(stateFile)
-
-  assert.equal(r.status, 4, `残锁仍应以 4 阻断：\n${r.stdout}\n${r.stderr}`)
-  assert.equal(afterState.containers[CONTAINER_A].running, false, 'PID 复用不得绕过未验收实例 stop/隔离')
-  assert.match(r.stderr, /停止|隔离|未接受|未发布/i)
-})
-
-test('P6-R2 残锁 owner：PID 与启动指纹都匹配时不得干扰仍在运行的 restore', () => {
-  const root = fs.mkdtempSync(path.join(tmpDir, 'live-owner-fingerprint-'))
-  const dataDir = path.join(root, 'data')
-  const backupsDir = path.join(dataDir, 'backups')
-  fs.mkdirSync(backupsDir, { recursive: true })
-  makeDb(path.join(dataDir, 'app.db'), 'CURRENT')
-  const snap = path.join(backupsDir, 'backup-live-owner.db')
-  makeSnapshot(snap, 'UNUSED')
-  const fingerprint = spawnSync('ps', ['-o', 'lstart=', '-p', String(process.pid)], {
-    encoding: 'utf8',
-    env: { ...process.env, LC_ALL: 'C' },
-  }).stdout.trim()
-  assert.ok(fingerprint, '前置：测试进程必须能读取自己的启动指纹')
-  const control = `${fs.realpathSync(dataDir)}.restore-control`
-  fs.mkdirSync(control, { mode: 0o700 })
-  fs.writeFileSync(path.join(control, 'app-started'), '', { mode: 0o600 })
-  fs.writeFileSync(path.join(control, 'container-id'), CONTAINER_A + '\n', { mode: 0o600 })
-  fs.writeFileSync(path.join(control, 'compose-project'), 'xiaojimao-hub\n', { mode: 0o600 })
-  fs.writeFileSync(path.join(control, 'compose-service'), 'app\n', { mode: 0o600 })
-  fs.writeFileSync(path.join(control, 'owner-pid'), `${process.pid}\n`, { mode: 0o600 })
-  fs.writeFileSync(path.join(control, 'owner-start-fingerprint'), fingerprint + '\n', { mode: 0o600 })
-  const { dir: dockerBin, stateFile } = installStatefulDockerBin(root)
-  fs.writeFileSync(stateFile, JSON.stringify(makeDockerState(dataDir)))
-
-  const r = runStatefulRestore(dataDir, backupsDir, snap, dockerBin, stateFile)
-  const afterState = readDockerState(stateFile)
+  const r = runStatefulRestore(c.dataDir, c.backupsDir, c.snap, c.dockerBin, c.stateFile, {
+    SUDO: sudoPath,
+    TEST_OWNER_PROBE_LOG: probeLog,
+    TEST_OWNER_BOOT_ID: OWNER_TEST_BOOT_ID,
+    TEST_OWNER_PID: ownerPid,
+    TEST_OWNER_CURRENT_TICKS: ownerTicks,
+    TEST_OWNER_PROC_MODE: 'matching',
+  })
+  const afterState = readDockerState(c.stateFile)
+  const probeCalls = fs.readFileSync(probeLog, 'utf8')
 
   assert.equal(r.status, 4)
-  assert.equal(afterState.containers[CONTAINER_A].running, true, '匹配 owner 不得被第二个 restore 停止')
-  assert.match(r.stderr, /owner PID.*存活|并发 restore/i)
+  assert.equal(afterState.containers[CONTAINER_A].running, true, '🔴 活跃 root owner 不得被普通 UID retry 停止')
+  assert.equal(afterState.containers[CONTAINER_A].networks.length, 1, '🔴 活跃 owner 的 endpoint 不得被断开')
+  assert.ok(!afterState.events.some((event) => event[0] === 'stop'), '跨 UID matching 时 docker stop 必须为 0 次')
+  assert.ok(
+    !afterState.events.some((event) => event[0] === 'network-disconnect'),
+    '跨 UID matching 时 docker network disconnect 必须为 0 次',
+  )
+  assert.match(r.stderr, /owner.*存活|并发 restore/i)
+  assert.match(probeCalls, /cat -- \/proc\/sys\/kernel\/random\/boot_id/)
+  assert.match(probeCalls, new RegExp(`cat -- /proc/${ownerPid}/stat`), '🔴 /proc owner stat 必须经 $SUDO 读取')
+})
+
+test('P6-R2 残锁 owner：Linux /proc 权限未知时必须阻断但不得 containment', () => {
+  const ownerPid = '4243'
+  const c = ownerResidualCase(
+    'unknown-owner-permission',
+    ownerPid,
+    linuxOwnerFingerprint('222222222'),
+  )
+  const { sudoPath, probeLog } = installLinuxOwnerProbeBin(c.dockerBin)
+  const accepted = path.join(c.control, 'ready-accepted')
+  const published = path.join(c.control, 'network-published')
+  const acceptedValue = `v2 ${CONTAINER_A} xiaojimao-hub app\n`
+  fs.writeFileSync(accepted, acceptedValue, { mode: 0o600 })
+  fs.writeFileSync(published, acceptedValue, { mode: 0o600 })
+  const acceptedBefore = fs.readFileSync(accepted)
+  const dataB = path.join(path.dirname(c.dataDir), 'data-b')
+  fs.mkdirSync(dataB, { recursive: true })
+  const dockerState = makeDockerState(c.dataDir, dataB)
+  dockerState.containers[CONTAINER_B].composeProject = 'xiaojimao-hub'
+  dockerState.containers[CONTAINER_B].composeService = 'app'
+  dockerState.containers[CONTAINER_B].running = true
+  fs.writeFileSync(c.stateFile, JSON.stringify(dockerState))
+
+  const r = runStatefulRestore(c.dataDir, c.backupsDir, c.snap, c.dockerBin, c.stateFile, {
+    SUDO: sudoPath,
+    TEST_OWNER_PROBE_LOG: probeLog,
+    TEST_OWNER_BOOT_ID: OWNER_TEST_BOOT_ID,
+    TEST_OWNER_PID: ownerPid,
+    TEST_OWNER_CURRENT_TICKS: '222222222',
+    TEST_OWNER_PROC_MODE: 'denied',
+  })
+  const afterState = readDockerState(c.stateFile)
+
+  assert.equal(r.status, 4)
+  assert.equal(afterState.containers[CONTAINER_A].running, true, '🔴 owner 权限未知不得被当 stale 停止')
+  assert.equal(afterState.containers[CONTAINER_A].networks.length, 1, '🔴 owner 权限未知不得断开网络')
+  assert.equal(afterState.containers[CONTAINER_B].running, true, '🔴 unknown owner 时也不得停额外 service 实例')
+  assert.equal(afterState.containers[CONTAINER_B].networks.length, 1, '🔴 unknown owner 时不得断开额外实例网络')
+  assert.ok(!afterState.events.some((event) => event[0] === 'stop'))
+  assert.ok(!afterState.events.some((event) => event[0] === 'network-disconnect'))
+  assert.deepEqual(fs.readFileSync(accepted), acceptedBefore, 'unknown 分支不得改 accepted 状态证据')
+  assert.match(r.stderr, /无法确认|权限|unknown/i)
+})
+
+test('P6-R2 残锁 owner：严格格式解析失败属于 unknown，不得 containment', () => {
+  const ownerPid = '4244'
+  const c = ownerResidualCase(
+    'malformed-owner-fingerprint',
+    ownerPid,
+    `${linuxOwnerFingerprint('333333333')} trailing-field`,
+  )
+  const { sudoPath, probeLog } = installLinuxOwnerProbeBin(c.dockerBin)
+
+  const r = runStatefulRestore(c.dataDir, c.backupsDir, c.snap, c.dockerBin, c.stateFile, {
+    SUDO: sudoPath,
+    TEST_OWNER_PROBE_LOG: probeLog,
+    TEST_OWNER_BOOT_ID: OWNER_TEST_BOOT_ID,
+    TEST_OWNER_PID: ownerPid,
+    TEST_OWNER_CURRENT_TICKS: '333333333',
+    TEST_OWNER_PROC_MODE: 'matching',
+  })
+  const afterState = readDockerState(c.stateFile)
+
+  assert.equal(r.status, 4)
+  assert.equal(afterState.containers[CONTAINER_A].running, true)
+  assert.equal(afterState.containers[CONTAINER_A].networks.length, 1)
+  assert.ok(!afterState.events.some((event) => event[0] === 'stop' || event[0] === 'network-disconnect'))
+  assert.match(r.stderr, /无法确认|格式|unknown/i)
+})
+
+test('P6-R2 残锁 owner：Darwin sudo/ps 认证失败属于 unknown，不得 containment', () => {
+  const ownerPid = '4250'
+  const c = ownerResidualCase(
+    'darwin-owner-permission-unknown',
+    ownerPid,
+    'v2 darwin-ps 0 123456:24',
+  )
+  const sudoLog = path.join(c.dockerBin, 'darwin-owner-sudo.log')
+  const sudoPath = path.join(c.dockerBin, 'sudo-darwin-owner')
+  fs.writeFileSync(sudoLog, '')
+  fs.writeFileSync(path.join(c.dockerBin, 'uname'), '#!/bin/sh\nprintf \'%s\\n\' Darwin\n', { mode: 0o755 })
+  fs.writeFileSync(
+    path.join(c.dockerBin, 'id'),
+    '#!/bin/sh\ncase "$1" in -u|-g) printf \'%s\\n\' 2001 ;; *) exec /usr/bin/id "$@" ;; esac\n',
+    { mode: 0o755 },
+  )
+  fs.writeFileSync(
+    sudoPath,
+    `#!/bin/sh
+printf '%s\\n' "$*" >> "$TEST_DARWIN_SUDO_LOG"
+if [ "$1" = "env" ]; then exit 1; fi
+exec "$@"
+`,
+    { mode: 0o755 },
+  )
+
+  const r = runStatefulRestore(c.dataDir, c.backupsDir, c.snap, c.dockerBin, c.stateFile, {
+    SUDO: sudoPath,
+    TEST_DARWIN_SUDO_LOG: sudoLog,
+  })
+  const afterState = readDockerState(c.stateFile)
+
+  assert.equal(r.status, 4)
+  assert.equal(afterState.containers[CONTAINER_A].running, true, '🔴 sudo 认证失败不能证明 Darwin owner 已死')
+  assert.equal(afterState.containers[CONTAINER_A].networks.length, 1)
+  assert.ok(!afterState.events.some((event) => event[0] === 'stop' || event[0] === 'network-disconnect'))
+  assert.match(fs.readFileSync(sudoLog, 'utf8'), /env LC_ALL=C ps/)
+  assert.match(r.stderr, /无法确认|权限|认证|查询失败|unknown/i)
+})
+
+test('P6-R2 残锁 owner：Darwin PID 枚举成功但空输出仍是 unknown，不得 containment', () => {
+  const c = ownerResidualCase(
+    'darwin-owner-empty-enumeration',
+    '4251',
+    'v2 darwin-ps 0 123456:24',
+  )
+  const sudoPath = path.join(c.dockerBin, 'sudo-darwin-empty')
+  fs.writeFileSync(path.join(c.dockerBin, 'uname'), '#!/bin/sh\nprintf \'%s\\n\' Darwin\n', { mode: 0o755 })
+  fs.writeFileSync(
+    path.join(c.dockerBin, 'id'),
+    '#!/bin/sh\ncase "$1" in -u|-g) printf \'%s\\n\' 2001 ;; *) exec /usr/bin/id "$@" ;; esac\n',
+    { mode: 0o755 },
+  )
+  fs.writeFileSync(
+    sudoPath,
+    '#!/bin/sh\nif [ "$1" = "env" ]; then exit 0; fi\nexec "$@"\n',
+    { mode: 0o755 },
+  )
+
+  const r = runStatefulRestore(c.dataDir, c.backupsDir, c.snap, c.dockerBin, c.stateFile, {
+    SUDO: sudoPath,
+  })
+  const afterState = readDockerState(c.stateFile)
+
+  assert.equal(r.status, 4)
+  assert.equal(afterState.containers[CONTAINER_A].running, true, '🔴 空 PID 列表不能证明 owner 已死')
+  assert.equal(afterState.containers[CONTAINER_A].networks.length, 1)
+  assert.ok(!afterState.events.some((event) => event[0] === 'stop' || event[0] === 'network-disconnect'))
+  assert.match(r.stderr, /无法确认|枚举格式异常|unknown/i)
+})
+
+test('P6-R2 残锁 owner：Linux 同 PID start ticks 不匹配才按 PID reuse stale 收口', () => {
+  const ownerPid = '4245'
+  const c = ownerResidualCase(
+    'owner-pid-reused-linux-proc',
+    ownerPid,
+    linuxOwnerFingerprint('444444444'),
+  )
+  const { sudoPath, probeLog } = installLinuxOwnerProbeBin(c.dockerBin)
+
+  const r = runStatefulRestore(c.dataDir, c.backupsDir, c.snap, c.dockerBin, c.stateFile, {
+    SUDO: sudoPath,
+    TEST_OWNER_PROBE_LOG: probeLog,
+    TEST_OWNER_BOOT_ID: OWNER_TEST_BOOT_ID,
+    TEST_OWNER_PID: ownerPid,
+    TEST_OWNER_CURRENT_TICKS: '555555555',
+    TEST_OWNER_PROC_MODE: 'reused',
+  })
+  const afterState = readDockerState(c.stateFile)
+
+  assert.equal(r.status, 4)
+  assert.equal(afterState.containers[CONTAINER_A].running, false, 'PID reuse 必须进入 stale containment')
+  assert.deepEqual(afterState.containers[CONTAINER_A].networks, [])
+  assert.ok(afterState.events.some((event) => event[0] === 'stop'))
+})
+
+test('P6-R2 残锁 owner：Linux /proc 明确确认 PID 已不存在时按 stale 收口', () => {
+  const ownerPid = '4246'
+  const c = ownerResidualCase(
+    'owner-definitely-dead-linux-proc',
+    ownerPid,
+    linuxOwnerFingerprint('666666666'),
+  )
+  const { sudoPath, probeLog } = installLinuxOwnerProbeBin(c.dockerBin)
+
+  const r = runStatefulRestore(c.dataDir, c.backupsDir, c.snap, c.dockerBin, c.stateFile, {
+    SUDO: sudoPath,
+    TEST_OWNER_PROBE_LOG: probeLog,
+    TEST_OWNER_BOOT_ID: OWNER_TEST_BOOT_ID,
+    TEST_OWNER_PID: ownerPid,
+    TEST_OWNER_CURRENT_TICKS: '666666666',
+    TEST_OWNER_PROC_MODE: 'dead',
+  })
+  const afterState = readDockerState(c.stateFile)
+
+  assert.equal(r.status, 4)
+  assert.equal(afterState.containers[CONTAINER_A].running, false, '明确 dead owner 必须进入 stale containment')
+  assert.deepEqual(afterState.containers[CONTAINER_A].networks, [])
+  assert.ok(afterState.events.some((event) => event[0] === 'stop'))
 })
 
 test('P6-R2 残锁自愈：replace 已完成且 sidecar/marker 已清但未启动时也先停并隔离 exact ID', () => {
@@ -3364,6 +3657,7 @@ test('P6-R2 残锁自愈：replace 已完成且 sidecar/marker 已清但未启�
   fs.writeFileSync(path.join(control, 'container-id'), `${CONTAINER_A}\n`, { mode: 0o600 })
   fs.writeFileSync(path.join(control, 'compose-project'), 'xiaojimao-hub\n', { mode: 0o600 })
   fs.writeFileSync(path.join(control, 'compose-service'), 'app\n', { mode: 0o600 })
+  writeDefinitelyStaleOwnerEvidence(control)
 
   const r = runStatefulRestore(dataDir, backupsDir, snap, dockerBin, stateFile)
   const afterState = readDockerState(stateFile)
@@ -3383,6 +3677,7 @@ test('P6-R2 残锁自愈：docker inspect 故障不得伪装成 exact 容器不�
   fs.writeFileSync(path.join(control, 'container-id'), `${CONTAINER_A}\n`, { mode: 0o600 })
   fs.writeFileSync(path.join(control, 'compose-project'), 'xiaojimao-hub\n', { mode: 0o600 })
   fs.writeFileSync(path.join(control, 'compose-service'), 'app\n', { mode: 0o600 })
+  writeDefinitelyStaleOwnerEvidence(control)
 
   const r = runStatefulRestore(dataDir, backupsDir, snap, dockerBin, stateFile, {
     TEST_INSPECT_FAIL_ID: CONTAINER_A,
@@ -3393,6 +3688,8 @@ test('P6-R2 残锁自愈：docker inspect 故障不得伪装成 exact 容器不�
   assert.equal(afterState.containers[CONTAINER_A].running, true, '前置：inspect 故障时不能声称已真的停机')
   assert.match(r.stderr, /无法确认|inspect|Docker.*状态|立即检查/i)
   assert.doesNotMatch(r.stderr, /已按锁内精确 ID 停止并隔离实例/)
+  assert.match(r.log, new RegExp(`\\["inspect","${CONTAINER_A}"\\]`), '必须实际命中 exact inspect 故障分支')
+  assert.match(r.log, new RegExp(`id=${CONTAINER_A}`), 'inspect 失败后必须用 docker ps id filter 区分不存在与不可观测')
   assert.ok(fs.existsSync(control))
 })
 
@@ -3404,6 +3701,7 @@ test('P6-R2 残锁自愈：inspect 404 且 docker ps id filter 确认不存在�
   fs.writeFileSync(path.join(control, 'container-id'), `${CONTAINER_A}\n`, { mode: 0o600 })
   fs.writeFileSync(path.join(control, 'compose-project'), 'xiaojimao-hub\n', { mode: 0o600 })
   fs.writeFileSync(path.join(control, 'compose-service'), 'app\n', { mode: 0o600 })
+  writeDefinitelyStaleOwnerEvidence(control)
   const state = readDockerState(stateFile)
   delete state.containers[CONTAINER_A]
   state.current = ''
@@ -3414,6 +3712,8 @@ test('P6-R2 残锁自愈：inspect 404 且 docker ps id filter 确认不存在�
   assert.equal(r.status, 4)
   assert.match(r.stderr, /不存在|已移除|残锁|人工/i)
   assert.doesNotMatch(r.stderr, /无法确认.*停止|立即检查 Docker 状态/i)
+  assert.match(r.log, new RegExp(`\\["inspect","${CONTAINER_A}"\\]`), '必须实际先 inspect 锁内 exact ID')
+  assert.match(r.log, new RegExp(`id=${CONTAINER_A}`), 'inspect 404 后必须由 docker ps id filter 明确确认不存在')
   assert.ok(fs.existsSync(control))
   assert.equal(readMarker(path.join(dataDir, 'app.db')), 'CURRENT')
 })
@@ -3436,6 +3736,7 @@ test('P6-R2 published 残锁：Compose 漂到 B 时保留已验收 A，仅停止
   fs.writeFileSync(path.join(control, 'container-id'), `${CONTAINER_A}\n`, { mode: 0o600 })
   fs.writeFileSync(path.join(control, 'compose-project'), 'xiaojimao-hub\n', { mode: 0o600 })
   fs.writeFileSync(path.join(control, 'compose-service'), 'app\n', { mode: 0o600 })
+  writeDefinitelyStaleOwnerEvidence(control)
   const { dir: dockerBin, stateFile } = installStatefulDockerBin(root)
   const state = makeDockerState(dataA, dataB)
   state.containers[CONTAINER_B].composeProject = state.composeProject
