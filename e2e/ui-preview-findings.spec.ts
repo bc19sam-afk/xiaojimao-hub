@@ -135,7 +135,17 @@ test('provider options remain fully visible and keyboard operable at mobile and 
   })
 
   await page.setViewportSize({ width: 320, height: 900 })
+  const contributionsResponsePromise = page.waitForResponse((response) =>
+    response.request().method() === 'GET' && new URL(response.url()).pathname === '/api/my-contributions')
   await login(page)
+  const contributionsResponse = await contributionsResponsePromise
+  expect(contributionsResponse.status()).toBe(200)
+  const contributionsBody = await contributionsResponse.json() as {
+    contributions?: Array<{ id?: unknown; accountId?: unknown }>
+  }
+  expect(contributionsBody.contributions).toEqual(expect.arrayContaining([
+    expect.objectContaining({ id: 'e2e-long-dashboard', accountId: longAccount }),
+  ]))
   await expect(page.getByText(longAccount, { exact: true })).toBeVisible()
 
   const providerSubtexts = [
@@ -163,6 +173,39 @@ test('provider options remain fully visible and keyboard operable at mobile and 
         const subtextNode = Array.from(option.querySelectorAll<HTMLElement>('*')).find(
           (node) => node.textContent?.trim() === subtext,
         )
+        const measureEffectivePath = (node: HTMLElement | undefined) => {
+          if (!node) return null
+          const path: Array<{
+            tag: string
+            display: string
+            visibility: string
+            opacity: number
+            rectCount: number
+            width: number
+            height: number
+          }> = []
+          let current: HTMLElement | null = node
+          while (current) {
+            const style = getComputedStyle(current)
+            const rect = current.getBoundingClientRect()
+            path.push({
+              tag: current.tagName,
+              display: style.display,
+              visibility: style.visibility,
+              opacity: Number(style.opacity),
+              rectCount: current.getClientRects().length,
+              width: rect.width,
+              height: rect.height,
+            })
+            if (current === option) break
+            current = current.parentElement
+          }
+          return {
+            reachesOption: current === option,
+            cumulativeOpacity: path.reduce((opacity, entry) => opacity * entry.opacity, 1),
+            path,
+          }
+        }
         const measureText = (node: HTMLElement | undefined) => {
           if (!node) return null
           const rect = node.getBoundingClientRect()
@@ -181,6 +224,7 @@ test('provider options remain fully visible and keyboard operable at mobile and 
             height: rect.height,
             clientWidth: node.clientWidth,
             scrollWidth: node.scrollWidth,
+            effectivePath: measureEffectivePath(node),
           }
         }
         return {
@@ -195,6 +239,7 @@ test('provider options remain fully visible and keyboard operable at mobile and 
             width: optionRect.width,
             height: optionRect.height,
           },
+          effectivePath: measureEffectivePath(option),
           mainText: measureText(mainTextNode),
           subtext: measureText(subtextNode),
         }
@@ -231,6 +276,17 @@ test('provider options remain fully visible and keyboard operable at mobile and 
       expect(option?.bounds?.right).toBeLessThanOrEqual(layout.pageWidth + 1)
       expect(option?.bounds?.top).toBeGreaterThanOrEqual(0)
       expect(option?.bounds?.bottom).toBeLessThanOrEqual(layout.pageHeight + 1)
+      if (!option?.effectivePath) throw new Error(`${width}px ${id} provider 可见性路径缺失`)
+      expect(option.effectivePath.reachesOption).toBe(true)
+      expect(option.effectivePath.cumulativeOpacity).toBeGreaterThan(0)
+      for (const ancestor of option.effectivePath.path) {
+        expect(ancestor.display).not.toBe('none')
+        expect(['hidden', 'collapse']).not.toContain(ancestor.visibility)
+        expect(ancestor.opacity).toBeGreaterThan(0)
+        expect(ancestor.rectCount).toBeGreaterThan(0)
+        expect(ancestor.width).toBeGreaterThan(0)
+        expect(ancestor.height).toBeGreaterThan(0)
+      }
       for (const [label, expectedText, textLayout] of [
         ['主文案', name, option?.mainText],
         ['副文案', subtext, option?.subtext],
@@ -252,6 +308,17 @@ test('provider options remain fully visible and keyboard operable at mobile and 
         expect(textLayout.top).toBeGreaterThanOrEqual(0)
         expect(textLayout.bottom).toBeLessThanOrEqual(layout.pageHeight + 1)
         expect(textLayout.scrollWidth).toBeLessThanOrEqual(textLayout.clientWidth + 1)
+        if (!textLayout.effectivePath) throw new Error(`${width}px ${id} ${label}祖先可见性路径缺失`)
+        expect(textLayout.effectivePath.reachesOption).toBe(true)
+        expect(textLayout.effectivePath.cumulativeOpacity).toBeGreaterThan(0)
+        for (const ancestor of textLayout.effectivePath.path) {
+          expect(ancestor.display).not.toBe('none')
+          expect(['hidden', 'collapse']).not.toContain(ancestor.visibility)
+          expect(ancestor.opacity).toBeGreaterThan(0)
+          expect(ancestor.rectCount).toBeGreaterThan(0)
+          expect(ancestor.width).toBeGreaterThan(0)
+          expect(ancestor.height).toBeGreaterThan(0)
+        }
       }
     }
     expect(layout.scroller).not.toBeNull()
@@ -521,9 +588,97 @@ test('dangerous action failures use public allowlisted messages and never echo A
 })
 
 test('dangerous admin routes return fixed public JSON when SQLite operations fail', async ({ page }) => {
-  await openAdmin(page)
-  await expect(page.getByTestId('readiness-status')).toContainText('可用')
+  const pageErrors: string[] = []
+  page.on('pageerror', (error) => pageErrors.push(error.message))
   const suffix = Date.now()
+  const startupBrokenAudit = `__e2e_startup_audit_log_${suffix}`
+  withE2eDb((db) => db.exec(`ALTER TABLE audit_log RENAME TO "${startupBrokenAudit}"`))
+  try {
+    const health = await page.request.get('/api/health')
+    expect(health.status()).toBe(200)
+    expect(await health.json()).toEqual({ ok: true })
+    const ready = await page.request.get('/api/ready')
+    expect(ready.status()).toBe(503)
+    expect(await ready.json()).toEqual({
+      ok: false,
+      code: 'DATABASE_NOT_READY',
+      summary: '数据库尚未就绪',
+    })
+
+    await openAdmin(page)
+    await expect(page.getByRole('heading', { name: '管理后台', level: 1 })).toBeVisible()
+    await expect(page.getByTestId('readiness-status')).toContainText('不可用')
+    await expect(page.getByTestId('audit-load-error')).toHaveText('审计记录暂时无法加载，请重试')
+    const auditResponse = await page.request.get('/api/admin/audit?limit=50')
+    expect(auditResponse.status()).toBe(500)
+    expect(auditResponse.headers()['content-type']).toContain('application/json')
+    expect(await auditResponse.json()).toEqual({
+      ok: false,
+      code: 'AUDIT_LOAD_FAILED',
+      error: '审计记录暂时无法加载，请重试',
+    })
+    expect(pageErrors).toEqual([])
+  } finally {
+    withE2eDb((db) => db.exec(`ALTER TABLE "${startupBrokenAudit}" RENAME TO audit_log`))
+  }
+  await page.getByTestId('refresh-audit').click()
+  await expect(page.getByTestId('audit-load-error')).toHaveCount(0)
+  await page.getByTestId('refresh-system-status').click()
+  await expect(page.getByTestId('readiness-status')).toContainText('可用')
+  expect(pageErrors).toEqual([])
+
+  const invalidUpdateSnapshot = withE2eDb((db) => ({
+    items: (db.prepare('SELECT COUNT(*) AS n FROM redeem_items').get() as { n: number }).n,
+    audits: (db.prepare('SELECT COUNT(*) AS n FROM audit_log').get() as { n: number }).n,
+  }))
+  const invalidUpdatePayload = {
+    name: `E2E invalid update ${suffix}`,
+    description: 'must never become a create',
+    cost: 9,
+    kind: 'timed_quota',
+    enabled: true,
+    sort: 0,
+    fulfillment: 'placeholder',
+    perUserLimit: 0,
+  }
+  for (const id of [0, -1, 1.5, '1', null, Number.MAX_SAFE_INTEGER + 1]) {
+    const response = await page.request.put('/api/admin/redeem-items', {
+      data: { ...invalidUpdatePayload, id },
+    })
+    expect(response.status()).toBe(400)
+    expect(await response.json()).toEqual({
+      ok: false,
+      code: 'REDEEM_ITEM_INVALID_ID',
+      error: '商品 ID 无效',
+    })
+  }
+  const malformedIdResponse = await page.request.put('/api/admin/redeem-items', {
+    headers: { 'Content-Type': 'application/json' },
+    data: `{"id":NaN,"name":"${invalidUpdatePayload.name}","description":"","cost":9,"kind":"timed_quota","enabled":true,"sort":0}`,
+  })
+  expect(malformedIdResponse.status()).toBe(400)
+  expect(await malformedIdResponse.json()).toEqual({
+    ok: false,
+    code: 'REDEEM_ITEM_INVALID',
+    error: '商品信息不完整',
+  })
+  const missingUpdate = await page.request.put('/api/admin/redeem-items', {
+    data: { ...invalidUpdatePayload, id: Number.MAX_SAFE_INTEGER },
+  })
+  expect(missingUpdate.status()).toBe(404)
+  expect(await missingUpdate.json()).toEqual({
+    ok: false,
+    code: 'REDEEM_ITEM_NOT_FOUND',
+    error: '兑换项不存在或已被删除',
+  })
+  expect(withE2eDb((db) => ({
+    items: (db.prepare('SELECT COUNT(*) AS n FROM redeem_items').get() as { n: number }).n,
+    audits: (db.prepare('SELECT COUNT(*) AS n FROM audit_log').get() as { n: number }).n,
+    accidentalCreates: (db.prepare('SELECT COUNT(*) AS n FROM redeem_items WHERE name=?').get(
+      invalidUpdatePayload.name,
+    ) as { n: number }).n,
+  }))).toEqual({ ...invalidUpdateSnapshot, accidentalCreates: 0 })
+
   const cases = [
     {
       table: 'point_rules',
@@ -616,6 +771,7 @@ test('dangerous admin routes return fixed public JSON when SQLite operations fai
     }
   })
   const failedCreateName = `E2E atomic create ${suffix}`
+  const failedCreateKey = `e2e-atomic-create-${crypto.randomUUID()}`
   const brokenSaveAudit = `__e2e_save_audit_log_${suffix}`
   let updateResponseStatus = 0
   let updateResponseType = ''
@@ -629,6 +785,7 @@ test('dangerous admin routes return fixed public JSON when SQLite operations fai
     enabledCount: number
     totalCount: number
     auditCount: number
+    intentCount: number
     sequence: number
   }>>
   withE2eDb((db) => db.exec(`ALTER TABLE audit_log RENAME TO "${brokenSaveAudit}"`))
@@ -641,6 +798,7 @@ test('dangerous admin routes return fixed public JSON when SQLite operations fai
     updateResponseText = await updateResponse.text()
 
     const createResponse = await page.request.put('/api/admin/redeem-items', {
+      headers: { 'Idempotency-Key': failedCreateKey },
       data: {
         name: failedCreateName,
         description: 'must roll back with audit failure',
@@ -663,6 +821,9 @@ test('dangerous admin routes return fixed public JSON when SQLite operations fai
       enabledCount: (db.prepare('SELECT COUNT(*) AS n FROM redeem_items WHERE enabled=1').get() as { n: number }).n,
       totalCount: (db.prepare('SELECT COUNT(*) AS n FROM redeem_items').get() as { n: number }).n,
       auditCount: (db.prepare(`SELECT COUNT(*) AS n FROM "${brokenSaveAudit}"`).get() as { n: number }).n,
+      intentCount: (db.prepare(
+        'SELECT COUNT(*) AS n FROM redeem_item_create_requests WHERE request_key=?',
+      ).get(failedCreateKey) as { n: number }).n,
       sequence: (db.prepare("SELECT seq FROM sqlite_sequence WHERE name='redeem_items'").get() as { seq: number }).seq,
     }))
   } finally {
@@ -704,6 +865,7 @@ test('dangerous admin routes return fixed public JSON when SQLite operations fai
     enabledCount: saveSnapshot.enabledCount,
     totalCount: saveSnapshot.totalCount,
     auditCount: saveSnapshot.auditCount,
+    intentCount: 0,
     sequence: saveSnapshot.sequence,
   })
 })
@@ -715,7 +877,7 @@ test('successful delete, retry, and terminate use exact targets, persist audit s
   const created = await page.evaluate(async (name) => {
     const response = await fetch('/api/admin/redeem-items', {
       method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'Idempotency-Key': `e2e-focus-create-${crypto.randomUUID()}` },
       body: JSON.stringify({
         name,
         description: 'isolated UI test item',
@@ -881,19 +1043,61 @@ test('saving an item updates the enabled-item overview from the persisted databa
   ).get() as { n: number }).n)
   const overviewValue = page.getByText('已启用商品', { exact: true }).locator('..').locator('dd')
   const row = page.locator(`input[value="${item.name}"]`).locator('..')
-  let saveMode: 'non-json' | 'network' | 'success' = 'non-json'
+  const validResponse = withE2eDb((db) => ({
+    ok: true,
+    redeemItems: db.prepare(
+      `SELECT id, name, description, cost, kind, enabled, sort, config, fulfillment,
+              per_user_limit AS perUserLimit FROM redeem_items ORDER BY sort, cost`,
+    ).all(),
+    overview: {
+      pooledAccounts: (db.prepare("SELECT COUNT(*) AS n FROM contributions WHERE verify_status='pooled'").get() as { n: number }).n,
+      needsReview: (db.prepare("SELECT COUNT(*) AS n FROM contributions WHERE verify_status='needs_review'").get() as { n: number }).n,
+      pendingRedemptions: (db.prepare("SELECT COUNT(*) AS n FROM redemptions WHERE status='pending'").get() as { n: number }).n,
+      enabledRedeemItems: before,
+    },
+  }))
+  let malformedBody: unknown = null
+  let saveMode: 'malformed' | 'non-json' | 'network' | 'intent-failure' | 'lost-create' | 'success' = 'malformed'
   let saveRequests = 0
+  let lostCreateName = ''
+  let lostCreateOriginBody: Record<string, unknown> | null = null
+  let releaseLostCreate!: () => void
+  let lostCreateGate = Promise.resolve()
+  const createIntentKeys: string[] = []
   await page.route('**/api/admin/redeem-items', async (route) => {
     if (route.request().method() !== 'PUT') {
       await route.fallback()
       return
     }
     saveRequests += 1
+    const requestBody = route.request().postDataJSON() as { id?: unknown; name?: unknown }
+    if (!Object.prototype.hasOwnProperty.call(requestBody, 'id')) {
+      createIntentKeys.push(route.request().headers()['idempotency-key'] ?? '')
+    }
+    if (saveMode === 'malformed') {
+      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(malformedBody) })
+      return
+    }
     if (saveMode === 'non-json') {
       await route.fulfill({ status: 500, contentType: 'text/plain', body: 'internal path token stack' })
       return
     }
     if (saveMode === 'network') {
+      await route.abort('failed')
+      return
+    }
+    if (saveMode === 'intent-failure') {
+      await route.fulfill({
+        status: 500,
+        contentType: 'application/json',
+        body: JSON.stringify({ ok: false, code: 'REDEEM_ITEM_SAVE_FAILED', error: 'internal' }),
+      })
+      return
+    }
+    if (saveMode === 'lost-create' && requestBody.name === lostCreateName) {
+      await lostCreateGate
+      const origin = await route.fetch()
+      lostCreateOriginBody = await origin.json() as Record<string, unknown>
       await route.abort('failed')
       return
     }
@@ -904,16 +1108,44 @@ test('saving an item updates the enabled-item overview from the persisted databa
     await expect(overviewValue).toHaveText(String(before))
     await row.locator('input[type="checkbox"]').uncheck()
 
+    const firstValidItem = validResponse.redeemItems[0] as Record<string, unknown>
+    const malformedCases = [
+      { ...validResponse, redeemItems: [null] },
+      { ...validResponse, redeemItems: [{ ...firstValidItem, config: undefined }] },
+      { ...validResponse, redeemItems: [{ ...firstValidItem, enabled: '1' }] },
+      { ...validResponse, redeemItems: [{ ...firstValidItem, cost: -1 }] },
+      { ...validResponse, redeemItems: [{ ...firstValidItem, id: Number.MAX_SAFE_INTEGER + 1 }] },
+      { ...validResponse, redeemItems: [firstValidItem, null] },
+      { ...validResponse, overview: { ...validResponse.overview, enabledRedeemItems: -1 } },
+    ]
+    for (const body of malformedCases) {
+      malformedBody = body
+      const expectedRequests = saveRequests + 1
+      await row.getByRole('button', { name: '保存' }).click()
+      await expect.poll(() => saveRequests).toBe(expectedRequests)
+      const itemError = page.getByTestId('redeem-item-error')
+      await expect(itemError).toHaveRole('alert')
+      await expect(itemError).toHaveText('保存兑换项失败，请重试')
+      await expect(itemError).toHaveClass(/text-rose-/)
+      await expect(overviewValue).toHaveText(String(before))
+      expect(withE2eDb((db) => (db.prepare(
+        'SELECT enabled FROM redeem_items WHERE id=?',
+      ).get(item.id) as { enabled: number }).enabled)).toBe(1)
+    }
+
+    saveMode = 'non-json'
+    let expectedRequests = saveRequests + 1
     await row.getByRole('button', { name: '保存' }).click()
-    await expect.poll(() => saveRequests).toBe(1)
-    await expect(page.getByText('保存兑换项失败，请重试', { exact: true })).toBeVisible()
+    await expect.poll(() => saveRequests).toBe(expectedRequests)
+    await expect(page.getByTestId('redeem-item-error')).toHaveText('保存兑换项失败，请重试')
     await expect(overviewValue).toHaveText(String(before))
     expect(withE2eDb((db) => (db.prepare('SELECT enabled FROM redeem_items WHERE id=?').get(item.id) as { enabled: number }).enabled)).toBe(1)
 
     saveMode = 'network'
+    expectedRequests = saveRequests + 1
     await row.getByRole('button', { name: '保存' }).click()
-    await expect.poll(() => saveRequests).toBe(2)
-    await expect(page.getByText('保存兑换项失败，请重试', { exact: true })).toBeVisible()
+    await expect.poll(() => saveRequests).toBe(expectedRequests)
+    await expect(page.getByTestId('redeem-item-error')).toHaveText('保存兑换项失败，请重试')
     await expect(overviewValue).toHaveText(String(before))
     expect(pageErrors).toEqual([])
 
@@ -942,8 +1174,148 @@ test('saving an item updates the enabled-item overview from the persisted databa
     expect(persisted.audit.target).toContain(`item#${item.id}`)
     expect(JSON.parse(persisted.audit.newValue).enabled).toBe(0)
     expect(pageErrors).toEqual([])
+
+    // Create intent: duplicate clicks while pending send once; if the origin commits but the
+    // response is lost, retry must reuse the same persistent idempotency key and item/audit.
+    lostCreateName = `E2E idempotent create ${Date.now()}`
+    lostCreateGate = new Promise<void>((resolve) => { releaseLostCreate = resolve })
+    saveMode = 'lost-create'
+    const newRow = page.getByTestId('redeem-item-new-row')
+    await newRow.getByPlaceholder('名称').fill(lostCreateName)
+    await newRow.getByRole('spinbutton').first().fill('13')
+    const createButton = newRow.getByTestId('redeem-item-save')
+    const createRequestsBefore = saveRequests
+    await createButton.evaluate((button: HTMLButtonElement) => {
+      button.click()
+      button.click()
+    })
+    await expect(createButton).toBeDisabled()
+    await expect.poll(() => saveRequests).toBe(createRequestsBefore + 1)
+    releaseLostCreate()
+    await expect(page.getByTestId('redeem-item-error')).toHaveText('保存兑换项失败，请重试')
+    const lostIntentKey = createIntentKeys.at(-1) ?? ''
+    const afterLostResponse = withE2eDb((db) => ({
+      items: db.prepare('SELECT id FROM redeem_items WHERE name=?').all(lostCreateName) as Array<{ id: number }>,
+      audits: (db.prepare(
+        "SELECT COUNT(*) AS n FROM audit_log WHERE action='redeem_item.upsert' AND new_value LIKE ?",
+      ).get(`%${lostCreateName}%`) as { n: number }).n,
+      intents: (db.prepare(
+        'SELECT COUNT(*) AS n FROM redeem_item_create_requests WHERE request_key=?',
+      ).get(lostIntentKey) as { n: number }).n,
+    }))
+    expect(afterLostResponse.items).toHaveLength(1)
+    expect(afterLostResponse.audits).toBe(1)
+    expect(afterLostResponse.intents).toBe(1)
+
+    saveMode = 'success'
+    const retryResponsePromise = page.waitForResponse((response) =>
+      response.request().method() === 'PUT' && response.url().endsWith('/api/admin/redeem-items'))
+    await createButton.click()
+    const retryResponse = await retryResponsePromise
+    expect(retryResponse.status()).toBe(200)
+    const retryBody = await retryResponse.json() as {
+      ok: boolean
+      redeemItems: Array<{ id: number; name: string }>
+    }
+    expect(retryBody.ok).toBe(true)
+    const firstBodyItems = (
+      (lostCreateOriginBody as Record<string, unknown> | null)?.redeemItems ?? []
+    ) as Array<{ id: number; name: string }>
+    const firstItemId = firstBodyItems.find((entry) => entry.name === lostCreateName)?.id
+    const retriedItemId = retryBody.redeemItems.find((entry) => entry.name === lostCreateName)?.id
+    expect(firstItemId).toBeGreaterThan(0)
+    expect(retriedItemId).toBe(firstItemId)
+    expect(createIntentKeys.slice(-2)[0]).toBeTruthy()
+    expect(createIntentKeys.slice(-2)[1]).toBe(createIntentKeys.slice(-2)[0])
+    expect(withE2eDb((db) => ({
+      items: (db.prepare('SELECT COUNT(*) AS n FROM redeem_items WHERE name=?').get(lostCreateName) as { n: number }).n,
+      audits: (db.prepare(
+        "SELECT COUNT(*) AS n FROM audit_log WHERE action='redeem_item.upsert' AND new_value LIKE ?",
+      ).get(`%${lostCreateName}%`) as { n: number }).n,
+    }))).toEqual({ items: 1, audits: 1 })
+
+    saveMode = 'intent-failure'
+    const intentStart = createIntentKeys.length
+    await newRow.getByPlaceholder('名称').fill(`E2E edited intent ${Date.now()}`)
+    await createButton.click()
+    await expect.poll(() => createIntentKeys.length).toBe(intentStart + 1)
+    await expect(page.getByTestId('redeem-item-error')).toHaveText('保存兑换项失败，请重试')
+    const originalIntentKey = createIntentKeys.at(-1)
+    await newRow.getByPlaceholder('说明').fill('edited after a retryable failure')
+    await createButton.click()
+    await expect.poll(() => createIntentKeys.length).toBe(intentStart + 2)
+    const editedIntentKey = createIntentKeys.at(-1)
+    expect(originalIntentKey).toBeTruthy()
+    expect(editedIntentKey).toBeTruthy()
+    expect(editedIntentKey).not.toBe(originalIntentKey)
+
+    saveMode = 'success'
+    const concurrentName = `E2E concurrent idempotent create ${Date.now()}`
+    const concurrentKey = `e2e-concurrent-${crypto.randomUUID()}`
+    const concurrentPayload = {
+      name: concurrentName,
+      description: 'concurrent create',
+      cost: 17,
+      kind: 'timed_quota',
+      enabled: true,
+      sort: 998,
+      fulfillment: 'placeholder',
+      perUserLimit: 0,
+    }
+    const [concurrentA, concurrentB] = await Promise.all([
+      page.request.put('/api/admin/redeem-items', {
+        headers: { 'Idempotency-Key': concurrentKey },
+        data: concurrentPayload,
+      }),
+      page.request.put('/api/admin/redeem-items', {
+        headers: { 'Idempotency-Key': concurrentKey },
+        data: concurrentPayload,
+      }),
+    ])
+    expect(concurrentA.status()).toBe(200)
+    expect(concurrentB.status()).toBe(200)
+    const concurrentBodyA = await concurrentA.json()
+    const concurrentBodyB = await concurrentB.json()
+    const concurrentIdA = concurrentBodyA.redeemItems.find((entry: { name: string }) => entry.name === concurrentName)?.id
+    const concurrentIdB = concurrentBodyB.redeemItems.find((entry: { name: string }) => entry.name === concurrentName)?.id
+    expect(concurrentIdA).toBeGreaterThan(0)
+    expect(concurrentIdB).toBe(concurrentIdA)
+    expect(withE2eDb((db) => ({
+      items: (db.prepare('SELECT COUNT(*) AS n FROM redeem_items WHERE name=?').get(concurrentName) as { n: number }).n,
+      audits: (db.prepare(
+        "SELECT COUNT(*) AS n FROM audit_log WHERE action='redeem_item.upsert' AND new_value LIKE ?",
+      ).get(`%${concurrentName}%`) as { n: number }).n,
+      intents: (db.prepare(
+        'SELECT COUNT(*) AS n FROM redeem_item_create_requests WHERE request_key=?',
+      ).get(concurrentKey) as { n: number }).n,
+    }))).toEqual({ items: 1, audits: 1, intents: 1 })
+
+    const conflict = await page.request.put('/api/admin/redeem-items', {
+      headers: { 'Idempotency-Key': concurrentKey },
+      data: { ...concurrentPayload, name: `${concurrentName} changed` },
+    })
+    expect(conflict.status()).toBe(409)
+    expect(await conflict.json()).toEqual({
+      ok: false,
+      code: 'IDEMPOTENCY_KEY_CONFLICT',
+      error: '该新增请求与已提交内容不一致，请重新编辑后再试',
+    })
   } finally {
-    withE2eDb((db) => db.prepare('UPDATE redeem_items SET enabled=1 WHERE id=?').run(item.id))
+    releaseLostCreate?.()
+    withE2eDb((db) => {
+      db.prepare('UPDATE redeem_items SET enabled=1 WHERE id=?').run(item.id)
+      if (lostCreateName) db.prepare('DELETE FROM redeem_items WHERE name=?').run(lostCreateName)
+      db.prepare("DELETE FROM redeem_items WHERE name LIKE 'E2E concurrent idempotent create %'").run()
+      const hasIntentTable = db.prepare(
+        "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='redeem_item_create_requests'",
+      ).get()
+      if (hasIntentTable) {
+        db.prepare("DELETE FROM redeem_item_create_requests WHERE request_key LIKE 'e2e-concurrent-%'").run()
+        for (const key of createIntentKeys.filter(Boolean)) {
+          db.prepare('DELETE FROM redeem_item_create_requests WHERE request_key=?').run(key)
+        }
+      }
+    })
   }
 })
 
@@ -953,7 +1325,7 @@ test('deleting an item applies the DELETE overview and ignores a stale config re
   const created = await page.evaluate(async (name) => {
     const response = await fetch('/api/admin/redeem-items', {
       method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'Idempotency-Key': `e2e-delete-overview-${crypto.randomUUID()}` },
       body: JSON.stringify({ name, description: 'delete overview fixture', cost: 1, kind: 'timed_quota', enabled: true, sort: 998 }),
     })
     return await response.json()

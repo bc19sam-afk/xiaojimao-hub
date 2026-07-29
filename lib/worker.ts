@@ -11,6 +11,46 @@ import { env } from './env'
 // ============================================================================
 
 let started = false
+type WorkerTasks = {
+  processPending: typeof import('./collect').processPending
+  checkPooledHealth: typeof import('./collect').checkPooledHealth
+  settleDailyUsage: typeof import('./settle').settleDailyUsage
+}
+let loadedTasks: WorkerTasks | undefined
+let readinessWarningShown = false
+
+async function loadReadyWorkerTasks(): Promise<WorkerTasks | undefined> {
+  try {
+    // Fresh-connection gate first: collect/settle both depend on the resident DB singleton and
+    // must not be imported until the canonical schema and write probe pass.
+    const { assertReadinessDatabase } = await import('./readiness-probe')
+    assertReadinessDatabase()
+    readinessWarningShown = false
+  } catch {
+    if (!readinessWarningShown) {
+      console.error('[worker] 数据库尚未就绪（后台巡检等待恢复）')
+      readinessWarningShown = true
+    }
+    return undefined
+  }
+
+  if (loadedTasks) return loadedTasks
+  try {
+    const collect = await import('./collect')
+    const settle = await import('./settle')
+    loadedTasks = {
+      processPending: collect.processPending,
+      checkPooledHealth: collect.checkPooledHealth,
+      settleDailyUsage: settle.settleDailyUsage,
+    }
+    return loadedTasks
+  } catch {
+    // lib/db uses a retryable lazy connection, so a DB race here cannot poison module loading;
+    // any unrelated module failure remains isolated from liveness and is reported without details.
+    console.error('[worker] 后台模块加载失败（本轮跳过）')
+    return undefined
+  }
+}
 
 export function startWorker() {
   if (started) return // 防重复启动（dev 热更可能多次触发）
@@ -21,23 +61,9 @@ export function startWorker() {
   started = true
 
   const tick = async () => {
-    // 延迟加载 DB 依赖：服务监听与 liveness/readiness 不应被坏库的模块求值阻断。
-    // 模块成功加载后由 ESM cache 复用，不会每轮重新执行文件。
-    let processPending: typeof import('./collect').processPending
-    let checkPooledHealth: typeof import('./collect').checkPooledHealth
-    let settleDailyUsage: typeof import('./settle').settleDailyUsage
-    try {
-      ;({ processPending, checkPooledHealth } = await import('./collect'))
-    } catch {
-      console.error('[worker] 收号模块加载失败（后台巡检本轮跳过）')
-      return
-    }
-    try {
-      ;({ settleDailyUsage } = await import('./settle'))
-    } catch {
-      console.error('[worker] 结算模块加载失败（后台巡检本轮跳过）')
-      return
-    }
+    const tasks = await loadReadyWorkerTasks()
+    if (!tasks) return
+    const { processPending, checkPooledHealth, settleDailyUsage } = tasks
 
     try {
       const r = await processPending()

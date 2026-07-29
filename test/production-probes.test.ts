@@ -54,7 +54,15 @@ function createDatabase(dbPath: string, broken = false): void {
   db.close()
 }
 
-function spawnProbeServer(dbPath: string): Promise<{
+function spawnProbeServer(
+  dbPath: string,
+  options: {
+    mock?: boolean
+    workerEnabled?: boolean
+    workerIntervalMs?: number
+    mockCpaPath?: string
+  } = {},
+): Promise<{
   child: ChildProcessWithoutNullStreams
   baseUrl: string
   stop: () => Promise<void>
@@ -68,9 +76,11 @@ function spawnProbeServer(dbPath: string): Promise<{
       ...process.env,
       NODE_ENV: 'production',
       NEXT_RUNTIME: 'nodejs',
-      MOCK: 'false',
-      WORKER_ENABLED: 'false',
+      MOCK: options.mock ? 'true' : 'false',
+      WORKER_ENABLED: options.workerEnabled ? 'true' : 'false',
+      WORKER_INTERVAL_MS: String(options.workerIntervalMs ?? 8000),
       DB_PATH: dbPath,
+      MOCK_CPA_PATH: options.mockCpaPath ?? path.join(dir, 'mock-cpa.json'),
       SESSION_SECRET: 'x'.repeat(64),
       CPA_BASE_URL: 'https://example.invalid',
       CPA_MANAGEMENT_KEY: 'test-only-not-real',
@@ -171,6 +181,114 @@ test('production cold start keeps health live and returns sanitized ready 503 fo
     const recovered = await fetch(`${server.baseUrl}/api/ready`)
     assert.equal(recovered.status, 200)
     assert.deepEqual(await recovered.json(), { ok: true })
+  } finally {
+    await server?.stop()
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('enabled worker retries readiness and starts a real collect tick after a broken database is repaired', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xjm-worker-recovery-'))
+  const dbPath = path.join(dir, 'app.db')
+  const mockCpaPath = path.join(dir, 'mock-cpa.json')
+  const contributionId = 'worker-recovery-contribution'
+  const accountId = 'worker-recovery-account'
+  const authFileName = 'grok-worker-recovery.json'
+  createDatabase(dbPath)
+  const fixture = new DatabaseSync(dbPath)
+  try {
+    const now = Date.now()
+    fixture.prepare(
+      `INSERT INTO contributions
+       (id, linuxdo_id, username, account_id, email, provider, plan, method, auth_file_name,
+        verify_status, points, reward_status, reward_text, reward_note, reward_code, created_at, updated_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    ).run(
+      contributionId,
+      1,
+      'worker-recovery',
+      accountId,
+      '',
+      'grok',
+      'super',
+      'oauth',
+      authFileName,
+      'submitted',
+      0,
+      'none',
+      '',
+      '',
+      null,
+      now,
+      now,
+    )
+    fixture.exec('ALTER TABLE redeem_items RENAME TO __xjm_broken_redeem_items')
+  } finally {
+    fixture.close()
+  }
+  fs.writeFileSync(mockCpaPath, JSON.stringify({
+    [authFileName]: {
+      name: authFileName,
+      accountId,
+      email: 'worker-recovery@example.com',
+      plan: 'super',
+      disabled: true,
+      provider: 'grok',
+    },
+  }))
+
+  let server: Awaited<ReturnType<typeof spawnProbeServer>> | undefined
+  try {
+    server = await spawnProbeServer(dbPath, {
+      mock: true,
+      workerEnabled: true,
+      workerIntervalMs: 100,
+      mockCpaPath,
+    })
+    const health = await fetch(`${server.baseUrl}/api/health`)
+    assert.equal(health.status, 200)
+    assert.deepEqual(await health.json(), { ok: true })
+    const brokenReady = await fetch(`${server.baseUrl}/api/ready`)
+    assert.equal(brokenReady.status, 503)
+    assert.deepEqual(await brokenReady.json(), {
+      ok: false,
+      code: 'DATABASE_NOT_READY',
+      summary: '数据库尚未就绪',
+    })
+
+    // Let the first scheduled worker tick run against the broken schema. The worker must not
+    // import/cache DB-backed collect or settle modules before the readiness gate succeeds.
+    await wait(3_300)
+    const beforeRepair = new DatabaseSync(dbPath)
+    try {
+      const row = beforeRepair.prepare(
+        'SELECT verify_status AS status FROM contributions WHERE id=?',
+      ).get(contributionId) as { status: string }
+      assert.equal(row.status, 'submitted')
+      beforeRepair.exec('ALTER TABLE __xjm_broken_redeem_items RENAME TO redeem_items')
+    } finally {
+      beforeRepair.close()
+    }
+
+    const recoveredReady = await fetch(`${server.baseUrl}/api/ready`)
+    assert.equal(recoveredReady.status, 200)
+    assert.deepEqual(await recoveredReady.json(), { ok: true })
+
+    const deadline = Date.now() + 5_000
+    let status = 'submitted'
+    while (Date.now() < deadline) {
+      const check = new DatabaseSync(dbPath)
+      try {
+        status = (check.prepare(
+          'SELECT verify_status AS status FROM contributions WHERE id=?',
+        ).get(contributionId) as { status: string }).status
+      } finally {
+        check.close()
+      }
+      if (status === 'pooled') break
+      await wait(100)
+    }
+    assert.equal(status, 'pooled', '修库后无需重启，真实 worker tick 应完成 collect 入池')
   } finally {
     await server?.stop()
     fs.rmSync(dir, { recursive: true, force: true })

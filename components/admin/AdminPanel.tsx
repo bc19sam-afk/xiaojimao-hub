@@ -7,6 +7,11 @@ import {
   probeSystemStatus,
   type ServiceProbeResult,
 } from '@/lib/service-status'
+import {
+  parseAdminRedeemItemsResponse,
+  type AdminOverviewResponse,
+  type AdminRedeemItem,
+} from '@/lib/admin-redeem-items-response'
 
 interface PointRule {
   id: number
@@ -25,18 +30,7 @@ interface UsageRate {
   enabled: number
   label: string
 }
-interface RedeemItem {
-  id: number
-  name: string
-  description: string
-  cost: number
-  kind: string
-  enabled: number
-  sort: number
-  config: string
-  fulfillment?: string
-  perUserLimit?: number
-}
+type RedeemItem = AdminRedeemItem
 // 审计日志一行（P4-R1，§7.3）：old/new 为已脱敏 JSON 摘要串（绝不含码/密钥），查看侧原样展示不泄敏感值
 interface AuditRow {
   id: number
@@ -98,20 +92,7 @@ interface ReviewRow {
   createdAt: number
   updatedAt: number
 }
-interface AdminOverview {
-  pooledAccounts: number
-  needsReview: number
-  pendingRedemptions: number
-  enabledRedeemItems: number
-}
-
-function isAdminOverview(value: unknown): value is AdminOverview {
-  if (!value || typeof value !== 'object') return false
-  const candidate = value as Record<keyof AdminOverview, unknown>
-  return ['pooledAccounts', 'needsReview', 'pendingRedemptions', 'enabledRedeemItems'].every(
-    (key) => typeof candidate[key as keyof AdminOverview] === 'number' && Number.isFinite(candidate[key as keyof AdminOverview]),
-  )
-}
+type AdminOverview = AdminOverviewResponse
 interface PendingConfirmation extends ConfirmDialogRequest {
   run: () => Promise<void>
   fallbackFocus: () => HTMLElement | null
@@ -125,6 +106,13 @@ const PUBLIC_DELETE_ERRORS = {
 } as const
 
 const PUBLIC_REDEEM_ITEM_SAVE_ERROR = '保存兑换项失败，请重试'
+const PUBLIC_ADMIN_LOAD_ERROR = '部分后台数据暂时无法加载，请刷新重试'
+const PUBLIC_AUDIT_LOAD_ERROR = '审计记录暂时无法加载，请重试'
+const PUBLIC_REDEEM_ITEM_SAVE_ERRORS_BY_CODE: Record<string, string> = {
+  REDEEM_ITEM_SAVE_FAILED: PUBLIC_REDEEM_ITEM_SAVE_ERROR,
+  REDEEM_ITEM_NOT_FOUND: '兑换项不存在或已被删除，请刷新后重试',
+  IDEMPOTENCY_KEY_CONFLICT: '该新增请求与已提交内容不一致，请重新编辑后再试',
+}
 
 const PUBLIC_ACTION_ERRORS_BY_CODE = {
   POINT_RULE_DELETE_FAILED: PUBLIC_DELETE_ERRORS.pointRule,
@@ -137,6 +125,12 @@ const PUBLIC_ACTION_ERRORS_BY_CODE = {
 function publicActionError(code: unknown, expectedCode: keyof typeof PUBLIC_ACTION_ERRORS_BY_CODE, fallback: string) {
   if (code !== expectedCode) return fallback
   return PUBLIC_ACTION_ERRORS_BY_CODE[expectedCode]
+}
+
+function publicRedeemItemSaveError(code: unknown): string {
+  return typeof code === 'string'
+    ? PUBLIC_REDEEM_ITEM_SAVE_ERRORS_BY_CODE[code] ?? PUBLIC_REDEEM_ITEM_SAVE_ERROR
+    : PUBLIC_REDEEM_ITEM_SAVE_ERROR
 }
 
 const KINDS = [
@@ -154,6 +148,90 @@ const FULFILLMENTS = [
 
 const field =
   'rounded-lg border border-white/10 bg-white/5 px-2 py-1.5 text-sm text-neutral-100 outline-none focus:border-emerald-400/50'
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+function isSafeInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value)
+}
+
+function isNonNegativeSafeInteger(value: unknown): value is number {
+  return isSafeInteger(value) && value >= 0
+}
+
+function isPointRule(value: unknown): value is PointRule {
+  return isRecord(value) && isSafeInteger(value.id) && value.id > 0 &&
+    typeof value.provider === 'string' && typeof value.plan === 'string' &&
+    isSafeInteger(value.points) && (value.enabled === 0 || value.enabled === 1) &&
+    typeof value.label === 'string'
+}
+
+function isUsageRate(value: unknown): value is UsageRate {
+  return isRecord(value) && isSafeInteger(value.id) && value.id > 0 &&
+    typeof value.provider === 'string' && typeof value.plan === 'string' &&
+    typeof value.pointsPerCall === 'number' && Number.isFinite(value.pointsPerCall) && value.pointsPerCall >= 0 &&
+    (value.enabled === 0 || value.enabled === 1) && typeof value.label === 'string'
+}
+
+function isContributionRow(value: unknown): value is ContributionRow {
+  return isRecord(value) && typeof value.id === 'string' && isSafeInteger(value.linuxdoId) && value.linuxdoId > 0 &&
+    typeof value.username === 'string' && typeof value.provider === 'string' && typeof value.plan === 'string' &&
+    typeof value.accountId === 'string' && typeof value.verifyStatus === 'string' &&
+    isNonNegativeSafeInteger(value.points) && isNonNegativeSafeInteger(value.createdAt)
+}
+
+function isSettlementRow(value: unknown): value is SettlementRow {
+  return isRecord(value) && isSafeInteger(value.id) && value.id > 0 &&
+    typeof value.contributionId === 'string' &&
+    (value.linuxdoId === null || (isSafeInteger(value.linuxdoId) && value.linuxdoId > 0)) &&
+    typeof value.username === 'string' && typeof value.date === 'string' &&
+    typeof value.provider === 'string' && typeof value.accountId === 'string' &&
+    isNonNegativeSafeInteger(value.callCount) && isSafeInteger(value.points) &&
+    isNonNegativeSafeInteger(value.settledAt)
+}
+
+function isRedemptionRow(value: unknown): value is RedemptionRow {
+  return isRecord(value) && typeof value.id === 'string' && isSafeInteger(value.linuxdoId) && value.linuxdoId > 0 &&
+    typeof value.username === 'string' && typeof value.itemName === 'string' &&
+    isNonNegativeSafeInteger(value.cost) && typeof value.status === 'string' &&
+    isNonNegativeSafeInteger(value.createdAt)
+}
+
+function isReviewRow(value: unknown): value is ReviewRow {
+  return isRecord(value) && typeof value.id === 'string' && isSafeInteger(value.linuxdoId) && value.linuxdoId > 0 &&
+    typeof value.username === 'string' && typeof value.provider === 'string' &&
+    typeof value.accountId === 'string' && isNonNegativeSafeInteger(value.createdAt) &&
+    isNonNegativeSafeInteger(value.updatedAt)
+}
+
+function isAuditRow(value: unknown): value is AuditRow {
+  if (!isRecord(value)) return false
+  return (
+    typeof value.id === 'number' && Number.isSafeInteger(value.id) && value.id > 0 &&
+    typeof value.actorType === 'string' &&
+    (value.actorId === null || (typeof value.actorId === 'number' && Number.isSafeInteger(value.actorId))) &&
+    typeof value.actorLabel === 'string' &&
+    typeof value.action === 'string' &&
+    typeof value.target === 'string' &&
+    (value.oldValue === null || typeof value.oldValue === 'string') &&
+    (value.newValue === null || typeof value.newValue === 'string') &&
+    typeof value.createdAt === 'number' && Number.isSafeInteger(value.createdAt) && value.createdAt >= 0
+  )
+}
+
+async function fetchAdminObject(url: string): Promise<Record<string, unknown>> {
+  const response = await fetch(url, { cache: 'no-store' })
+  let body: unknown
+  try {
+    body = await response.json()
+  } catch {
+    throw new Error('invalid admin response')
+  }
+  if (!response.ok || !isRecord(body)) throw new Error('admin request failed')
+  return body
+}
 
 export default function AdminPanel() {
   const [rules, setRules] = useState<PointRule[]>([])
@@ -183,56 +261,134 @@ export default function AdminPanel() {
   const itemHeadingRef = useRef<HTMLHeadingElement>(null)
   const reviewHeadingRef = useRef<HTMLHeadingElement>(null)
   const [msg, setMsg] = useState('')
+  const [itemError, setItemError] = useState('')
+  const [auditError, setAuditError] = useState('')
+  const [adminLoadError, setAdminLoadError] = useState('')
+  const savingItemKeysRef = useRef(new Set<string>())
+  const [savingItemKeys, setSavingItemKeys] = useState<Set<string>>(() => new Set())
 
   const load = useCallback(async () => {
-    const d = await fetch('/api/admin/config', { cache: 'no-store' }).then((r) => r.json())
-    setRules(d.pointRules ?? [])
-    setItems(d.redeemItems ?? [])
-    if (d.overview) setOverview(d.overview)
+    try {
+      const d = await fetchAdminObject('/api/admin/config')
+      if (!Array.isArray(d.pointRules) || !d.pointRules.every(isPointRule)) throw new Error('invalid point rules')
+      const parsed = parseAdminRedeemItemsResponse({
+        ok: true,
+        redeemItems: d.redeemItems,
+        overview: d.overview,
+      })
+      if (!parsed) throw new Error('invalid redeem item config')
+      setRules(d.pointRules)
+      setItems(parsed.redeemItems)
+      setOverview(parsed.overview)
+    } catch {
+      setAdminLoadError(PUBLIC_ADMIN_LOAD_ERROR)
+    }
   }, [])
   const loadRates = useCallback(async () => {
-    const d = await fetch('/api/admin/usage-rates', { cache: 'no-store' }).then((r) => r.json())
-    if (d.ok) setRates(d.usageRates ?? [])
+    try {
+      const d = await fetchAdminObject('/api/admin/usage-rates')
+      if (d.ok !== true || !Array.isArray(d.usageRates) || !d.usageRates.every(isUsageRate)) throw new Error('invalid usage rates')
+      setRates(d.usageRates)
+    } catch {
+      setAdminLoadError(PUBLIC_ADMIN_LOAD_ERROR)
+    }
   }, [])
   const loadQuota = useCallback(async () => {
-    const d = await fetch('/api/admin/ldc-quota', { cache: 'no-store' }).then((r) => r.json())
-    if (d.ok) setQuota(String(d.quota))
+    try {
+      const d = await fetchAdminObject('/api/admin/ldc-quota')
+      if (d.ok !== true || typeof d.quota !== 'number' || !Number.isSafeInteger(d.quota) || d.quota < 0) {
+        throw new Error('invalid quota')
+      }
+      setQuota(String(d.quota))
+    } catch {
+      setAdminLoadError(PUBLIC_ADMIN_LOAD_ERROR)
+    }
   }, [])
   const loadGate = useCallback(async () => {
-    const d = await fetch('/api/admin/trust-gate', { cache: 'no-store' }).then((r) => r.json())
-    if (d.ok) {
+    try {
+      const d = await fetchAdminObject('/api/admin/trust-gate')
+      if (
+        d.ok !== true || typeof d.enabled !== 'boolean' || typeof d.minTrust !== 'number' ||
+        !Number.isSafeInteger(d.minTrust) || d.minTrust < 0
+      ) throw new Error('invalid trust gate')
       setGateEnabled(d.enabled)
       setMinTrust(String(d.minTrust))
+    } catch {
+      setAdminLoadError(PUBLIC_ADMIN_LOAD_ERROR)
     }
   }, [])
   const loadSettle = useCallback(async () => {
-    const d = await fetch('/api/admin/settle-params', { cache: 'no-store' }).then((r) => r.json())
-    if (d.ok) setGraceMinutes(String(d.graceMinutes))
+    try {
+      const d = await fetchAdminObject('/api/admin/settle-params')
+      if (
+        d.ok !== true || typeof d.graceMinutes !== 'number' || !Number.isSafeInteger(d.graceMinutes) ||
+        d.graceMinutes < 0 || d.graceMinutes > 1439
+      ) throw new Error('invalid settle params')
+      setGraceMinutes(String(d.graceMinutes))
+    } catch {
+      setAdminLoadError(PUBLIC_ADMIN_LOAD_ERROR)
+    }
   }, [])
   const loadPool = useCallback(async () => {
-    const d = await fetch('/api/admin/pool-priority', { cache: 'no-store' }).then((r) => r.json())
-    if (d.ok) setPoolPriority(String(d.poolPriority))
+    try {
+      const d = await fetchAdminObject('/api/admin/pool-priority')
+      if (
+        d.ok !== true || typeof d.poolPriority !== 'number' || !Number.isSafeInteger(d.poolPriority) ||
+        d.poolPriority < 0
+      ) throw new Error('invalid pool priority')
+      setPoolPriority(String(d.poolPriority))
+    } catch {
+      setAdminLoadError(PUBLIC_ADMIN_LOAD_ERROR)
+    }
   }, [])
   const loadAudit = useCallback(async () => {
-    const d = await fetch('/api/admin/audit?limit=50', { cache: 'no-store' }).then((r) => r.json())
-    if (d.ok) setAudit(d.audit ?? [])
+    try {
+      const d = await fetchAdminObject('/api/admin/audit?limit=50')
+      if (d.ok !== true || !Array.isArray(d.audit) || !d.audit.every(isAuditRow)) {
+        throw new Error('invalid audit')
+      }
+      setAudit(d.audit)
+      setAuditError('')
+    } catch {
+      setAuditError(PUBLIC_AUDIT_LOAD_ERROR)
+    }
   }, [])
   // 数据查看三块：各拉一页（limit=50）。§8——兑换记录后端已脱敏，不含 result
   const loadContributions = useCallback(async () => {
-    const d = await fetch('/api/admin/contributions?limit=50', { cache: 'no-store' }).then((r) => r.json())
-    if (d.ok) setContributions(d.contributions ?? [])
+    try {
+      const d = await fetchAdminObject('/api/admin/contributions?limit=50')
+      if (d.ok !== true || !Array.isArray(d.contributions) || !d.contributions.every(isContributionRow)) throw new Error('invalid contributions')
+      setContributions(d.contributions)
+    } catch {
+      setAdminLoadError(PUBLIC_ADMIN_LOAD_ERROR)
+    }
   }, [])
   const loadSettlements = useCallback(async () => {
-    const d = await fetch('/api/admin/settlements?limit=50', { cache: 'no-store' }).then((r) => r.json())
-    if (d.ok) setSettlements(d.settlements ?? [])
+    try {
+      const d = await fetchAdminObject('/api/admin/settlements?limit=50')
+      if (d.ok !== true || !Array.isArray(d.settlements) || !d.settlements.every(isSettlementRow)) throw new Error('invalid settlements')
+      setSettlements(d.settlements)
+    } catch {
+      setAdminLoadError(PUBLIC_ADMIN_LOAD_ERROR)
+    }
   }, [])
   const loadRedemptions = useCallback(async () => {
-    const d = await fetch('/api/admin/redemptions?limit=50', { cache: 'no-store' }).then((r) => r.json())
-    if (d.ok) setRedemptions(d.redemptions ?? [])
+    try {
+      const d = await fetchAdminObject('/api/admin/redemptions?limit=50')
+      if (d.ok !== true || !Array.isArray(d.redemptions) || !d.redemptions.every(isRedemptionRow)) throw new Error('invalid redemptions')
+      setRedemptions(d.redemptions)
+    } catch {
+      setAdminLoadError(PUBLIC_ADMIN_LOAD_ERROR)
+    }
   }, [])
   const loadReview = useCallback(async () => {
-    const d = await fetch('/api/admin/review', { cache: 'no-store' }).then((r) => r.json())
-    if (d.ok) setReview(d.review ?? [])
+    try {
+      const d = await fetchAdminObject('/api/admin/review')
+      if (d.ok !== true || !Array.isArray(d.review) || !d.review.every(isReviewRow)) throw new Error('invalid review')
+      setReview(d.review)
+    } catch {
+      setAdminLoadError(PUBLIC_ADMIN_LOAD_ERROR)
+    }
   }, [])
   const refreshSystemStatus = useCallback(async () => {
     if (statusRefreshInFlight.current) return
@@ -395,39 +551,51 @@ export default function AdminPanel() {
     flash('已删除')
     void loadAudit().catch(() => {})
   }
-  async function saveItem(it: Partial<RedeemItem>) {
+  async function saveItem(
+    it: Partial<RedeemItem>,
+    rowKey: string,
+    idempotencyKey?: string,
+  ): Promise<boolean> {
+    if (savingItemKeysRef.current.has(rowKey)) return false
+    savingItemKeysRef.current.add(rowKey)
+    setSavingItemKeys(new Set(savingItemKeysRef.current))
+    setItemError('')
     try {
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+      if (idempotencyKey) headers['Idempotency-Key'] = idempotencyKey
       const res = await fetch('/api/admin/redeem-items', {
         method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify({ ...it, enabled: it.enabled !== 0 }),
       })
-      const d = await res.json().catch(() => null) as {
-        ok?: unknown
-        code?: unknown
-        redeemItems?: unknown
-        overview?: unknown
-      } | null
-      if (!res.ok || d?.ok !== true || !Array.isArray(d.redeemItems) || !isAdminOverview(d.overview)) {
-        flash(publicActionError(d?.code, 'REDEEM_ITEM_SAVE_FAILED', PUBLIC_REDEEM_ITEM_SAVE_ERROR))
-        return
+      const d = await res.json().catch(() => null)
+      const parsed = parseAdminRedeemItemsResponse(d)
+      if (!res.ok || !parsed) {
+        setItemError(publicRedeemItemSaveError(isRecord(d) ? d.code : undefined))
+        return false
       }
-      setItems(d.redeemItems as RedeemItem[])
-      setOverview(d.overview)
+      setItems(parsed.redeemItems)
+      setOverview(parsed.overview)
       flash('已保存')
-      void loadAudit().catch(() => {})
+      void loadAudit()
+      return true
     } catch {
-      flash(PUBLIC_REDEEM_ITEM_SAVE_ERROR)
+      setItemError(PUBLIC_REDEEM_ITEM_SAVE_ERROR)
+      return false
+    } finally {
+      savingItemKeysRef.current.delete(rowKey)
+      setSavingItemKeys(new Set(savingItemKeysRef.current))
     }
   }
   async function delItem(id: number) {
     const res = await fetch('/api/admin/redeem-items?id=' + id, { method: 'DELETE' })
-    const d = await res.json().catch(() => ({}))
-    if (!res.ok || !d.ok || !Array.isArray(d.redeemItems) || !d.overview) {
-      throw new Error(publicActionError(d.code, 'REDEEM_ITEM_DELETE_FAILED', PUBLIC_DELETE_ERRORS.redeemItem))
+    const d = await res.json().catch(() => null)
+    const parsed = parseAdminRedeemItemsResponse(d)
+    if (!res.ok || !parsed) {
+      throw new Error(publicActionError(isRecord(d) ? d.code : undefined, 'REDEEM_ITEM_DELETE_FAILED', PUBLIC_DELETE_ERRORS.redeemItem))
     }
-    setItems(d.redeemItems)
-    setOverview(d.overview)
+    setItems(parsed.redeemItems)
+    setOverview(parsed.overview)
     flash('已删除')
     void loadAudit().catch(() => {})
   }
@@ -521,6 +689,12 @@ export default function AdminPanel() {
             </a>
           </div>
         </header>
+
+        {adminLoadError && (
+          <p role="alert" className="mb-6 rounded-lg border border-amber-400/20 bg-amber-500/10 px-3 py-2 text-xs text-amber-100">
+            {adminLoadError}
+          </p>
+        )}
 
         <section aria-labelledby="admin-overview-title" className="mb-8 rounded-2xl border border-white/10 bg-white/[0.03] p-5">
           <div className="flex flex-wrap items-start justify-between gap-3">
@@ -616,14 +790,30 @@ export default function AdminPanel() {
         <section className="rounded-2xl border border-white/10 bg-white/[0.02] p-5">
           <h2 ref={itemHeadingRef} tabIndex={-1} className="mb-1 font-bold text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400">兑换项（商店）</h2>
           <p className="mb-4 text-xs text-neutral-500">用户用积分兑换。履约接口后续接小鸡毛，现为占位。</p>
+          {itemError && (
+            <p
+              data-testid="redeem-item-error"
+              role="alert"
+              aria-live="assertive"
+              className="mb-4 rounded-lg border border-rose-400/25 bg-rose-500/10 px-3 py-2 text-xs text-rose-200"
+            >
+              {itemError}
+            </p>
+          )}
           <div className="space-y-2">
             <div className="grid grid-cols-[1.3fr_100px_1fr_1.4fr_auto_auto] gap-2 text-[11px] text-neutral-500">
               <span>名称</span><span>积分价</span><span>类型</span><span>说明</span><span>启用</span><span></span>
             </div>
             {items.map((it) => (
-              <ItemRow key={it.id} item={it} onSave={saveItem} onDelete={() => confirmItemDelete(it)} />
+              <ItemRow
+                key={it.id}
+                item={it}
+                onSave={saveItem}
+                onDelete={() => confirmItemDelete(it)}
+                saving={savingItemKeys.has(`item:${it.id}`)}
+              />
             ))}
-            <ItemRow onSave={saveItem} isNew />
+            <ItemRow onSave={saveItem} isNew saving={savingItemKeys.has('new')} />
           </div>
         </section>
 
@@ -753,6 +943,8 @@ export default function AdminPanel() {
           <div className="mb-1 flex items-center justify-between">
             <h2 className="font-bold text-white">审计日志</h2>
             <button
+              type="button"
+              data-testid="refresh-audit"
               onClick={loadAudit}
               className="rounded-lg border border-white/10 bg-white/5 px-2.5 py-1 text-xs hover:bg-white/10"
             >
@@ -762,6 +954,15 @@ export default function AdminPanel() {
           <p className="mb-4 text-xs text-neutral-500">
             配置写操作留痕（操作人 / 时间 / 动作 / 目标 / 旧→新）。最新 50 条，倒序。
           </p>
+          {auditError && (
+            <p
+              data-testid="audit-load-error"
+              role="alert"
+              className="mb-4 rounded-lg border border-rose-400/25 bg-rose-500/10 px-3 py-2 text-xs text-rose-200"
+            >
+              {auditError}
+            </p>
+          )}
           <div className="space-y-1.5">
             <div className="grid grid-cols-[130px_130px_1.2fr_1.4fr_2fr] gap-2 text-[11px] text-neutral-500">
               <span>时间</span><span>操作人</span><span>动作</span><span>目标</span><span>旧 → 新</span>
@@ -1197,32 +1398,62 @@ function ItemRow({
   onSave,
   onDelete,
   isNew,
+  saving,
 }: {
   item?: RedeemItem
-  onSave: (it: Partial<RedeemItem>) => void
+  onSave: (it: Partial<RedeemItem>, rowKey: string, idempotencyKey?: string) => Promise<boolean>
   onDelete?: () => void
   isNew?: boolean
+  saving: boolean
 }) {
   const [name, setName] = useState(item?.name ?? '')
   const [cost, setCost] = useState(item?.cost ?? 0)
   const [kind, setKind] = useState(item?.kind ?? 'timed_quota')
-  const [fulfillment, setFulfillment] = useState(item?.fulfillment ?? 'placeholder')
+  const [fulfillment, setFulfillment] = useState<'placeholder' | 'cdk'>(item?.fulfillment ?? 'placeholder')
   const [perUserLimit, setPerUserLimit] = useState(item?.perUserLimit ?? 0)
   const [description, setDescription] = useState(item?.description ?? '')
   const [enabled, setEnabled] = useState((item?.enabled ?? 1) !== 0)
+  const createIntentKey = useRef<string | null>(null)
+
+  const changed = () => {
+    if (isNew) createIntentKey.current = null
+  }
+
+  const submit = async () => {
+    const rowKey = item ? `item:${item.id}` : 'new'
+    if (isNew && !createIntentKey.current) createIntentKey.current = crypto.randomUUID()
+    const saved = await onSave(
+      { id: item?.id, name, cost, kind, fulfillment, perUserLimit, description, sort: item?.sort ?? 0, enabled: enabled ? 1 : 0 },
+      rowKey,
+      isNew ? createIntentKey.current ?? undefined : undefined,
+    )
+    if (saved && isNew) {
+      setName('')
+      setCost(0)
+      setKind('timed_quota')
+      setFulfillment('placeholder')
+      setPerUserLimit(0)
+      setDescription('')
+      setEnabled(true)
+      createIntentKey.current = null
+    }
+  }
 
   return (
-    <div className="grid grid-cols-[1.2fr_80px_1fr_1fr_72px_1.2fr_auto_auto] items-center gap-2">
-      <input className={field} value={name} onChange={(e) => setName(e.target.value)} placeholder="名称" />
-      <input className={field} type="number" value={cost} onChange={(e) => setCost(Number(e.target.value))} />
-      <select className={field} value={kind} onChange={(e) => setKind(e.target.value)}>
+    <div
+      data-testid={isNew ? 'redeem-item-new-row' : `redeem-item-row-${item?.id}`}
+      className="grid grid-cols-[1.2fr_80px_1fr_1fr_72px_1.2fr_auto_auto] items-center gap-2"
+    >
+      <input className={field} value={name} disabled={saving} onChange={(e) => { changed(); setName(e.target.value) }} placeholder="名称" />
+      <input className={field} type="number" value={cost} disabled={saving} onChange={(e) => { changed(); setCost(Number(e.target.value)) }} />
+      <select className={field} value={kind} disabled={saving} onChange={(e) => { changed(); setKind(e.target.value) }}>
         {KINDS.map((k) => (
           <option key={k.v} value={k.v}>
             {k.t}
           </option>
         ))}
       </select>
-      <select className={field} value={fulfillment} onChange={(e) => setFulfillment(e.target.value)} title="履约类型">
+      <select className={field} value={fulfillment} disabled={saving} onChange={(e) => { changed(); setFulfillment(e.target.value as 'placeholder' | 'cdk') }} title="履约类型">
         {FULFILLMENTS.map((f) => (
           <option key={f.v} value={f.v}>
             {f.t}
@@ -1234,21 +1465,22 @@ function ItemRow({
         type="number"
         min={0}
         value={perUserLimit}
-        onChange={(e) => setPerUserLimit(Number(e.target.value))}
+        disabled={saving}
+        onChange={(e) => { changed(); setPerUserLimit(Number(e.target.value)) }}
         title="每人限购（0=不限）"
         placeholder="限购"
       />
-      <input className={field} value={description} onChange={(e) => setDescription(e.target.value)} placeholder="说明" />
-      <input type="checkbox" checked={enabled} onChange={(e) => setEnabled(e.target.checked)} className="h-4 w-4 accent-emerald-500" />
+      <input className={field} value={description} disabled={saving} onChange={(e) => { changed(); setDescription(e.target.value) }} placeholder="说明" />
+      <input type="checkbox" checked={enabled} disabled={saving} onChange={(e) => { changed(); setEnabled(e.target.checked) }} className="h-4 w-4 accent-emerald-500" />
       <div className="flex gap-1">
         <button
           type="button"
-          onClick={() =>
-            onSave({ id: item?.id, name, cost, kind, fulfillment, perUserLimit, description, sort: item?.sort ?? 0, enabled: enabled ? 1 : 0 })
-          }
-          className="rounded-lg bg-[var(--brand)]/20 px-2.5 py-1.5 text-xs font-medium text-[var(--brand-bright)] hover:bg-[var(--brand)]/30"
+          data-testid="redeem-item-save"
+          onClick={() => void submit()}
+          disabled={saving}
+          className="rounded-lg bg-[var(--brand)]/20 px-2.5 py-1.5 text-xs font-medium text-[var(--brand-bright)] hover:bg-[var(--brand)]/30 disabled:cursor-not-allowed disabled:opacity-50"
         >
-          {isNew ? '新增' : '保存'}
+          {saving ? '保存中…' : isNew ? '新增' : '保存'}
         </button>
         {onDelete && (
           <button

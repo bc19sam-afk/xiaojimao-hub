@@ -54,17 +54,22 @@ const DB_PATH = process.env.DB_PATH || path.join(process.cwd(), 'data', 'app.db'
 function openDb(): DatabaseSync {
   fs.mkdirSync(path.dirname(DB_PATH), { recursive: true })
   const d = new DatabaseSync(DB_PATH)
-  // busy_timeout 必须先设：它一设即生效且自身不取锁，随后所有取锁语句（WAL 建立、seedDefaults 的
-  // BEGIN IMMEDIATE）都受这 5s 等待保护。若顺序颠倒，next build 多 worker 同刻 openDb 争 WAL 建立
-  // 的短暂排他锁时，journal_mode=WAL 会以 busy_timeout=0 立刻抛 "database is locked"（无重试）。
-  d.exec('PRAGMA busy_timeout = 5000')
-  d.exec('PRAGMA journal_mode = WAL')
-  // 迁移纪律：生产（非 mock）只校验 schema 版本，迁移由部署步骤 `npm run migrate` 执行；
-  // mock（开发/演示）保持启动自动迁移。
-  if (env.mock) migrate(d)
-  else assertSchemaCurrent(d)
-  seedDefaults(d)
-  return d
+  try {
+    // busy_timeout 必须先设：它一设即生效且自身不取锁，随后所有取锁语句（WAL 建立、seedDefaults 的
+    // BEGIN IMMEDIATE）都受这 5s 等待保护。若顺序颠倒，next build 多 worker 同刻 openDb 争 WAL 建立
+    // 的短暂排他锁时，journal_mode=WAL 会以 busy_timeout=0 立刻抛 "database is locked"（无重试）。
+    d.exec('PRAGMA busy_timeout = 5000')
+    d.exec('PRAGMA journal_mode = WAL')
+    // 迁移纪律：生产（非 mock）只校验 schema 版本，迁移由部署步骤 `npm run migrate` 执行；
+    // mock（开发/演示）保持启动自动迁移。
+    if (env.mock) migrate(d)
+    else assertSchemaCurrent(d)
+    seedDefaults(d)
+    return d
+  } catch (error) {
+    d.close()
+    throw error
+  }
 }
 
 // 首次运行播种合理默认值（管理页可随时改）。仅在表为空时插入。
@@ -155,9 +160,21 @@ export function seedDefaults(d: DatabaseSync): void {
   }
 }
 
-// 跨热更新复用同一连接
+// 跨热更新复用同一连接。连接本身惰性创建：DB-backed 模块可以安全完成 ESM 求值；若坏库令
+// openDb() 失败，本次调用抛错但模块不会进入 rejected-module cache，修库后下一次调用会重新尝试。
+// Proxy 只转发 DatabaseSync 方法并绑定真实实例，避免原生方法的 this brand check 失败；现有数十个
+// db 调用点无需改成 getDb()，把恢复能力收敛在单例边界。
 const g = globalThis as unknown as { __appDb?: DatabaseSync }
-const conn: DatabaseSync = g.__appDb ?? (g.__appDb = openDb())
+function connection(): DatabaseSync {
+  return g.__appDb ?? (g.__appDb = openDb())
+}
+const conn = new Proxy({} as DatabaseSync, {
+  get(_target, property) {
+    const current = connection()
+    const value = Reflect.get(current, property, current)
+    return typeof value === 'function' ? value.bind(current) : value
+  },
+})
 
 interface Row {
   id: string
@@ -607,9 +624,9 @@ export const db = {
     config?: string
     fulfillment?: string
     perUserLimit?: number
-  }): void {
+  }): number | undefined {
     if (it.id) {
-      conn
+      const result = conn
         .prepare(
           `UPDATE redeem_items SET name=?, description=?, cost=?, kind=?, enabled=?, sort=?, config=?,
              fulfillment=COALESCE(?, fulfillment), per_user_limit=COALESCE(?, per_user_limit) WHERE id=?`,
@@ -618,8 +635,9 @@ export const db = {
           it.name, it.description, it.cost, it.kind, it.enabled ? 1 : 0, it.sort, it.config ?? '{}',
           it.fulfillment ?? null, it.perUserLimit ?? null, it.id,
         )
+      return result.changes === 1 ? it.id : undefined
     } else {
-      conn
+      const result = conn
         .prepare(
           `INSERT INTO redeem_items (name, description, cost, kind, enabled, sort, config, fulfillment, per_user_limit)
            VALUES (?,?,?,?,?,?,?,?,?)`,
@@ -628,7 +646,23 @@ export const db = {
           it.name, it.description, it.cost, it.kind, it.enabled ? 1 : 0, it.sort, it.config ?? '{}',
           it.fulfillment ?? 'placeholder', it.perUserLimit ?? 0,
         )
+      return Number(result.lastInsertRowid)
     }
+  },
+  getRedeemItemCreateRequest(requestKey: string): RedeemItemCreateRequest | undefined {
+    return conn
+      .prepare(
+        `SELECT request_key AS requestKey, payload_hash AS payloadHash, item_id AS itemId,
+                created_at AS createdAt
+         FROM redeem_item_create_requests WHERE request_key=?`,
+      )
+      .get(requestKey) as unknown as RedeemItemCreateRequest | undefined
+  },
+  recordRedeemItemCreateRequest(request: RedeemItemCreateRequest): void {
+    conn.prepare(
+      `INSERT INTO redeem_item_create_requests (request_key, payload_hash, item_id, created_at)
+       VALUES (?,?,?,?)`,
+    ).run(request.requestKey, request.payloadHash, request.itemId, request.createdAt)
   },
   deleteRedeemItem(id: number): void {
     conn.prepare('DELETE FROM redeem_items WHERE id=?').run(id)
@@ -1470,6 +1504,12 @@ export interface RedeemItem {
   fulfillment: string
   // 每人限购件数（P3-R1）：0＝不限（默认）
   perUserLimit: number
+}
+export interface RedeemItemCreateRequest {
+  requestKey: string
+  payloadHash: string
+  itemId: number
+  createdAt: number
 }
 export interface RedemptionRow {
   id: string

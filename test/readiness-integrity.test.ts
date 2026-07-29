@@ -84,6 +84,13 @@ test('readiness：缺表、缺列与落后 schema 均 fail closed', async (t) =>
     })
   })
 
+  await t.test('缺少 create 幂等表', () => {
+    withDatabase((db) => {
+      db.exec('DROP TABLE redeem_item_create_requests')
+      assert.throws(() => assertDatabaseReady(db), /redeem_item_create_requests|schema/i)
+    })
+  })
+
   await t.test('缺少迁移定义的关键列', () => {
     withDatabase((db) => {
       db.exec('ALTER TABLE redeem_items DROP COLUMN fulfillment')

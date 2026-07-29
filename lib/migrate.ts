@@ -488,6 +488,24 @@ export const migrations: Migration[] = [
       `)
     },
   },
+  {
+    version: 13,
+    // migration 013（UI-R1）：管理端新增兑换商品的持久化幂等键。浏览器可能在服务端已经提交后
+    // 丢失响应；重试必须按同一 request_key 找回原 item_id，而不是再插一件商品/再写一条审计。
+    // 不使用 name 充当天然键（业务未声明唯一）；request_key PRIMARY KEY 才是跨进程/并发硬约束。
+    // 故意不用 IF NOT EXISTS：若 v12 库里已有同名残表但形状不兼容，迁移必须在外层事务内失败并
+    // 保持 schema_version=12，不能把残表静默当成已完成迁移。
+    up(db) {
+      db.exec(`
+        CREATE TABLE redeem_item_create_requests (
+          request_key TEXT PRIMARY KEY,
+          payload_hash TEXT NOT NULL,
+          item_id      INTEGER NOT NULL,
+          created_at   INTEGER NOT NULL
+        )
+      `)
+    },
+  },
 ]
 
 // 代码所知的最新 schema 版本（从 migrations 数组派生，勿手写）
