@@ -149,6 +149,7 @@ export default function CollectPanel({ onDone }: { onDone: () => void }) {
             key={p.id}
             type="button"
             data-provider-option={p.id}
+            aria-label={`${p.name} ${p.sub}`}
             aria-pressed={provider === p.id}
             onClick={() => {
               setProvider(p.id)

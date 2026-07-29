@@ -153,31 +153,57 @@ test('provider options remain fully visible and keyboard operable at mobile and 
       const documentElement = document.documentElement
       const providers = Array.from(document.querySelectorAll<HTMLElement>('[data-provider-option]')).map((option) => {
         const id = option.dataset.providerOption ?? ''
-        const subtext = expectedProviders.find(([expectedId]) => expectedId === id)?.[2] ?? ''
+        const expected = expectedProviders.find(([expectedId]) => expectedId === id)
+        const name = expected?.[1] ?? ''
+        const subtext = expected?.[2] ?? ''
         const optionRect = option.getBoundingClientRect()
+        const mainTextNode = Array.from(option.querySelectorAll<HTMLElement>('*')).find(
+          (node) => node.textContent?.trim() === name,
+        )
         const subtextNode = Array.from(option.querySelectorAll<HTMLElement>('*')).find(
           (node) => node.textContent?.trim() === subtext,
         )
-        const subtextRect = subtextNode?.getBoundingClientRect()
+        const measureText = (node: HTMLElement | undefined) => {
+          if (!node) return null
+          const rect = node.getBoundingClientRect()
+          const style = getComputedStyle(node)
+          return {
+            text: node.textContent?.trim() ?? '',
+            display: style.display,
+            visibility: style.visibility,
+            opacity: Number(style.opacity),
+            rectCount: node.getClientRects().length,
+            left: rect.left,
+            right: rect.right,
+            top: rect.top,
+            bottom: rect.bottom,
+            width: rect.width,
+            height: rect.height,
+            clientWidth: node.clientWidth,
+            scrollWidth: node.scrollWidth,
+          }
+        }
         return {
           id,
           text: option.textContent ?? '',
-          bounds: { left: optionRect.left, right: optionRect.right, width: optionRect.width },
-          subtext: subtextNode && subtextRect
-            ? {
-                text: subtextNode.textContent?.trim() ?? '',
-                left: subtextRect.left,
-                right: subtextRect.right,
-                clientWidth: subtextNode.clientWidth,
-                scrollWidth: subtextNode.scrollWidth,
-              }
-            : null,
+          ariaLabel: option.getAttribute('aria-label') ?? '',
+          bounds: {
+            left: optionRect.left,
+            right: optionRect.right,
+            top: optionRect.top,
+            bottom: optionRect.bottom,
+            width: optionRect.width,
+            height: optionRect.height,
+          },
+          mainText: measureText(mainTextNode),
+          subtext: measureText(subtextNode),
         }
       })
       const scroller = document.querySelector('table')?.parentElement
       const scrollerRect = scroller?.getBoundingClientRect()
       return {
         pageWidth: documentElement.clientWidth,
+        pageHeight: documentElement.clientHeight,
         scrollWidth: documentElement.scrollWidth,
         providers,
         scroller: scroller && scrollerRect
@@ -196,14 +222,37 @@ test('provider options remain fully visible and keyboard operable at mobile and 
     for (const [id, name, subtext] of providerSubtexts) {
       const option = layout.providers.find((provider) => provider.id === id)
       expect(option?.text).toContain(name)
+      expect(option?.ariaLabel).toContain(name)
+      expect(option?.ariaLabel).toContain(subtext)
       expect(option?.bounds).not.toBeNull()
       expect(option?.bounds?.width).toBeGreaterThan(0)
+      expect(option?.bounds?.height).toBeGreaterThan(0)
       expect(option?.bounds?.left).toBeGreaterThanOrEqual(0)
       expect(option?.bounds?.right).toBeLessThanOrEqual(layout.pageWidth + 1)
-      expect(option?.subtext?.text).toBe(subtext)
-      expect(option?.subtext?.left).toBeGreaterThanOrEqual(0)
-      expect(option?.subtext?.right).toBeLessThanOrEqual(layout.pageWidth + 1)
-      expect(option?.subtext?.scrollWidth).toBeLessThanOrEqual((option?.subtext?.clientWidth ?? 0) + 1)
+      expect(option?.bounds?.top).toBeGreaterThanOrEqual(0)
+      expect(option?.bounds?.bottom).toBeLessThanOrEqual(layout.pageHeight + 1)
+      for (const [label, expectedText, textLayout] of [
+        ['主文案', name, option?.mainText],
+        ['副文案', subtext, option?.subtext],
+      ] as const) {
+        if (!option?.bounds || !textLayout) throw new Error(`${width}px ${id} ${label}缺失`)
+        expect(textLayout.text).toBe(expectedText)
+        expect(textLayout.display).not.toBe('none')
+        expect(['hidden', 'collapse']).not.toContain(textLayout.visibility)
+        expect(textLayout.opacity).toBeGreaterThan(0)
+        expect(textLayout.rectCount).toBeGreaterThan(0)
+        expect(textLayout.width).toBeGreaterThan(0)
+        expect(textLayout.height).toBeGreaterThan(0)
+        expect(textLayout.left).toBeGreaterThanOrEqual(option.bounds.left - 1)
+        expect(textLayout.right).toBeLessThanOrEqual(option.bounds.right + 1)
+        expect(textLayout.top).toBeGreaterThanOrEqual(option.bounds.top - 1)
+        expect(textLayout.bottom).toBeLessThanOrEqual(option.bounds.bottom + 1)
+        expect(textLayout.left).toBeGreaterThanOrEqual(0)
+        expect(textLayout.right).toBeLessThanOrEqual(layout.pageWidth + 1)
+        expect(textLayout.top).toBeGreaterThanOrEqual(0)
+        expect(textLayout.bottom).toBeLessThanOrEqual(layout.pageHeight + 1)
+        expect(textLayout.scrollWidth).toBeLessThanOrEqual(textLayout.clientWidth + 1)
+      }
     }
     expect(layout.scroller).not.toBeNull()
     expect(layout.scroller?.left).toBeGreaterThanOrEqual(0)
@@ -539,6 +588,124 @@ test('dangerous admin routes return fixed public JSON when SQLite operations fai
   expect(withE2eDb((db) => db.prepare('SELECT id FROM point_rules WHERE id=?').get(protectedRuleId))).toEqual({
     id: protectedRuleId,
   })
+
+  // 商品保存也必须把旧值读取、upsert、audit、overview/列表读回放在同一事务。
+  const saveSnapshot = withE2eDb((db) => {
+    const item = db.prepare(
+      `SELECT id, name, description, cost, kind, enabled, sort, config, fulfillment,
+              per_user_limit AS perUserLimit
+       FROM redeem_items WHERE enabled=1 ORDER BY id LIMIT 1`,
+    ).get() as {
+      id: number
+      name: string
+      description: string
+      cost: number
+      kind: string
+      enabled: number
+      sort: number
+      config: string
+      fulfillment: string
+      perUserLimit: number
+    }
+    return {
+      item,
+      enabledCount: (db.prepare('SELECT COUNT(*) AS n FROM redeem_items WHERE enabled=1').get() as { n: number }).n,
+      totalCount: (db.prepare('SELECT COUNT(*) AS n FROM redeem_items').get() as { n: number }).n,
+      auditCount: (db.prepare('SELECT COUNT(*) AS n FROM audit_log').get() as { n: number }).n,
+      sequence: (db.prepare("SELECT seq FROM sqlite_sequence WHERE name='redeem_items'").get() as { seq: number }).seq,
+    }
+  })
+  const failedCreateName = `E2E atomic create ${suffix}`
+  const brokenSaveAudit = `__e2e_save_audit_log_${suffix}`
+  let updateResponseStatus = 0
+  let updateResponseType = ''
+  let updateResponseText = ''
+  let createResponseStatus = 0
+  let createResponseType = ''
+  let createResponseText = ''
+  let failedSaveState: ReturnType<typeof withE2eDb<{
+    item: typeof saveSnapshot.item | undefined
+    created: { id: number } | undefined
+    enabledCount: number
+    totalCount: number
+    auditCount: number
+    sequence: number
+  }>>
+  withE2eDb((db) => db.exec(`ALTER TABLE audit_log RENAME TO "${brokenSaveAudit}"`))
+  try {
+    const updateResponse = await page.request.put('/api/admin/redeem-items', {
+      data: { ...saveSnapshot.item, name: `${saveSnapshot.item.name} changed`, enabled: false },
+    })
+    updateResponseStatus = updateResponse.status()
+    updateResponseType = updateResponse.headers()['content-type'] ?? ''
+    updateResponseText = await updateResponse.text()
+
+    const createResponse = await page.request.put('/api/admin/redeem-items', {
+      data: {
+        name: failedCreateName,
+        description: 'must roll back with audit failure',
+        cost: 7,
+        kind: 'timed_quota',
+        enabled: false,
+        sort: 999,
+      },
+    })
+    createResponseStatus = createResponse.status()
+    createResponseType = createResponse.headers()['content-type'] ?? ''
+    createResponseText = await createResponse.text()
+
+    failedSaveState = withE2eDb((db) => ({
+      item: db.prepare(
+        `SELECT id, name, description, cost, kind, enabled, sort, config, fulfillment,
+                per_user_limit AS perUserLimit FROM redeem_items WHERE id=?`,
+      ).get(saveSnapshot.item.id) as typeof saveSnapshot.item | undefined,
+      created: db.prepare('SELECT id FROM redeem_items WHERE name=?').get(failedCreateName) as { id: number } | undefined,
+      enabledCount: (db.prepare('SELECT COUNT(*) AS n FROM redeem_items WHERE enabled=1').get() as { n: number }).n,
+      totalCount: (db.prepare('SELECT COUNT(*) AS n FROM redeem_items').get() as { n: number }).n,
+      auditCount: (db.prepare(`SELECT COUNT(*) AS n FROM "${brokenSaveAudit}"`).get() as { n: number }).n,
+      sequence: (db.prepare("SELECT seq FROM sqlite_sequence WHERE name='redeem_items'").get() as { seq: number }).seq,
+    }))
+  } finally {
+    withE2eDb((db) => {
+      db.exec(`ALTER TABLE "${brokenSaveAudit}" RENAME TO audit_log`)
+      db.prepare(
+        `UPDATE redeem_items SET name=?, description=?, cost=?, kind=?, enabled=?, sort=?, config=?,
+           fulfillment=?, per_user_limit=? WHERE id=?`,
+      ).run(
+        saveSnapshot.item.name,
+        saveSnapshot.item.description,
+        saveSnapshot.item.cost,
+        saveSnapshot.item.kind,
+        saveSnapshot.item.enabled,
+        saveSnapshot.item.sort,
+        saveSnapshot.item.config,
+        saveSnapshot.item.fulfillment,
+        saveSnapshot.item.perUserLimit,
+        saveSnapshot.item.id,
+      )
+      db.prepare('DELETE FROM redeem_items WHERE name=?').run(failedCreateName)
+      db.prepare("UPDATE sqlite_sequence SET seq=? WHERE name='redeem_items'").run(saveSnapshot.sequence)
+    })
+  }
+  const saveFailureBody = {
+    ok: false,
+    code: 'REDEEM_ITEM_SAVE_FAILED',
+    error: '保存兑换项失败，请重试',
+  }
+  expect(updateResponseStatus).toBe(500)
+  expect(updateResponseType).toContain('application/json')
+  expect(JSON.parse(updateResponseText)).toEqual(saveFailureBody)
+  expect(createResponseStatus).toBe(500)
+  expect(createResponseType).toContain('application/json')
+  expect(JSON.parse(createResponseText)).toEqual(saveFailureBody)
+  expect(failedSaveState!).toEqual({
+    item: saveSnapshot.item,
+    created: undefined,
+    enabledCount: saveSnapshot.enabledCount,
+    totalCount: saveSnapshot.totalCount,
+    auditCount: saveSnapshot.auditCount,
+    sequence: saveSnapshot.sequence,
+  })
 })
 
 test('successful delete, retry, and terminate use exact targets, persist audit state, and restore stable focus', async ({ page }) => {
@@ -704,6 +871,8 @@ test('successful point-rule and usage-rate deletes use exact IDs, DB state, audi
 
 test('saving an item updates the enabled-item overview from the persisted database state', async ({ page }) => {
   await openAdmin(page)
+  const pageErrors: string[] = []
+  page.on('pageerror', (error) => pageErrors.push(error.message))
   const item = withE2eDb((db) => db.prepare(
     'SELECT id, name FROM redeem_items WHERE enabled=1 ORDER BY id LIMIT 1',
   ).get() as { id: number; name: string })
@@ -712,21 +881,67 @@ test('saving an item updates the enabled-item overview from the persisted databa
   ).get() as { n: number }).n)
   const overviewValue = page.getByText('已启用商品', { exact: true }).locator('..').locator('dd')
   const row = page.locator(`input[value="${item.name}"]`).locator('..')
+  let saveMode: 'non-json' | 'network' | 'success' = 'non-json'
+  let saveRequests = 0
+  await page.route('**/api/admin/redeem-items', async (route) => {
+    if (route.request().method() !== 'PUT') {
+      await route.fallback()
+      return
+    }
+    saveRequests += 1
+    if (saveMode === 'non-json') {
+      await route.fulfill({ status: 500, contentType: 'text/plain', body: 'internal path token stack' })
+      return
+    }
+    if (saveMode === 'network') {
+      await route.abort('failed')
+      return
+    }
+    await route.fallback()
+  })
 
   try {
     await expect(overviewValue).toHaveText(String(before))
     await row.locator('input[type="checkbox"]').uncheck()
+
+    await row.getByRole('button', { name: '保存' }).click()
+    await expect.poll(() => saveRequests).toBe(1)
+    await expect(page.getByText('保存兑换项失败，请重试', { exact: true })).toBeVisible()
+    await expect(overviewValue).toHaveText(String(before))
+    expect(withE2eDb((db) => (db.prepare('SELECT enabled FROM redeem_items WHERE id=?').get(item.id) as { enabled: number }).enabled)).toBe(1)
+
+    saveMode = 'network'
+    await row.getByRole('button', { name: '保存' }).click()
+    await expect.poll(() => saveRequests).toBe(2)
+    await expect(page.getByText('保存兑换项失败，请重试', { exact: true })).toBeVisible()
+    await expect(overviewValue).toHaveText(String(before))
+    expect(pageErrors).toEqual([])
+
+    saveMode = 'success'
     const responsePromise = page.waitForResponse((response) =>
       response.request().method() === 'PUT' && response.url().endsWith('/api/admin/redeem-items'))
     await row.getByRole('button', { name: '保存' }).click()
-    expect((await responsePromise).status()).toBe(200)
+    const response = await responsePromise
+    expect(response.status()).toBe(200)
+    const responseBody = await response.json()
+    expect(responseBody.ok).toBe(true)
+    expect(responseBody.overview.enabledRedeemItems).toBe(before - 1)
+    expect(responseBody.redeemItems.find((entry: { id: number }) => entry.id === item.id)?.enabled).toBe(0)
 
     await expect(overviewValue).toHaveText(String(before - 1))
     const persisted = withE2eDb((db) => ({
       enabled: (db.prepare('SELECT enabled FROM redeem_items WHERE id=?').get(item.id) as { enabled: number }).enabled,
       count: (db.prepare('SELECT COUNT(*) AS n FROM redeem_items WHERE enabled=1').get() as { n: number }).n,
+      audit: db.prepare(
+        "SELECT action, target, new_value AS newValue FROM audit_log WHERE action='redeem_item.upsert' AND target LIKE ? ORDER BY id DESC LIMIT 1",
+      ).get(`item#${item.id}%`) as { action: string; target: string; newValue: string },
     }))
-    expect(persisted).toEqual({ enabled: 0, count: before - 1 })
+    expect(persisted.enabled).toBe(0)
+    expect(persisted.count).toBe(before - 1)
+    expect(persisted.audit.action).toBe('redeem_item.upsert')
+    expect(persisted.audit.target).toContain(`item#${item.id}`)
+    expect(JSON.parse(persisted.audit.newValue).enabled).toBe(0)
+    expect(pageErrors).toEqual([])
   } finally {
     withE2eDb((db) => db.prepare('UPDATE redeem_items SET enabled=1 WHERE id=?').run(item.id))
   }

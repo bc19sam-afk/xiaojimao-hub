@@ -1206,8 +1206,8 @@ export const db = {
   // ===== 审计留痕（P4-R1，§7.3）=====
   // 记一条操作留痕：操作人 actor / 时间 / 动作 / 目标 / 旧值 / 新值。old/new 为**已脱敏摘要**（由 lib/audit.ts
   // 构造，绝不含 CDK 码/密钥等敏感原文，§8）；undefined → 落 null。actor 取结构最小型（不 import lib/admin，
-  // 免 db 反向依赖 next/headers；admin.Actor 结构兼容）。与主操作紧邻调用（非同事务）：单机单 worker 下
-  // 主写与本写各自 auto-commit、先后紧邻；本 INSERT 无唯一约束不会失败，异常一律上抛不吞（审计不静默丢）。
+  // 免 db 反向依赖 next/headers；admin.Actor 结构兼容）。本方法不自行开事务：管理写调用方用
+  // withTransaction() 将主变更与审计原子提交；异常一律上抛不吞（审计失败必须让主变更回滚）。
   recordAudit(
     actor: { type: string; id?: number; label: string },
     entry: { action: string; target: string; old?: unknown; new?: unknown },

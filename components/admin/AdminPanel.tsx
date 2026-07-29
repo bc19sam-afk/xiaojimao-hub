@@ -104,6 +104,14 @@ interface AdminOverview {
   pendingRedemptions: number
   enabledRedeemItems: number
 }
+
+function isAdminOverview(value: unknown): value is AdminOverview {
+  if (!value || typeof value !== 'object') return false
+  const candidate = value as Record<keyof AdminOverview, unknown>
+  return ['pooledAccounts', 'needsReview', 'pendingRedemptions', 'enabledRedeemItems'].every(
+    (key) => typeof candidate[key as keyof AdminOverview] === 'number' && Number.isFinite(candidate[key as keyof AdminOverview]),
+  )
+}
 interface PendingConfirmation extends ConfirmDialogRequest {
   run: () => Promise<void>
   fallbackFocus: () => HTMLElement | null
@@ -116,10 +124,13 @@ const PUBLIC_DELETE_ERRORS = {
   review: '人工复核操作失败，请重试',
 } as const
 
+const PUBLIC_REDEEM_ITEM_SAVE_ERROR = '保存兑换项失败，请重试'
+
 const PUBLIC_ACTION_ERRORS_BY_CODE = {
   POINT_RULE_DELETE_FAILED: PUBLIC_DELETE_ERRORS.pointRule,
   USAGE_RATE_DELETE_FAILED: PUBLIC_DELETE_ERRORS.usageRate,
   REDEEM_ITEM_DELETE_FAILED: PUBLIC_DELETE_ERRORS.redeemItem,
+  REDEEM_ITEM_SAVE_FAILED: PUBLIC_REDEEM_ITEM_SAVE_ERROR,
   REVIEW_ACTION_FAILED: PUBLIC_DELETE_ERRORS.review,
 } as const
 
@@ -385,17 +396,29 @@ export default function AdminPanel() {
     void loadAudit().catch(() => {})
   }
   async function saveItem(it: Partial<RedeemItem>) {
-    const res = await fetch('/api/admin/redeem-items', {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ...it, enabled: it.enabled !== 0 }),
-    })
-    const d = await res.json()
-    if (res.ok) {
-      setItems(d.redeemItems)
-      if (d.overview) setOverview(d.overview)
+    try {
+      const res = await fetch('/api/admin/redeem-items', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...it, enabled: it.enabled !== 0 }),
+      })
+      const d = await res.json().catch(() => null) as {
+        ok?: unknown
+        code?: unknown
+        redeemItems?: unknown
+        overview?: unknown
+      } | null
+      if (!res.ok || d?.ok !== true || !Array.isArray(d.redeemItems) || !isAdminOverview(d.overview)) {
+        flash(publicActionError(d?.code, 'REDEEM_ITEM_SAVE_FAILED', PUBLIC_REDEEM_ITEM_SAVE_ERROR))
+        return
+      }
+      setItems(d.redeemItems as RedeemItem[])
+      setOverview(d.overview)
       flash('已保存')
-    } else flash(d.error || '失败')
+      void loadAudit().catch(() => {})
+    } catch {
+      flash(PUBLIC_REDEEM_ITEM_SAVE_ERROR)
+    }
   }
   async function delItem(id: number) {
     const res = await fetch('/api/admin/redeem-items?id=' + id, { method: 'DELETE' })

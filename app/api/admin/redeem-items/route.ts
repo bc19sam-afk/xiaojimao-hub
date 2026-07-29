@@ -3,6 +3,18 @@ import { getAdminActor } from '@/lib/admin'
 import { db } from '@/lib/db'
 import { auditRedeemItemUpsert, auditRedeemItemDelete } from '@/lib/audit'
 
+const REDEEM_ITEM_SAVE_FAILURE = {
+  ok: false,
+  code: 'REDEEM_ITEM_SAVE_FAILED',
+  error: '保存兑换项失败，请重试',
+} as const
+
+const REDEEM_ITEM_INVALID = {
+  ok: false,
+  code: 'REDEEM_ITEM_INVALID',
+  error: '商品信息不完整',
+} as const
+
 const REDEEM_ITEM_DELETE_FAILURE = {
   ok: false,
   code: 'REDEEM_ITEM_DELETE_FAILED',
@@ -12,9 +24,13 @@ const REDEEM_ITEM_DELETE_FAILURE = {
 // 新增/更新兑换项
 export async function PUT(req: NextRequest) {
   const actor = await getAdminActor()
-  if (!actor) return NextResponse.json({ error: '无权限' }, { status: 403 })
-  const b = await req.json().catch(() => ({}))
-  if (!b.name || !b.kind) return NextResponse.json({ error: '缺 name/kind' }, { status: 400 })
+  if (!actor) {
+    return NextResponse.json({ ok: false, code: 'UNAUTHORIZED', error: '无权限' }, { status: 403 })
+  }
+  const b = await req.json().catch(() => null)
+  if (!b || typeof b !== 'object' || !b.name || !b.kind) {
+    return NextResponse.json(REDEEM_ITEM_INVALID, { status: 400 })
+  }
   const id = b.id ? Number(b.id) : undefined
   const next = {
     id,
@@ -33,15 +49,22 @@ export async function PUT(req: NextRequest) {
     fulfillment: b.fulfillment === 'cdk' || b.fulfillment === 'placeholder' ? b.fulfillment : undefined,
     perUserLimit: b.perUserLimit != null ? Math.max(0, Number(b.perUserLimit) || 0) : undefined,
   }
-  // 审计需旧值：仅编辑（带 id）时读原行；新建无旧值（old=undefined → 审计 old 落 null）
-  const old = id ? db.getRedeemItem(id) : undefined
-  db.upsertRedeemItem(next)
-  db.recordAudit(actor, auditRedeemItemUpsert(old, next))
-  return NextResponse.json({
-    ok: true,
-    redeemItems: db.listRedeemItems(false),
-    overview: db.adminOverview(),
-  })
+  try {
+    const result = db.withTransaction(() => {
+      // 旧值、主写、审计和权威响应读回必须共享事务；任一步失败都回滚，客户端才可安全重试。
+      const old = id ? db.getRedeemItem(id) : undefined
+      db.upsertRedeemItem(next)
+      db.recordAudit(actor, auditRedeemItemUpsert(old, next))
+      return {
+        redeemItems: db.listRedeemItems(false),
+        overview: db.adminOverview(),
+      }
+    })
+    return NextResponse.json({ ok: true, ...result })
+  } catch (error) {
+    console.error('[admin] redeem item save failed', error instanceof Error ? error.name : 'unknown')
+    return NextResponse.json(REDEEM_ITEM_SAVE_FAILURE, { status: 500 })
+  }
 }
 
 // 删除兑换项
