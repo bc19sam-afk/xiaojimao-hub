@@ -12,7 +12,7 @@ import { DatabaseSync } from 'node:sqlite'
 //
 // 用**桩 docker** 跑真实脚本：桩把 `docker compose run ... -v H:C ... -e <JS>` 里的容器路径按挂载
 // 规格换回宿主路径，然后用真 node 跑那段 JS——于是 VACUUM INTO 是真的在跑、真的读写真 SQLite 库，
-// 只有「起容器」这一层被替换掉。stop/start 默认是空操作，curl 默认返回严格 200 + {"ok":true}。
+// 只有「起容器」这一层被替换掉。stop/start 默认是空操作，readiness 由 docker exec 桩返回。
 //
 // ⚠️ 测试库隔离（红线）：全程临时目录，DATA_DIR/BACKUP_DIR 都指向 tmp，绝不碰真实 data/。
 // ============================================================================
@@ -22,6 +22,7 @@ const RESTORE_SH = path.join(REPO, 'scripts', 'restore.sh')
 
 let tmpDir: string
 let binDir: string
+let originalTmpDir: string | undefined
 
 // 桩 docker 的真身：解析 -v/-e，把容器内路径换成宿主路径，再用真 node 跑那段 JS。
 // 顺带充当**断言点**：挂载源必须是存在的绝对路径——相对路径会被真 docker 当成「命名卷」
@@ -43,6 +44,54 @@ if (args[0] === 'inspect') {
   if (process.env.TEST_CONTAINER_MOUNT_MODE === 'inspect-fail') process.exit(78)
   const mode = process.env.TEST_CONTAINER_MOUNT_MODE || 'bind'
   const source = process.env.TEST_CONTAINER_DATA_SOURCE || process.env.TEST_COMPOSE_DATA_SOURCE || process.env.DATA_DIR || ''
+  const formatAt = args.indexOf('--format')
+  const format = formatAt >= 0 ? args[formatAt + 1] : ''
+  if (format.includes('com.docker.compose.project')) {
+    console.log('xiaojimao-hub\\tapp\\tFalse\\t' + 'c'.repeat(64))
+    process.exit(0)
+  }
+  if (format.includes('.Id')) {
+    console.log(process.env.TEST_INSPECT_ID_OVERRIDE || 'a'.repeat(64))
+    process.exit(0)
+  }
+  if (format.includes('.Image')) {
+    console.log('sha256:' + '1'.repeat(64))
+    process.exit(0)
+  }
+  if (format.includes('XJM_NETWORK_ID')) {
+    if (!fs.existsSync(process.env.STUB_LOG + '.isolated')) {
+      console.log('XJM_NETWORK_ID\\t' + 'd'.repeat(64))
+    }
+    process.exit(0)
+  }
+  if (format.includes('XJM_NETWORK_RECORD')) {
+    if (!fs.existsSync(process.env.STUB_LOG + '.isolated')) {
+      console.log('XJM_NETWORK_RECORD\\tstub-network\\t' + 'd'.repeat(64) + '\\tapp\\tstub-app')
+    }
+    process.exit(0)
+  }
+  if (format.includes('XJM_BIND')) {
+    console.log('XJM_BIND\\t' + source + '\\t/app/data')
+    if (process.env.TEST_CONTAINER_EXTRA_BIND_SOURCE) {
+      console.log(
+        'XJM_BIND\\t' + process.env.TEST_CONTAINER_EXTRA_BIND_SOURCE + '\\t' +
+        (process.env.TEST_CONTAINER_EXTRA_BIND_TARGET || '/app/extra'),
+      )
+    }
+    process.exit(0)
+  }
+  if (format.includes('IPAMConfig')) {
+    if (process.env.TEST_UNSUPPORTED_NETWORK_CONFIG === '1') console.log('stub-network\tstatic-ipv4')
+    process.exit(0)
+  }
+  if (format.includes('NetworkSettings.Networks')) {
+    if (!fs.existsSync(process.env.STUB_LOG + '.isolated')) console.log('stub-network\\tapp\\tstub-app')
+    process.exit(0)
+  }
+  if (format.includes('.State.Running')) {
+    console.log(fs.existsSync(process.env.STUB_LOG + '.stopped') ? 'false' : 'true')
+    process.exit(0)
+  }
   if (mode === 'missing') process.exit(0)
   if (mode === 'multiple') {
     console.log(\`bind\\t\${source}\`)
@@ -52,15 +101,67 @@ if (args[0] === 'inspect') {
   console.log(\`\${mode === 'named' ? 'volume' : 'bind'}\\t\${mode === 'named' ? 'xiaojimao_data' : source}\`)
   process.exit(0)
 }
+if (args[0] === 'stop') {
+  const exitCode = Number(process.env.TEST_DOCKER_STOP_EXIT || 0)
+  if (exitCode === 0) fs.writeFileSync(process.env.STUB_LOG + '.stopped', '')
+  process.exit(exitCode)
+}
+if (args[0] === 'start') {
+  fs.rmSync(process.env.STUB_LOG + '.stopped', { force: true })
+  const stateFile = process.env.TEST_START_STATE || ''
+  const wal = process.env.TEST_WAL_PATH || ''
+  const shm = process.env.TEST_SHM_PATH || ''
+  if (stateFile) {
+    fs.appendFileSync(stateFile, JSON.stringify({
+      walExists: wal ? fs.existsSync(wal) : null,
+      shmExists: shm ? fs.existsSync(shm) : null,
+    }) + '\\n')
+  }
+  if (process.env.TEST_CREATE_SIDECARS_ON_START === '1') {
+    if (wal) fs.writeFileSync(wal, 'NEW-DB-WAL')
+    if (shm) fs.writeFileSync(shm, 'NEW-DB-SHM')
+  }
+  process.exit(0)
+}
+if (args[0] === 'network') {
+  if (args[1] === 'disconnect') fs.writeFileSync(process.env.STUB_LOG + '.isolated', '')
+  if (args[1] === 'connect') fs.rmSync(process.env.STUB_LOG + '.isolated', { force: true })
+  process.exit(0)
+}
+if (args[0] === 'exec') {
+  if (process.env.TEST_READY_ENTERED) fs.writeFileSync(process.env.TEST_READY_ENTERED, '')
+  if (process.env.TEST_READY_BLOCK_MS) {
+    spawnSync('sleep', [String(Number(process.env.TEST_READY_BLOCK_MS) / 1000)])
+  }
+  if (process.env.TEST_CLOCK_FILE) {
+    const clock = JSON.parse(fs.readFileSync(process.env.TEST_CLOCK_FILE, 'utf8'))
+    const maxTime = Number(args.at(-1))
+    const startedAt = clock.now
+    const duration = clock.curlDurations[clock.curlCalls.length] ?? 0
+    clock.curlCalls.push({ startedAt, maxTime, deadline: clock.deadline })
+    clock.now += Math.min(duration, maxTime)
+    fs.writeFileSync(process.env.TEST_CLOCK_FILE, JSON.stringify(clock))
+    process.exit(7)
+  }
+  const body = process.env.TEST_READY_BODY ?? '{"ok":true}'
+  const status = process.env.TEST_READY_STATUS || '200'
+  process.stdout.write(body)
+  process.exit(Number(process.env.TEST_READY_EXIT || (status === '200' ? 0 : 8)))
+}
 if (args[0] !== 'compose') process.exit(0)
 if (args[1] === 'ps') {
-  if (process.env.TEST_CONTAINER_MOUNT_MODE === 'container-missing') process.exit(0)
+  if (process.env.TEST_CONTAINER_MOUNT_MODE === 'container-missing' && !fs.existsSync(process.env.STUB_LOG + '.created')) process.exit(0)
   if (process.env.TEST_CONTAINER_MOUNT_MODE === 'container-multiple') {
-    console.log('stub-app-1')
-    console.log('stub-app-2')
+    console.log('1111111111111111111111111111111111111111111111111111111111111111')
+    console.log('2222222222222222222222222222222222222222222222222222222222222222')
     process.exit(0)
   }
-  console.log('stub-app')
+  console.log(process.env.TEST_COMPOSE_CONTAINER_ID || 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')
+  process.exit(0)
+}
+if (args[1] === 'create') {
+  fs.writeFileSync(process.env.STUB_LOG + '.created', '')
+  fs.writeFileSync(process.env.STUB_LOG + '.stopped', '')
   process.exit(0)
 }
 if (args[1] === 'stop') process.exit(0)
@@ -87,6 +188,10 @@ if (args[1] === 'start') {
 if (args[1] === 'config') {
   const mountMode = process.env.TEST_COMPOSE_MOUNT_MODE || 'bind'
   if (mountMode === 'config-fail') process.exit(77)
+  if (args.includes('--hash')) {
+    console.log('app ' + 'c'.repeat(64))
+    process.exit(0)
+  }
   const formatAt = args.indexOf('--format')
   if (formatAt >= 0 && args[formatAt + 1] === 'json') {
     const source = process.env.TEST_COMPOSE_DATA_SOURCE || process.env.DATA_DIR || ''
@@ -101,7 +206,19 @@ if (args[1] === 'config') {
         { type: 'bind', source: process.env.TEST_COMPOSE_DATA_SOURCE_2 || source, target: '/app/data', bind: {} },
       ]
     }
-    console.log(JSON.stringify({ services: { app: { volumes } } }, null, 2))
+    if (process.env.TEST_COMPOSE_EXTRA_BIND_SOURCE) {
+      volumes.push({
+        type: 'bind',
+        source: process.env.TEST_COMPOSE_EXTRA_BIND_SOURCE,
+        target: process.env.TEST_COMPOSE_EXTRA_BIND_TARGET || '/app/extra',
+        bind: {},
+      })
+    }
+    const app = { volumes }
+    if (process.env.TEST_COMPOSE_FALSE_POSITIVE_NETWORK_KEY === '1') {
+      app.environment = { interface_name: 'diagnostic-only', mac_address: 'not-an-endpoint' }
+    }
+    console.log(JSON.stringify({ services: { app } }, null, 2))
     process.exit(0)
   }
   // R4-P1①：restore.sh 改用 docker compose config app 读容器内 DB_PATH。
@@ -158,31 +275,553 @@ process.exit(r.status ?? 1)
 `
 
 const READY_CURL_STUB = `#!/bin/sh
-if [ "\${TEST_READY_BODY+x}" = x ]; then
-  body=$TEST_READY_BODY
-else
-  body='{"ok":true}'
-fi
-status=\${TEST_READY_STATUS-200}
-out=
-while [ "$#" -gt 0 ]; do
-  if [ "$1" = "--output" ]; then out=$2; shift 2; else shift; fi
-done
-if [ -n "$out" ]; then
-  printf '%s' "$body" > "$out"
-  printf '%s' "$status"
-else
-  printf '%s\\n%s\\n' "$body" "$status"
-fi
-exit "\${TEST_READY_EXIT-0}"
+echo "unexpected host curl: restore readiness must use docker exec exact-id" >&2
+exit 97
+`
+
+// 本轮架构回归需要一个有真实“容器 A / 容器 B / 运行态 / 网络隔离”状态的 Docker 桩。
+// 旧的轻量桩继续服务既有用例；新增的身份漂移、网络隔离与 SIGKILL 测试使用本桩。
+const STATEFUL_DOCKER_STUB = `import fs from 'node:fs'
+import path from 'node:path'
+import { spawnSync } from 'node:child_process'
+
+const args = process.argv.slice(2)
+const stateFile = process.env.TEST_DOCKER_STATE
+const logFile = process.env.STUB_LOG
+const state = JSON.parse(fs.readFileSync(stateFile, 'utf8'))
+fs.appendFileSync(logFile, JSON.stringify(args) + '\\n')
+
+function save() { fs.writeFileSync(stateFile, JSON.stringify(state)) }
+function resolveId(ref) {
+  if (state.containers[ref]) return ref
+  const matches = Object.keys(state.containers).filter((id) => id.startsWith(ref))
+  return matches.length === 1 ? matches[0] : ref
+}
+function renderId(id) {
+  const truncate = !args.includes('--no-trunc') && (
+    process.env.TEST_TRUNCATE_ALL_IDS_WITHOUT_FLAG === '1' ||
+    (process.env.TEST_TRUNCATE_SERVICE_IDS_WHEN_EXTRA === '1' && state.extraAppeared)
+  )
+  return truncate ? id.slice(0, 12) : id
+}
+function drift(point) {
+  if (state.drifted || state.driftAt !== point) return
+  state.containers[state.driftTarget].composeProject = state.composeProject
+  state.containers[state.driftTarget].composeService = state.composeService
+  state.current = state.driftTarget
+  state.composeSource = state.containers[state.driftTarget].dataSource
+  state.containers[state.driftTarget].running = true
+  state.drifted = true
+  state.events.push(['drift', point, state.driftTarget])
+}
+function materializeExtra(point) {
+  if (state.extraAppeared || state.extraAt !== point) return
+  const extra = state.containers[state.extraTarget]
+  extra.composeProject = state.composeProject
+  extra.composeService = state.composeService
+  extra.running = true
+  state.extraAppeared = true
+  state.events.push(['extra-service', point, state.extraTarget])
+}
+function injectExternalNetwork(point) {
+  if (state.externalNetworkInjected || state.externalNetworkAt !== point) return
+  const container = state.containers[state.current]
+  container.networks.push({
+    name: 'unexpected-network',
+    networkId: 'f'.repeat(64),
+    aliases: ['unexpected-app'],
+    runtimeMacAddress: '02:42:ac:13:00:77',
+  })
+  container.isolated = false
+  state.externalNetworkInjected = true
+  state.events.push(['external-network-connect', point, state.current])
+}
+function startContainer(id, source) {
+  if (!state.containers[id]) process.exit(79)
+  state.containers[id].running = true
+  state.events.push([source, id])
+  const startState = process.env.TEST_START_STATE || ''
+  const wal = process.env.TEST_WAL_PATH || ''
+  const shm = process.env.TEST_SHM_PATH || ''
+  if (startState) {
+    fs.appendFileSync(startState, JSON.stringify({
+      walExists: wal ? fs.existsSync(wal) : null,
+      shmExists: shm ? fs.existsSync(shm) : null,
+    }) + '\\n')
+  }
+  if (process.env.TEST_CREATE_SIDECARS_ON_START === '1') {
+    if (wal) fs.writeFileSync(wal, 'NEW-DB-WAL')
+    if (shm) fs.writeFileSync(shm, 'NEW-DB-SHM')
+  }
+}
+
+if (args[0] === 'inspect') {
+  const id = resolveId(args.at(-1))
+  const container = state.containers[id]
+  if (!container) process.exit(79)
+  if (process.env.TEST_INSPECT_FAIL_ID === id) process.exit(78)
+  const formatAt = args.indexOf('--format')
+  const format = formatAt >= 0 ? args[formatAt + 1] : ''
+  if (format.includes('com.docker.compose.project')) {
+    console.log(
+      container.composeProject + '\\t' + container.composeService + '\\tFalse\\t' + container.composeConfigHash,
+    )
+  } else if (format.includes('.Id')) {
+    console.log(process.env.TEST_INSPECT_ID_OVERRIDE || id)
+  } else if (format.includes('.Image')) {
+    if (process.env.TEST_IMAGE_INSPECT_DELAY_MS) {
+      spawnSync('sleep', [String(Number(process.env.TEST_IMAGE_INSPECT_DELAY_MS) / 1000)])
+    }
+    console.log(container.image)
+  } else if (format.includes('XJM_NETWORK_ID')) {
+    for (const network of container.networks) {
+      console.log('XJM_NETWORK_ID\\t' + network.networkId)
+    }
+  } else if (format.includes('XJM_NETWORK_RECORD')) {
+    for (const network of container.networks) {
+      console.log([
+        'XJM_NETWORK_RECORD',
+        network.name,
+        network.networkId,
+        ...network.aliases,
+      ].join('\\t'))
+    }
+  } else if (
+    format.includes('IPAMConfig') ||
+    format.includes('GwPriority') ||
+    format.includes('DriverOpts') ||
+    format.includes('Links')
+  ) {
+    for (const network of container.networks) {
+      if (format.includes('IPv4Address') && network.staticIpv4) {
+        console.log(network.name + '\tstatic-ipv4')
+      }
+      if (format.includes('GwPriority') && network.gwPriority) {
+        console.log(network.name + '\tgw-priority\t' + network.gwPriority)
+      }
+    }
+  } else if (format.includes('NetworkSettings.Networks')) {
+    for (const network of container.networks) {
+      console.log([network.name, ...network.aliases].join('\\t'))
+    }
+  } else if (format.includes('.State.Running')) {
+    console.log(container.running ? 'true' : 'false')
+  } else if (format.includes('XJM_BIND')) {
+    console.log('XJM_BIND\\t' + container.dataSource + '\\t/app/data')
+    for (const bind of container.extraBinds || []) {
+      console.log('XJM_BIND\\t' + bind.source + '\\t' + bind.target)
+    }
+  } else {
+    console.log('bind\\t' + container.dataSource)
+  }
+  process.exit(0)
+}
+
+if (args[0] === 'stop') {
+  const id = resolveId(args.at(-1))
+  if (state.containers[id]) {
+    const publicStage = path.join(state.containers[id].dataSource, '.restore-in-progress', 'snapshot.db')
+    if (process.env.TEST_PRESTOP_STAGE_OBSERVATION) {
+      fs.writeFileSync(
+        process.env.TEST_PRESTOP_STAGE_OBSERVATION,
+        JSON.stringify({
+          publicLockVisible: fs.existsSync(path.dirname(publicStage)),
+          publicStageVisible: fs.existsSync(publicStage),
+        }),
+      )
+    }
+    if (process.env.TEST_MUTATE_PUBLIC_STAGE_BEFORE_STOP === '1' && fs.existsSync(publicStage)) {
+      fs.writeFileSync(publicStage, 'APP-TAMPERED-STAGE')
+    }
+    state.containers[id].running = false
+    state.events.push(['stop', id])
+    drift('after-stop')
+    materializeExtra('after-stop')
+    save()
+  }
+  process.exit(Number(process.env.TEST_DOCKER_STOP_EXIT || 0))
+}
+
+if (args[0] === 'start') {
+  drift('before-start')
+  materializeExtra('before-start')
+  const id = resolveId(args.at(-1))
+  startContainer(id, 'start')
+  drift('after-start')
+  materializeExtra('after-start')
+  save()
+  if (process.env.TEST_BLOCK_START_AFTER_DRIFT === '1') {
+    if (process.env.TEST_START_AFTER_DRIFT_ENTERED) {
+      fs.writeFileSync(process.env.TEST_START_AFTER_DRIFT_ENTERED, '')
+    }
+    while (true) spawnSync('sleep', ['1'])
+  }
+  process.exit(0)
+}
+
+if (args[0] === 'network') {
+  const action = args[1]
+  const id = resolveId(args.at(-1))
+  const networkRef = args.at(-2)
+  const container = state.containers[id]
+  if (!container) process.exit(79)
+  state.networkCatalog ||= {}
+  if (action === 'disconnect') {
+    const requestedNetwork = container.networks.find(
+      (network) => network.name === networkRef || network.networkId === networkRef,
+    )
+    const resolvedNetworkName = requestedNetwork?.name || state.networkCatalog[networkRef]?.name || networkRef
+    if (requestedNetwork) state.networkCatalog[requestedNetwork.networkId] = requestedNetwork
+    if (
+      process.env.TEST_FAIL_ROLLBACK_DISCONNECT === '1' &&
+      state.events.some((event) => event[0] === 'network-connect-failed')
+    ) {
+      state.events.push(['network-disconnect-failed', resolvedNetworkName, id])
+      save()
+      process.exit(77)
+    }
+    container.networks = container.networks.filter(
+      (network) => network.name !== networkRef && network.networkId !== networkRef,
+    )
+    container.isolated = container.networks.length === 0
+    state.events.push(['network-disconnect', resolvedNetworkName, id])
+  } else if (action === 'connect') {
+    const aliases = []
+    for (let i = 2; i < args.length - 2; i++) {
+      if (args[i] === '--alias') aliases.push(args[++i])
+    }
+    const catalogNetwork = state.networkCatalog[networkRef]
+    const networkName = catalogNetwork?.name || networkRef
+    if (process.env.TEST_FAIL_NETWORK_CONNECT === networkName ||
+        process.env.TEST_FAIL_NETWORK_CONNECT === networkRef) {
+      state.events.push(['network-connect-failed', networkName, id])
+      save()
+      process.exit(76)
+    }
+    if (process.env.TEST_BLOCK_NETWORK_CONNECT_BEFORE_EFFECT === networkName) {
+      state.events.push(['network-connect-blocked-before-effect', networkName, id])
+      save()
+      if (process.env.TEST_NETWORK_CONNECT_ENTERED) {
+        fs.writeFileSync(process.env.TEST_NETWORK_CONNECT_ENTERED, '')
+      }
+      while (true) spawnSync('sleep', ['1'])
+    }
+    if (!container.networks.some((network) => network.networkId === networkRef)) {
+      container.networks.push({
+        name: networkName,
+        networkId: networkRef,
+        aliases,
+        runtimeMacAddress: '02:42:ac:12:00:99',
+      })
+    }
+    container.isolated = false
+    save()
+    if (process.env.TEST_BLOCK_NETWORK_CONNECT_AFTER_EFFECT === networkName) {
+      state.events.push(['network-connect-blocked-after-effect', networkName, id])
+      save()
+      if (process.env.TEST_NETWORK_CONNECT_ENTERED) {
+        fs.writeFileSync(process.env.TEST_NETWORK_CONNECT_ENTERED, '')
+      }
+      while (true) spawnSync('sleep', ['1'])
+    }
+    const accepted = fs.existsSync(path.join(container.dataSource + '.restore-control', 'ready-accepted'))
+    state.events.push([
+      'network-connect',
+      networkName,
+      networkRef,
+      id,
+      accepted ? 'accepted' : 'unaccepted',
+      ...aliases,
+    ])
+  }
+  save()
+  process.exit(0)
+}
+
+if (args[0] === 'exec') {
+  let cursor = 1
+  while (cursor < args.length && args[cursor].startsWith('-')) {
+    cursor += args[cursor] === '--user' ? 2 : 1
+  }
+  const id = resolveId(args[cursor])
+  const container = state.containers[id]
+  if (!container || !container.running) process.exit(79)
+  injectExternalNetwork('before-ready')
+  state.events.push(['exec-readiness', id, String(container.networks.length)])
+  save()
+  if (process.env.TEST_READY_ENTERED) fs.writeFileSync(process.env.TEST_READY_ENTERED, '')
+  if (process.env.TEST_READY_BLOCK_MS) {
+    spawnSync('sleep', [String(Number(process.env.TEST_READY_BLOCK_MS) / 1000)])
+  }
+  const body = process.env.TEST_READY_BODY ?? '{"ok":true}'
+  const status = process.env.TEST_READY_STATUS || '200'
+  process.stdout.write(body)
+  process.exit(Number(process.env.TEST_READY_EXIT || (status === '200' ? 0 : 8)))
+}
+if (args[0] === 'ps') {
+  let idFilter = ''
+  for (let i = 1; i < args.length - 1; i++) {
+    if (args[i] === '--filter' && args[i + 1].startsWith('id=')) {
+      idFilter = args[++i].slice(3)
+    }
+  }
+  if (!idFilter && process.env.TEST_FAIL_SERVICE_PS_WHEN_EXTRA === '1' && state.extraAppeared) {
+    state.events.push(['service-enumeration-failed', 'docker-ps'])
+    save()
+    process.exit(78)
+  }
+  const resolvedIdFilter = idFilter ? resolveId(idFilter) : ''
+  for (const [id, container] of Object.entries(state.containers)) {
+    if (resolvedIdFilter && id !== resolvedIdFilter) continue
+    if (container.composeProject === state.composeProject && container.composeService === state.composeService) {
+      console.log(renderId(id))
+    }
+  }
+  process.exit(0)
+}
+if (args[0] !== 'compose') process.exit(0)
+
+if (args[1] === 'ps') {
+  if (process.env.TEST_FAIL_COMPOSE_PS_ALWAYS === '1' ||
+      (process.env.TEST_FAIL_COMPOSE_PS_WHEN_EXTRA === '1' && state.extraAppeared)) {
+    state.events.push(['service-enumeration-failed', 'compose-ps'])
+    save()
+    process.exit(79)
+  }
+  if (state.current) console.log(renderId(state.current))
+  process.exit(0)
+}
+if (args[1] === 'create') {
+  if (!state.current && state.createId) {
+    state.current = state.createId
+    state.composeSource = state.containers[state.createId].dataSource
+    state.events.push(['compose-create', state.createId])
+    save()
+  }
+  process.exit(0)
+}
+if (args[1] === 'stop') {
+  const id = state.current
+  if (id) {
+    state.containers[id].running = false
+    state.events.push(['compose-stop', id])
+    drift('after-stop')
+    materializeExtra('after-stop')
+    save()
+  }
+  process.exit(0)
+}
+if (args[1] === 'start') {
+  drift('before-start')
+  materializeExtra('before-start')
+  const id = state.current
+  startContainer(id, 'compose-start')
+  drift('after-start')
+  materializeExtra('after-start')
+  save()
+  process.exit(0)
+}
+if (args[1] === 'config') {
+  const control = state.composeSource + '.restore-control'
+  if (fs.existsSync(path.join(control, 'network-published'))) {
+    materializeExtra('after-published')
+    save()
+  }
+  if (
+    process.env.TEST_BLOCK_AFTER_NETWORK_PUBLISHED === '1' &&
+    fs.existsSync(path.join(control, 'network-published'))
+  ) {
+    if (process.env.TEST_AFTER_NETWORK_PUBLISHED_ENTERED) {
+      fs.writeFileSync(process.env.TEST_AFTER_NETWORK_PUBLISHED_ENTERED, '')
+    }
+    while (true) spawnSync('sleep', ['1'])
+  }
+  if (args.includes('--hash')) {
+    console.log('app ' + state.composeConfigHash)
+    process.exit(0)
+  }
+  const formatAt = args.indexOf('--format')
+  if (formatAt >= 0 && args[formatAt + 1] === 'json') {
+    const app = { volumes: [
+      { type: 'bind', source: state.composeSource, target: '/app/data', bind: {} },
+      ...(state.composeExtraBinds || []).map((bind) => ({ type: 'bind', ...bind, bind: {} })),
+    ] }
+    if (state.composeNetworkMode === 'static-ipv4') {
+      app.networks = { 'stub-network': { ipv4_address: '172.30.0.10' } }
+    } else if (state.composeNetworkMode === 'interface-name') {
+      app.networks = { 'stub-network': { interface_name: 'eth42' } }
+    } else if (state.composeNetworkMode === 'mac-address') {
+      app.networks = { 'stub-network': { mac_address: '02:11:22:33:44:55' } }
+    } else if (state.composeNetworkMode === 'env-interface-name') {
+      app.networks = { 'stub-network': {} }
+      app.environment = { interface_name: 'diagnostic-only' }
+    }
+    console.log(JSON.stringify({ services: { app } }, null, 2))
+  }
+  process.exit(0)
+}
+if (args[1] === 'run') {
+  const base = spawnSync(process.execPath, [process.env.TEST_BASE_DOCKER_STUB, ...args], {
+    stdio: 'inherit',
+    env: process.env,
+  })
+  process.exit(base.status ?? 1)
+}
+process.exit(0)
 `
 
 function installReadyCurlStub(dir: string): void {
   fs.writeFileSync(path.join(dir, 'curl'), READY_CURL_STUB, { mode: 0o755 })
 }
 
+function installArmedMarkerFailureBin(root: string): string {
+  const dir = path.join(root, 'armed-marker-fail-bin')
+  fs.mkdirSync(dir, { recursive: true })
+  fs.writeFileSync(
+    path.join(dir, 'docker'),
+    `#!/bin/sh\nexec "${process.execPath}" "${path.join(binDir, 'docker-stub.mjs')}" "$@"\n`,
+    { mode: 0o755 },
+  )
+  installReadyCurlStub(dir)
+  fs.writeFileSync(
+    path.join(dir, 'install'),
+    `#!/bin/sh
+target=
+for arg in "$@"; do target="$arg"; done
+if [ "$target" = "$TEST_FAIL_INSTALL_TARGET" ]; then
+  exit 73
+fi
+/usr/bin/install "$@"
+`,
+    { mode: 0o755 },
+  )
+  fs.writeFileSync(
+    path.join(dir, 'mktemp'),
+    `#!/bin/sh
+if [ "$1" = "$TEST_FAIL_MKTEMP_TEMPLATE" ]; then
+  exit 73
+fi
+/usr/bin/mktemp "$@"
+`,
+    { mode: 0o755 },
+  )
+  return dir
+}
+
+const CONTAINER_A = 'a'.repeat(64)
+const CONTAINER_B = 'b'.repeat(64)
+const NETWORK_ID = 'd'.repeat(64)
+
+type DockerState = {
+  current: string
+  composeSource: string
+  composeProject: string
+  composeService: string
+  composeConfigHash: string
+  composeNetworkMode?: 'static-ipv4' | 'interface-name' | 'mac-address' | 'env-interface-name'
+  composeExtraBinds?: Array<{ source: string; target: string }>
+  createId?: string
+  driftAt?: 'after-stop' | 'before-start' | 'after-start'
+  driftTarget?: string
+  drifted?: boolean
+  extraAt?: 'after-stop' | 'before-start' | 'after-start' | 'after-published'
+  extraTarget?: string
+  extraAppeared?: boolean
+  externalNetworkAt?: 'before-ready'
+  externalNetworkInjected?: boolean
+  containers: Record<string, {
+    dataSource: string
+    image: string
+    running: boolean
+    isolated: boolean
+    composeProject: string
+    composeService: string
+    composeConfigHash: string
+    extraBinds?: Array<{ source: string; target: string }>
+    networks: Array<{
+      name: string
+      networkId: string
+      aliases: string[]
+      staticIpv4?: boolean
+      runtimeMacAddress?: string
+      gwPriority?: number
+    }>
+  }>
+  events: string[][]
+}
+
+function makeDockerState(dataA: string, dataB?: string): DockerState {
+  const containers: DockerState['containers'] = {
+    [CONTAINER_A]: {
+      dataSource: dataA,
+      image: 'sha256:' + '1'.repeat(64),
+      running: true,
+      isolated: false,
+      composeProject: 'xiaojimao-hub',
+      composeService: 'app',
+      composeConfigHash: 'c'.repeat(64),
+      networks: [{
+        name: 'stub-network',
+        networkId: NETWORK_ID,
+        aliases: ['app', 'stub-app-a'],
+        runtimeMacAddress: '02:42:ac:12:00:02',
+        gwPriority: 0,
+      }],
+    },
+  }
+  if (dataB) {
+    containers[CONTAINER_B] = {
+      dataSource: dataB,
+      image: 'sha256:' + '2'.repeat(64),
+      running: false,
+      isolated: false,
+      composeProject: 'not-yet-compose-service',
+      composeService: 'app',
+      composeConfigHash: 'c'.repeat(64),
+      networks: [{
+        name: 'stub-network',
+        networkId: NETWORK_ID,
+        aliases: ['app', 'stub-app-b'],
+        runtimeMacAddress: '02:42:ac:12:00:03',
+        gwPriority: 0,
+      }],
+    }
+  }
+  return {
+    current: CONTAINER_A,
+    composeSource: dataA,
+    composeProject: 'xiaojimao-hub',
+    composeService: 'app',
+    composeConfigHash: 'c'.repeat(64),
+    containers,
+    events: [],
+  }
+}
+
+function installStatefulDockerBin(root: string): { dir: string; stateFile: string } {
+  const dir = path.join(root, 'stateful-bin')
+  fs.mkdirSync(dir, { recursive: true })
+  const stateFile = path.join(root, 'docker-state.json')
+  fs.writeFileSync(path.join(dir, 'docker-stateful.mjs'), STATEFUL_DOCKER_STUB)
+  fs.writeFileSync(
+    path.join(dir, 'docker'),
+    `#!/bin/sh\nexec "${process.execPath}" "${path.join(dir, 'docker-stateful.mjs')}" "$@"\n`,
+    { mode: 0o755 },
+  )
+  installReadyCurlStub(dir)
+  return { dir, stateFile }
+}
+
+function readDockerState(stateFile: string): DockerState {
+  return JSON.parse(fs.readFileSync(stateFile, 'utf8')) as DockerState
+}
+
 before(() => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'xjm-restore-'))
+  originalTmpDir = process.env.TMPDIR
+  // restore 的 SIGKILL 回归会故意阻止 shell cleanup；把子进程 mktemp 也收进本测试沙箱，
+  // 由 after() 连同其余 fixture 一次清理，避免在宿主 TMPDIR 遗留 0600 readiness body。
+  process.env.TMPDIR = tmpDir
   binDir = path.join(tmpDir, 'bin')
   fs.mkdirSync(binDir, { recursive: true })
 
@@ -192,12 +831,19 @@ before(() => {
     `#!/bin/sh\nexec "${process.execPath}" "${path.join(binDir, 'docker-stub.mjs')}" "$@"\n`,
     { mode: 0o755 },
   )
-  // curl 桩：默认返回严格 200 + {"ok":true}；个别测试可用 TEST_READY_* 注入反例。
+  // 宿主 curl 是 fail-fast sentinel：restore readiness 必须从 exact 容器内 loopback 探测。
   installReadyCurlStub(binDir)
+  process.env.TEST_BASE_DOCKER_STUB = path.join(binDir, 'docker-stub.mjs')
 })
 
 after(() => {
-  fs.rmSync(tmpDir, { recursive: true, force: true })
+  delete process.env.TEST_BASE_DOCKER_STUB
+  try {
+    fs.rmSync(tmpDir, { recursive: true, force: true })
+  } finally {
+    if (originalTmpDir === undefined) delete process.env.TMPDIR
+    else process.env.TMPDIR = originalTmpDir
+  }
 })
 
 // 建一个带 marker 行的真 WAL 库，用于分辨「还原出来的到底是哪一份」。
@@ -290,6 +936,90 @@ function runRestore(
   }
 }
 
+function runStatefulRestore(
+  dataDir: string,
+  backupsDir: string,
+  snapshot: string,
+  dockerBin: string,
+  dockerStateFile: string,
+  envOverrides: NodeJS.ProcessEnv = {},
+): { status: number; stdout: string; stderr: string; log: string } {
+  const logFile = path.join(path.dirname(dataDir), 'stub.log')
+  fs.writeFileSync(logFile, '')
+  const r = spawnSync('sh', [RESTORE_SH, snapshot], {
+    cwd: REPO,
+    env: {
+      ...process.env,
+      PATH: `${dockerBin}:${process.env.PATH}`,
+      STUB_LOG: logFile,
+      SUDO: '',
+      DATA_DIR: dataDir,
+      BACKUP_DIR: backupsDir,
+      TEST_DOCKER_STATE: dockerStateFile,
+      ...envOverrides,
+    },
+    encoding: 'utf8',
+  })
+  return {
+    status: r.status ?? -1,
+    stdout: r.stdout || '',
+    stderr: r.stderr || '',
+    log: fs.readFileSync(logFile, 'utf8'),
+  }
+}
+
+function spawnStatefulRestore(
+  dataDir: string,
+  backupsDir: string,
+  snapshot: string,
+  dockerBin: string,
+  dockerStateFile: string,
+  envOverrides: NodeJS.ProcessEnv = {},
+): {
+  child: ReturnType<typeof spawn>
+  exited: ReturnType<typeof collectExit>
+  logFile: string
+} {
+  const logFile = path.join(path.dirname(dataDir), 'stub.log')
+  fs.writeFileSync(logFile, '')
+  const child = spawn('sh', [RESTORE_SH, snapshot], {
+    cwd: REPO,
+    detached: true,
+    env: {
+      ...process.env,
+      PATH: `${dockerBin}:${process.env.PATH}`,
+      STUB_LOG: logFile,
+      SUDO: '',
+      DATA_DIR: dataDir,
+      BACKUP_DIR: backupsDir,
+      TEST_DOCKER_STATE: dockerStateFile,
+      ...envOverrides,
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+  return { child, exited: collectExit(child, 30_000), logFile }
+}
+
+function publicationCase(name: string): {
+  root: string
+  dataDir: string
+  backupsDir: string
+  snap: string
+  dockerBin: string
+  stateFile: string
+} {
+  const root = fs.mkdtempSync(path.join(tmpDir, name + '-'))
+  const dataDir = path.join(root, 'data')
+  const backupsDir = path.join(dataDir, 'backups')
+  fs.mkdirSync(backupsDir, { recursive: true })
+  makeDb(path.join(dataDir, 'app.db'), 'CURRENT')
+  const snap = path.join(backupsDir, 'backup-publication.db')
+  makeSnapshot(snap, 'ACCEPTED-SNAPSHOT')
+  const { dir: dockerBin, stateFile } = installStatefulDockerBin(root)
+  fs.writeFileSync(stateFile, JSON.stringify(makeDockerState(dataDir)))
+  return { root, dataDir, backupsDir, snap, dockerBin, stateFile }
+}
+
 async function waitForFile(p: string, timeoutMs = 5_000): Promise<void> {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
@@ -297,6 +1027,15 @@ async function waitForFile(p: string, timeoutMs = 5_000): Promise<void> {
     await delay(20)
   }
   throw new Error(`等待测试握手文件超时：${p}`)
+}
+
+async function waitUntil(check: () => boolean, message: string, timeoutMs = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (check()) return
+    await delay(20)
+  }
+  throw new Error(message)
 }
 
 function collectExit(
@@ -325,6 +1064,34 @@ function collectExit(
 function killProcessGroup(child: ReturnType<typeof spawn>, signal: NodeJS.Signals): void {
   assert.ok(child.pid, '子进程必须有 pid')
   process.kill(-child.pid, signal)
+}
+
+async function sigkillAtFile(
+  child: ReturnType<typeof spawn>,
+  exited: ReturnType<typeof collectExit>,
+  entered: string,
+  beforeKill: () => void,
+): Promise<{ code: number | null; signal: NodeJS.Signals | null; stdout: string; stderr: string }> {
+  try {
+    await Promise.race([
+      waitForFile(entered, 20_000),
+      exited.then((result) => {
+        throw new Error(
+          `restore 在目标 SIGKILL 窗口前提前退出：code=${result.code} signal=${result.signal}\n${result.stdout}\n${result.stderr}`,
+        )
+      }),
+    ])
+    beforeKill()
+    killProcessGroup(child, 'SIGKILL')
+    const killed = await exited
+    assert.equal(killed.code, null)
+    assert.equal(killed.signal, 'SIGKILL')
+    return killed
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) {
+      try { killProcessGroup(child, 'SIGKILL') } catch {}
+    }
+  }
 }
 
 // ① 🔴🔴 必修 1 的核心回归：从 pre-restore.db 二次反悔
@@ -595,7 +1362,24 @@ test('P6-R2 DATA_DIR 绑定门禁：Compose 已改但现有容器仍挂旧目录
   assert.doesNotMatch(r.log, /"run"|"stop"|"start"/)
 })
 
-for (const mode of ['container-missing', 'container-multiple', 'missing', 'named', 'multiple', 'inspect-fail'] as const) {
+test('P6-R2 DATA_DIR 绑定门禁：app 容器尚不存在时按已核验 Compose create 为停止态后正常恢复', () => {
+  const { dataDir, backupsDir } = scene('container-data-container-missing', 'CURRENT')
+  const snap = path.join(backupsDir, 'backup-container-missing.db')
+  makeSnapshot(snap, 'CREATED-CONTAINER-RESTORED')
+
+  const r = runRestore(dataDir, backupsDir, snap, {
+    TEST_CONTAINER_MOUNT_MODE: 'container-missing',
+    TEST_CONTAINER_DATA_SOURCE: dataDir,
+  })
+  const calls = r.log.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line) as string[])
+
+  assert.equal(r.status, 0, `合法的 container-missing 应先 create 停止态容器再恢复：\n${r.stdout}\n${r.stderr}`)
+  assert.ok(calls.some((call) => call[0] === 'compose' && call[1] === 'create' && call.at(-1) === 'app'))
+  assert.equal(readMarker(path.join(dataDir, 'app.db')), 'CREATED-CONTAINER-RESTORED')
+  assert.ok(!fs.existsSync(path.join(dataDir, '.restore-in-progress')))
+})
+
+for (const mode of ['container-multiple', 'missing', 'named', 'multiple', 'inspect-fail'] as const) {
   test(`P6-R2 DATA_DIR 绑定门禁：现有容器挂载状态 ${mode} 必须 fail-closed`, () => {
     const { dataDir, backupsDir } = scene(`container-data-${mode}`, 'CURRENT')
     const snap = path.join(backupsDir, `backup-container-${mode}.db`)
@@ -644,7 +1428,7 @@ test('P6-R2 DATA_DIR 绑定门禁：校验后的 symlink 换靶不得改变锁�
     dirnameStub,
     `import fs from 'node:fs'
 import path from 'node:path'
-if (!fs.existsSync(process.env.TEST_RETARGET_DONE)) {
+if (process.argv.at(-1) === process.env.TEST_RETARGET_TRIGGER && !fs.existsSync(process.env.TEST_RETARGET_DONE)) {
   fs.unlinkSync(process.env.TEST_DATA_ALIAS)
   fs.symlinkSync(process.env.TEST_RETARGET_DEST, process.env.TEST_DATA_ALIAS, 'dir')
   fs.writeFileSync(process.env.TEST_RETARGET_DONE, '')
@@ -675,6 +1459,7 @@ console.log(path.dirname(process.argv.at(-1)))
       TEST_DATA_ALIAS: aliasDataDir,
       TEST_RETARGET_DEST: retargetDataDir,
       TEST_RETARGET_DONE: retargetDone,
+      TEST_RETARGET_TRIGGER: snap,
     },
     encoding: 'utf8',
   })
@@ -684,6 +1469,703 @@ console.log(path.dirname(process.argv.at(-1)))
   assert.equal(readMarker(path.join(actualDataDir, 'app.db')), 'PINNED-SNAPSHOT')
   assert.equal(readMarker(path.join(retargetDataDir, 'app.db')), 'RETARGET-CURRENT', '换靶目录不得被写入')
   assert.ok(!fs.existsSync(path.join(retargetDataDir, '.restore-in-progress')))
+})
+
+for (const driftAt of ['after-stop', 'before-start', 'after-start'] as const) {
+  test(`P6-R2 容器身份固定：${driftAt} 发生 A→B recreate 时不得接受 B 的 readiness`, () => {
+    const root = fs.mkdtempSync(path.join(tmpDir, `container-drift-${driftAt}-`))
+    const dataA = path.join(root, 'data-a')
+    const dataB = path.join(root, 'data-b')
+    const backupsDir = path.join(dataA, 'backups')
+    fs.mkdirSync(backupsDir, { recursive: true })
+    makeDb(path.join(dataA, 'app.db'), 'A-CURRENT')
+    makeDb(path.join(dataB, 'app.db'), 'B-OLD-SERVICE')
+    const snap = path.join(backupsDir, `backup-${driftAt}.db`)
+    makeSnapshot(snap, 'A-RESTORED')
+    const { dir: dockerBin, stateFile } = installStatefulDockerBin(root)
+    const state = makeDockerState(dataA, dataB)
+    state.driftAt = driftAt
+    state.driftTarget = CONTAINER_B
+    fs.writeFileSync(stateFile, JSON.stringify(state))
+
+    const r = runStatefulRestore(dataA, backupsDir, snap, dockerBin, stateFile, {
+      TEST_READY_STATUS: '200',
+      TEST_READY_BODY: '{"ok":true}',
+    })
+    const afterState = readDockerState(stateFile)
+    const control = `${fs.realpathSync(dataA)}.restore-control`
+
+    assert.notEqual(r.status, 0, `🔴 容器身份漂移必须 fail-closed：\n${r.stdout}\n${r.stderr}`)
+    assert.doesNotMatch(r.stdout, /恢复完成/, '不得把 B 的 readiness 宣告为 A 恢复成功')
+    assert.equal(
+      readMarker(path.join(dataA, 'app.db')),
+      driftAt === 'after-stop' ? 'A-CURRENT' : 'A-RESTORED',
+      'after-stop 漂移应在 replace 前中止；更晚漂移则只能影响已钉住的数据目录 A',
+    )
+    assert.equal(readMarker(path.join(dataB, 'app.db')), 'B-OLD-SERVICE', '并发 recreate 的 B 库不得被改动')
+    assert.ok(fs.existsSync(control), '身份漂移后必须保留 host-only control 与阶段证据')
+    assert.ok(!fs.existsSync(path.join(control, 'ready-accepted')), '漂移时绝不能记录 accepted')
+    assert.equal(afterState.containers[CONTAINER_B].running, false, '错误目标 B 也必须被停止，不能继续冒充成功实例')
+  })
+}
+
+test('P6-R2 容器身份：初始即存在额外同 project/service 容器时在停机与写库前 fail-closed', () => {
+  const root = fs.mkdtempSync(path.join(tmpDir, 'container-extra-initial-'))
+  const dataA = path.join(root, 'data-a')
+  const dataB = path.join(root, 'data-b')
+  const backupsDir = path.join(dataA, 'backups')
+  fs.mkdirSync(backupsDir, { recursive: true })
+  makeDb(path.join(dataA, 'app.db'), 'A-CURRENT')
+  makeDb(path.join(dataB, 'app.db'), 'B-CURRENT')
+  const snap = path.join(backupsDir, 'backup-extra-initial.db')
+  makeSnapshot(snap, 'SHOULD-NOT-INSTALL')
+  const { dir: dockerBin, stateFile } = installStatefulDockerBin(root)
+  const state = makeDockerState(dataA, dataB)
+  state.containers[CONTAINER_B].composeProject = state.composeProject
+  state.containers[CONTAINER_B].composeService = state.composeService
+  state.containers[CONTAINER_B].running = true
+  fs.writeFileSync(stateFile, JSON.stringify(state))
+
+  const r = runStatefulRestore(dataA, backupsDir, snap, dockerBin, stateFile)
+  const afterState = readDockerState(stateFile)
+
+  assert.notEqual(r.status, 0, `🔴 多个同 service 容器时必须 fail-closed：\n${r.stdout}\n${r.stderr}`)
+  assert.match(r.stderr, /多个|额外|容器|service|身份/i)
+  assert.equal(readMarker(path.join(dataA, 'app.db')), 'A-CURRENT')
+  assert.equal(readMarker(path.join(dataB, 'app.db')), 'B-CURRENT')
+  assert.ok(!afterState.events.some((event) => event[0] === 'stop'), '初始身份不唯一时不得先停任一实例')
+  assert.ok(!fs.existsSync(path.join(dataA, '.restore-in-progress')))
+  assert.ok(!fs.existsSync(`${fs.realpathSync(dataA)}.restore-control`))
+})
+
+test('P6-R2 容器身份：Compose ps 返回非完整 64hex ID 时在建锁/停机/写库前拒绝', () => {
+  const { dataDir, backupsDir } = scene('container-id-malformed', 'CURRENT')
+  const snap = path.join(backupsDir, 'backup-malformed-id.db')
+  makeSnapshot(snap, 'SHOULD-NOT-INSTALL')
+
+  const r = runRestore(dataDir, backupsDir, snap, {
+    TEST_COMPOSE_CONTAINER_ID: 'abc123',
+  })
+
+  assert.notEqual(r.status, 0)
+  assert.match(r.stderr, /容器.*ID|64|hex|身份/i)
+  assert.equal(readMarker(path.join(dataDir, 'app.db')), 'CURRENT')
+  assert.doesNotMatch(r.log, /"run"|"stop"|"start"/)
+  assert.ok(!fs.existsSync(path.join(dataDir, '.restore-in-progress')))
+  assert.ok(!fs.existsSync(`${fs.realpathSync(dataDir)}.restore-control`))
+})
+
+test('P6-R2 容器身份：docker inspect .Id 不等于 Compose 捕获值时在建锁/停机/写库前拒绝', () => {
+  const { dataDir, backupsDir, snap, dockerBin, stateFile } = publicationCase('container-id-mismatch')
+
+  const r = runStatefulRestore(dataDir, backupsDir, snap, dockerBin, stateFile, {
+    TEST_INSPECT_ID_OVERRIDE: CONTAINER_B,
+  })
+  const afterState = readDockerState(stateFile)
+
+  assert.notEqual(r.status, 0)
+  assert.match(r.stderr, /容器.*ID|inspect|身份.*不一致/i)
+  assert.equal(readMarker(path.join(dataDir, 'app.db')), 'CURRENT')
+  assert.ok(!afterState.events.some((event) => event[0] === 'stop'))
+  assert.ok(!fs.existsSync(path.join(dataDir, '.restore-in-progress')))
+  assert.ok(!fs.existsSync(`${fs.realpathSync(dataDir)}.restore-control`))
+})
+
+test('P6-R2 容器身份：start 后出现额外同 service 容器时拒绝 accepted 并收口所有未验收实例', () => {
+  const root = fs.mkdtempSync(path.join(tmpDir, 'container-extra-after-start-'))
+  const dataA = path.join(root, 'data-a')
+  const dataB = path.join(root, 'data-b')
+  const backupsDir = path.join(dataA, 'backups')
+  fs.mkdirSync(backupsDir, { recursive: true })
+  makeDb(path.join(dataA, 'app.db'), 'A-CURRENT')
+  makeDb(path.join(dataB, 'app.db'), 'B-CURRENT')
+  const snap = path.join(backupsDir, 'backup-extra-after-start.db')
+  makeSnapshot(snap, 'A-RESTORED')
+  const { dir: dockerBin, stateFile } = installStatefulDockerBin(root)
+  const state = makeDockerState(dataA, dataB)
+  state.extraAt = 'after-start'
+  state.extraTarget = CONTAINER_B
+  fs.writeFileSync(stateFile, JSON.stringify(state))
+
+  const r = runStatefulRestore(dataA, backupsDir, snap, dockerBin, stateFile)
+  const afterState = readDockerState(stateFile)
+  const control = `${fs.realpathSync(dataA)}.restore-control`
+
+  assert.notEqual(r.status, 0, `🔴 start 后 service 身份不再唯一时不得成功：\n${r.stdout}\n${r.stderr}`)
+  assert.doesNotMatch(r.stdout, /恢复完成/)
+  assert.ok(afterState.events.some((event) => event[0] === 'extra-service' && event[1] === 'after-start'))
+  assert.equal(afterState.containers[CONTAINER_A].running, false, '未验收 A 必须停止')
+  assert.equal(afterState.containers[CONTAINER_B].running, false, '额外 B 也必须停止')
+  assert.deepEqual(afterState.containers[CONTAINER_A].networks, [])
+  assert.deepEqual(afterState.containers[CONTAINER_B].networks, [])
+  assert.ok(fs.existsSync(control))
+  assert.ok(!fs.existsSync(path.join(control, 'ready-accepted')), '额外实例出现后绝不能接受 readiness')
+})
+
+test('P6-R2 cleanup：service 标签枚举失败时不得把未知额外 B 当作已收口', () => {
+  const root = fs.mkdtempSync(path.join(tmpDir, 'cleanup-service-enumeration-fail-'))
+  const dataA = path.join(root, 'data-a')
+  const dataB = path.join(root, 'data-b')
+  const backupsDir = path.join(dataA, 'backups')
+  fs.mkdirSync(backupsDir, { recursive: true })
+  makeDb(path.join(dataA, 'app.db'), 'A-CURRENT')
+  makeDb(path.join(dataB, 'app.db'), 'B-CURRENT')
+  const snap = path.join(backupsDir, 'backup-enumeration-fail.db')
+  makeSnapshot(snap, 'A-RESTORED')
+  const { dir: dockerBin, stateFile } = installStatefulDockerBin(root)
+  const state = makeDockerState(dataA, dataB)
+  state.extraAt = 'after-start'
+  state.extraTarget = CONTAINER_B
+  fs.writeFileSync(stateFile, JSON.stringify(state))
+
+  const r = runStatefulRestore(dataA, backupsDir, snap, dockerBin, stateFile, {
+    TEST_FAIL_SERVICE_PS_WHEN_EXTRA: '1',
+  })
+  const afterState = readDockerState(stateFile)
+  const control = `${fs.realpathSync(dataA)}.restore-control`
+
+  assert.notEqual(r.status, 0)
+  assert.equal(afterState.containers[CONTAINER_A].running, false, '即使枚举失败也必须先停止已捕获 A')
+  assert.equal(afterState.containers[CONTAINER_B].running, true, '前置：枚举故障使 B 无法被可靠发现')
+  assert.ok(
+    afterState.events.some((event) => event[0] === 'service-enumeration-failed'),
+    '前置：cleanup 的 service 枚举故障必须真实命中',
+  )
+  assert.ok(
+    fs.existsSync(path.join(control, 'ambiguous-publication')),
+    '🔴 无法证明所有 service 候选已收口时必须保留明确 ambiguous 证据',
+  )
+  assert.match(r.stderr, /无法枚举|无法确认.*service|发布状态不明|ambiguous/i)
+})
+
+test('P6-R2 cleanup：Compose ps 枚举失败也必须保留未发布状态不明证据', () => {
+  const root = fs.mkdtempSync(path.join(tmpDir, 'cleanup-compose-enumeration-fail-'))
+  const dataA = path.join(root, 'data-a')
+  const dataB = path.join(root, 'data-b')
+  const backupsDir = path.join(dataA, 'backups')
+  fs.mkdirSync(backupsDir, { recursive: true })
+  makeDb(path.join(dataA, 'app.db'), 'A-CURRENT')
+  makeDb(path.join(dataB, 'app.db'), 'B-CURRENT')
+  const snap = path.join(backupsDir, 'backup-compose-enumeration-fail.db')
+  makeSnapshot(snap, 'A-RESTORED')
+  const { dir: dockerBin, stateFile } = installStatefulDockerBin(root)
+  const state = makeDockerState(dataA, dataB)
+  state.extraAt = 'after-start'
+  state.extraTarget = CONTAINER_B
+  fs.writeFileSync(stateFile, JSON.stringify(state))
+
+  const r = runStatefulRestore(dataA, backupsDir, snap, dockerBin, stateFile, {
+    TEST_FAIL_COMPOSE_PS_WHEN_EXTRA: '1',
+  })
+  const afterState = readDockerState(stateFile)
+  const control = `${fs.realpathSync(dataA)}.restore-control`
+
+  assert.notEqual(r.status, 0)
+  assert.equal(afterState.containers[CONTAINER_A].running, false, '已捕获 A 必须先停止')
+  assert.equal(afterState.containers[CONTAINER_B].running, true, '前置：Compose 枚举故障使 B 无法确认收口')
+  assert.ok(afterState.events.some((event) => event[0] === 'service-enumeration-failed' && event[1] === 'compose-ps'))
+  assert.ok(fs.existsSync(path.join(control, 'ambiguous-publication')))
+  assert.match(r.stderr, /Compose.*指针|无法确认.*候选|发布状态不明|ambiguous/i)
+})
+
+test('P6-R2 cleanup：network-published 后枚举失败时保留 A 并记录发布身份不明', () => {
+  const root = fs.mkdtempSync(path.join(tmpDir, 'published-cleanup-enumeration-fail-'))
+  const dataA = path.join(root, 'data-a')
+  const dataB = path.join(root, 'data-b')
+  const backupsDir = path.join(dataA, 'backups')
+  fs.mkdirSync(backupsDir, { recursive: true })
+  makeDb(path.join(dataA, 'app.db'), 'A-CURRENT')
+  makeDb(path.join(dataB, 'app.db'), 'B-CURRENT')
+  const snap = path.join(backupsDir, 'backup-published-enumeration-fail.db')
+  makeSnapshot(snap, 'A-ACCEPTED')
+  const { dir: dockerBin, stateFile } = installStatefulDockerBin(root)
+  const state = makeDockerState(dataA, dataB)
+  state.extraAt = 'after-published'
+  state.extraTarget = CONTAINER_B
+  fs.writeFileSync(stateFile, JSON.stringify(state))
+
+  const r = runStatefulRestore(dataA, backupsDir, snap, dockerBin, stateFile, {
+    TEST_FAIL_SERVICE_PS_WHEN_EXTRA: '1',
+  })
+  const afterState = readDockerState(stateFile)
+  const control = `${fs.realpathSync(dataA)}.restore-control`
+
+  assert.notEqual(r.status, 0)
+  assert.equal(afterState.containers[CONTAINER_A].running, true, 'network-published 后 trusted A 不得反向停机')
+  assert.equal(afterState.containers[CONTAINER_B].running, true, '前置：枚举故障使额外 B 的状态无法确认')
+  assert.ok(fs.existsSync(path.join(control, 'ready-accepted')))
+  assert.ok(fs.existsSync(path.join(control, 'network-published')))
+  assert.ok(
+    fs.existsSync(path.join(control, 'ambiguous-publication')),
+    '🔴 已发布后无法枚举替代实例时必须留下明确发布身份不明证据',
+  )
+  assert.match(r.stderr, /无法完整枚举|发布身份状态不明|ambiguous/i)
+})
+
+test('P6-R2 cleanup：network-published 后 Compose ps 失败也不得释放 accepted 状态', () => {
+  const root = fs.mkdtempSync(path.join(tmpDir, 'published-cleanup-compose-fail-'))
+  const dataA = path.join(root, 'data-a')
+  const dataB = path.join(root, 'data-b')
+  const backupsDir = path.join(dataA, 'backups')
+  fs.mkdirSync(backupsDir, { recursive: true })
+  makeDb(path.join(dataA, 'app.db'), 'A-CURRENT')
+  makeDb(path.join(dataB, 'app.db'), 'B-CURRENT')
+  const snap = path.join(backupsDir, 'backup-published-compose-fail.db')
+  makeSnapshot(snap, 'A-ACCEPTED')
+  const { dir: dockerBin, stateFile } = installStatefulDockerBin(root)
+  const state = makeDockerState(dataA, dataB)
+  state.extraAt = 'after-published'
+  state.extraTarget = CONTAINER_B
+  fs.writeFileSync(stateFile, JSON.stringify(state))
+
+  const r = runStatefulRestore(dataA, backupsDir, snap, dockerBin, stateFile, {
+    TEST_FAIL_COMPOSE_PS_WHEN_EXTRA: '1',
+  })
+  const afterState = readDockerState(stateFile)
+  const control = `${fs.realpathSync(dataA)}.restore-control`
+
+  assert.notEqual(r.status, 0)
+  assert.equal(afterState.containers[CONTAINER_A].running, true, 'published A 必须保留运行')
+  assert.equal(afterState.containers[CONTAINER_B].running, true, '前置：Compose ps 故障使 B 无法确认收口')
+  assert.ok(afterState.events.some((event) => event[0] === 'service-enumeration-failed' && event[1] === 'compose-ps'))
+  assert.ok(fs.existsSync(path.join(control, 'ready-accepted')))
+  assert.ok(fs.existsSync(path.join(control, 'network-published')))
+  assert.ok(fs.existsSync(path.join(control, 'ambiguous-publication')))
+  assert.match(r.stderr, /Compose.*指针|发布身份状态不明|ambiguous/i)
+})
+
+test('P6-R2 cleanup：network-published 后短 ID 不得把 trusted A 当作额外 B 停止', () => {
+  const root = fs.mkdtempSync(path.join(tmpDir, 'published-cleanup-short-id-'))
+  const dataA = path.join(root, 'data-a')
+  const dataB = path.join(root, 'data-b')
+  const backupsDir = path.join(dataA, 'backups')
+  fs.mkdirSync(backupsDir, { recursive: true })
+  makeDb(path.join(dataA, 'app.db'), 'A-CURRENT')
+  makeDb(path.join(dataB, 'app.db'), 'B-CURRENT')
+  const snap = path.join(backupsDir, 'backup-published-short-id.db')
+  makeSnapshot(snap, 'A-ACCEPTED')
+  const { dir: dockerBin, stateFile } = installStatefulDockerBin(root)
+  const state = makeDockerState(dataA, dataB)
+  state.extraAt = 'after-published'
+  state.extraTarget = CONTAINER_B
+  fs.writeFileSync(stateFile, JSON.stringify(state))
+
+  const r = runStatefulRestore(dataA, backupsDir, snap, dockerBin, stateFile, {
+    TEST_TRUNCATE_SERVICE_IDS_WHEN_EXTRA: '1',
+  })
+  const afterState = readDockerState(stateFile)
+  const control = `${fs.realpathSync(dataA)}.restore-control`
+
+  assert.notEqual(r.status, 0, '额外 B 出现后必须 fail-closed')
+  assert.equal(afterState.containers[CONTAINER_A].running, true, '🔴 trusted published A 不得因短 ID 比较被误停')
+  assert.equal(afterState.containers[CONTAINER_B].running, false, '未验收 B 必须停止并隔离')
+  assert.deepEqual(afterState.containers[CONTAINER_B].networks, [])
+  assert.ok(fs.existsSync(path.join(control, 'ready-accepted')))
+  assert.ok(fs.existsSync(path.join(control, 'network-published')))
+})
+
+test('P6-R2 容器身份：Docker 默认短 ID 时必须显式 no-trunc 后正常成功', () => {
+  const root = fs.mkdtempSync(path.join(tmpDir, 'container-stable-'))
+  const dataDir = path.join(root, 'data')
+  const backupsDir = path.join(dataDir, 'backups')
+  fs.mkdirSync(backupsDir, { recursive: true })
+  makeDb(path.join(dataDir, 'app.db'), 'CURRENT')
+  const snap = path.join(backupsDir, 'backup-stable.db')
+  makeSnapshot(snap, 'STABLE-RESTORED')
+  const { dir: dockerBin, stateFile } = installStatefulDockerBin(root)
+  fs.writeFileSync(stateFile, JSON.stringify(makeDockerState(dataDir)))
+
+  const r = runStatefulRestore(dataDir, backupsDir, snap, dockerBin, stateFile, {
+    TEST_TRUNCATE_ALL_IDS_WITHOUT_FLAG: '1',
+  })
+  const afterState = readDockerState(stateFile)
+  const disconnectAt = afterState.events.findIndex((event) => event[0] === 'network-disconnect' && event[2] === CONTAINER_A)
+  const startAt = afterState.events.findIndex((event) => event[0] === 'start' && event[1] === CONTAINER_A)
+  const reconnectAt = afterState.events.findIndex(
+    (event) => event[0] === 'network-connect' && event[3] === CONTAINER_A,
+  )
+  assert.equal(r.status, 0, `合法无漂移路径应成功：\n${r.stdout}\n${r.stderr}`)
+  assert.equal(readMarker(path.join(dataDir, 'app.db')), 'STABLE-RESTORED')
+  assert.ok(!fs.existsSync(path.join(dataDir, '.restore-in-progress')))
+  assert.ok(disconnectAt >= 0 && disconnectAt < startAt && startAt < reconnectAt, '🔴 app 必须先断网，再启动，accepted 后才恢复网络')
+  assert.ok(
+    afterState.events.some((event) => event[0] === 'exec-readiness' && event[1] === CONTAINER_A && event[2] === '0'),
+    'readiness 必须从已捕获 exact ID 的容器内执行，且 probe 时网络集合仍为空',
+  )
+  assert.ok(
+    afterState.events.some((event) =>
+      event[0] === 'network-connect' &&
+      event[1] === 'stub-network' &&
+      event[3] === CONTAINER_A &&
+      event[4] === 'accepted'),
+    '🔴 ready-accepted 写入前不得恢复容器网络；否则 SIGKILL 可把未接受实例暴露给流量',
+  )
+  assert.doesNotMatch(r.log, /--mac-address/, '动态 endpoint MAC 不得捕获或重放')
+  assert.equal(
+    afterState.containers[CONTAINER_A].networks[0].runtimeMacAddress,
+    '02:42:ac:12:00:99',
+    '动态 MAC 可由 Docker 在重连时改变，NetworkID/name/aliases 不变即应成功',
+  )
+})
+
+test('P6-R2 方案A SIGKILL：app-started / ready 前实例保持断网，重试先停精确 ID 再 exit 4', async () => {
+  const { root, dataDir, backupsDir, snap, dockerBin, stateFile } = publicationCase('sigkill-pre-ready')
+  const control = `${fs.realpathSync(dataDir)}.restore-control`
+  const entered = path.join(root, 'ready-entered')
+  const { child, exited } = spawnStatefulRestore(dataDir, backupsDir, snap, dockerBin, stateFile, {
+    TEST_READY_ENTERED: entered,
+    TEST_READY_BLOCK_MS: '30000',
+  })
+
+  await sigkillAtFile(child, exited, entered, () => {
+    const state = readDockerState(stateFile)
+    assert.equal(state.containers[CONTAINER_A].running, true, '前置：exact A 已启动')
+    assert.deepEqual(state.containers[CONTAINER_A].networks, [], '🔴 strict readiness 前必须保持零网络')
+    assert.ok(fs.existsSync(path.join(control, 'app-started')))
+    assert.ok(!fs.existsSync(path.join(control, 'ready-accepted')))
+    assert.ok(!fs.existsSync(path.join(control, 'network-published')))
+  })
+
+  const retry = runStatefulRestore(dataDir, backupsDir, snap, dockerBin, stateFile)
+  const afterRetry = readDockerState(stateFile)
+  assert.equal(retry.status, 4)
+  assert.equal(afterRetry.containers[CONTAINER_A].running, false, '🔴 未验收残锁必须先停 exact A')
+  assert.deepEqual(afterRetry.containers[CONTAINER_A].networks, [], '未验收残锁必须确认 A 仍隔离')
+  assert.ok(fs.existsSync(control), '残锁与 app-started 证据必须保留')
+})
+
+test('P6-R2 方案A SIGKILL：ready-accepted / reconnect 前可验收但仍断网，重试收口后 exit 4', async () => {
+  const { root, dataDir, backupsDir, snap, dockerBin, stateFile } = publicationCase('sigkill-pre-reconnect')
+  const control = `${fs.realpathSync(dataDir)}.restore-control`
+  const entered = path.join(root, 'connect-before-effect')
+  const { child, exited } = spawnStatefulRestore(dataDir, backupsDir, snap, dockerBin, stateFile, {
+    TEST_BLOCK_NETWORK_CONNECT_BEFORE_EFFECT: 'stub-network',
+    TEST_NETWORK_CONNECT_ENTERED: entered,
+  })
+
+  await sigkillAtFile(child, exited, entered, () => {
+    const state = readDockerState(stateFile)
+    assert.ok(fs.existsSync(path.join(control, 'ready-accepted')), '🔴 reconnect 前必须先持久化 trusted accepted')
+    assert.ok(fs.existsSync(path.join(control, 'networks-reconnecting')))
+    assert.ok(!fs.existsSync(path.join(control, 'network-published')))
+    assert.equal(state.containers[CONTAINER_A].running, true)
+    assert.deepEqual(state.containers[CONTAINER_A].networks, [], 'connect 生效前仍必须零网络')
+  })
+
+  const retry = runStatefulRestore(dataDir, backupsDir, snap, dockerBin, stateFile)
+  const afterRetry = readDockerState(stateFile)
+  assert.equal(retry.status, 4)
+  assert.equal(afterRetry.containers[CONTAINER_A].running, false)
+  assert.deepEqual(afterRetry.containers[CONTAINER_A].networks, [])
+  assert.ok(fs.existsSync(path.join(control, 'ready-accepted')), 'accepted 证据不得因残锁收口删除')
+})
+
+test('P6-R2 方案A SIGKILL：connect 已生效 / network-published 前，重试撤回 endpoint 并停机', async () => {
+  const { root, dataDir, backupsDir, snap, dockerBin, stateFile } = publicationCase('sigkill-post-connect')
+  const control = `${fs.realpathSync(dataDir)}.restore-control`
+  const entered = path.join(root, 'connect-after-effect')
+  const { child, exited } = spawnStatefulRestore(dataDir, backupsDir, snap, dockerBin, stateFile, {
+    TEST_BLOCK_NETWORK_CONNECT_AFTER_EFFECT: 'stub-network',
+    TEST_NETWORK_CONNECT_ENTERED: entered,
+  })
+
+  await sigkillAtFile(child, exited, entered, () => {
+    const state = readDockerState(stateFile)
+    assert.ok(fs.existsSync(path.join(control, 'ready-accepted')), '🔴 endpoint 生效前 accepted 已持久化')
+    assert.ok(!fs.existsSync(path.join(control, 'network-published')))
+    assert.equal(state.containers[CONTAINER_A].networks.length, 1, '前置：network connect 已真实生效')
+  })
+
+  const retry = runStatefulRestore(dataDir, backupsDir, snap, dockerBin, stateFile)
+  const afterRetry = readDockerState(stateFile)
+  assert.equal(retry.status, 4)
+  assert.equal(afterRetry.containers[CONTAINER_A].running, false)
+  assert.deepEqual(afterRetry.containers[CONTAINER_A].networks, [], '🔴 未提交 publication 的 endpoint 必须撤回')
+  assert.ok(fs.existsSync(path.join(control, 'ready-accepted')))
+})
+
+test('P6-R2 方案A SIGKILL：network-published / lock release 前属于已验收实例，重试不得反向停 A', async () => {
+  const { root, dataDir, backupsDir, snap, dockerBin, stateFile } = publicationCase('sigkill-post-published')
+  const control = `${fs.realpathSync(dataDir)}.restore-control`
+  const entered = path.join(root, 'network-published-entered')
+  const { child, exited } = spawnStatefulRestore(dataDir, backupsDir, snap, dockerBin, stateFile, {
+    TEST_BLOCK_AFTER_NETWORK_PUBLISHED: '1',
+    TEST_AFTER_NETWORK_PUBLISHED_ENTERED: entered,
+  })
+
+  await sigkillAtFile(child, exited, entered, () => {
+    const state = readDockerState(stateFile)
+    assert.ok(fs.existsSync(path.join(control, 'ready-accepted')))
+    assert.ok(fs.existsSync(path.join(control, 'network-published')), '🔴 对外可达前必须已有唯一 commit marker')
+    assert.equal(state.containers[CONTAINER_A].running, true)
+    assert.equal(state.containers[CONTAINER_A].networks.length, 1)
+  })
+
+  const beforeRetry = readDockerState(stateFile)
+  const stopCount = beforeRetry.events.filter((event) => event[0] === 'stop' && event[1] === CONTAINER_A).length
+  const retry = runStatefulRestore(dataDir, backupsDir, snap, dockerBin, stateFile)
+  const afterRetry = readDockerState(stateFile)
+  assert.equal(retry.status, 4)
+  assert.equal(afterRetry.containers[CONTAINER_A].running, true, '已发布 exact A 不得被残锁处理反向停机')
+  assert.equal(afterRetry.containers[CONTAINER_A].networks.length, 1)
+  assert.equal(
+    afterRetry.events.filter((event) => event[0] === 'stop' && event[1] === CONTAINER_A).length,
+    stopCount,
+  )
+  assert.ok(fs.existsSync(control), 'published 后 SIGKILL 的 accepted/published 证据必须保留')
+})
+
+test('P6-R2 隔离不变量：start 后被外部接入网络时，probe/accepted 前复核必须 fail-closed', () => {
+  const { dataDir, backupsDir, snap, dockerBin, stateFile } = publicationCase('external-connect-before-ready')
+  const state = readDockerState(stateFile)
+  state.externalNetworkAt = 'before-ready'
+  fs.writeFileSync(stateFile, JSON.stringify(state))
+  const control = `${fs.realpathSync(dataDir)}.restore-control`
+
+  const r = runStatefulRestore(dataDir, backupsDir, snap, dockerBin, stateFile)
+  const afterState = readDockerState(stateFile)
+
+  assert.notEqual(r.status, 0, `🔴 隔离态被外部 network connect 破坏后不得成功：\n${r.stdout}\n${r.stderr}`)
+  assert.doesNotMatch(r.stdout, /恢复完成/)
+  assert.ok(afterState.events.some((event) => event[0] === 'external-network-connect'))
+  assert.ok(!fs.existsSync(path.join(control, 'ready-accepted')), '🔴 网络集合非空时不得写 trusted accepted')
+  assert.equal(afterState.containers[CONTAINER_A].running, false)
+  assert.deepEqual(afterState.containers[CONTAINER_A].networks, [])
+  assert.ok(fs.existsSync(control), '隔离不变量失败必须保留阶段锁')
+})
+
+test('P6-R2 host-only stage：app 在 stop 前看不到也不能篡改已校验 replace stage', () => {
+  const root = fs.mkdtempSync(path.join(tmpDir, 'host-only-stage-'))
+  const dataDir = path.join(root, 'data')
+  const backupsDir = path.join(dataDir, 'backups')
+  fs.mkdirSync(backupsDir, { recursive: true })
+  makeDb(path.join(dataDir, 'app.db'), 'CURRENT')
+  const snap = path.join(backupsDir, 'backup-host-only-stage.db')
+  makeSnapshot(snap, 'HOST-ONLY-STAGE-RESTORED')
+  const { dir: dockerBin, stateFile } = installStatefulDockerBin(root)
+  fs.writeFileSync(stateFile, JSON.stringify(makeDockerState(dataDir)))
+  const observation = path.join(root, 'prestop-stage.json')
+
+  const r = runStatefulRestore(dataDir, backupsDir, snap, dockerBin, stateFile, {
+    TEST_PRESTOP_STAGE_OBSERVATION: observation,
+    TEST_MUTATE_PUBLIC_STAGE_BEFORE_STOP: '1',
+  })
+
+  assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`)
+  assert.deepEqual(
+    JSON.parse(fs.readFileSync(observation, 'utf8')),
+    { publicLockVisible: false, publicStageVisible: false },
+    '🔴 stop 前不得创建 app 可换 entry 的 public lock/stage；唯一状态必须在 host-only control',
+  )
+  assert.equal(readMarker(path.join(dataDir, 'app.db')), 'HOST-ONLY-STAGE-RESTORED')
+  assert.ok(!fs.existsSync(`${fs.realpathSync(dataDir)}.restore-control`), '成功后 host-only 控制锁必须清理')
+})
+
+test('P6-R2 host-only 控制面：Compose 额外 bind 覆盖 DATA_DIR 父目录时必须在建锁/停机前拒绝', () => {
+  const root = fs.mkdtempSync(path.join(tmpDir, 'control-overlap-compose-'))
+  const dataDir = path.join(root, 'data')
+  const backupsDir = path.join(dataDir, 'backups')
+  fs.mkdirSync(backupsDir, { recursive: true })
+  makeDb(path.join(dataDir, 'app.db'), 'CURRENT')
+  const snap = path.join(backupsDir, 'backup-overlap-compose.db')
+  makeSnapshot(snap, 'SHOULD-NOT-INSTALL')
+  const { dir: dockerBin, stateFile } = installStatefulDockerBin(root)
+  const state = makeDockerState(dataDir)
+  state.composeExtraBinds = [{ source: root, target: '/app/repo' }]
+  state.containers[CONTAINER_A].extraBinds = [{ source: root, target: '/app/repo' }]
+  fs.writeFileSync(stateFile, JSON.stringify(state))
+
+  const r = runStatefulRestore(dataDir, backupsDir, snap, dockerBin, stateFile)
+  const afterState = readDockerState(stateFile)
+
+  assert.notEqual(r.status, 0, '🔴 app 能经父目录 bind 看见 data.restore-control 时必须 fail-closed')
+  assert.match(r.stderr, /host-only|control|bind|挂载.*重叠|祖先/i)
+  assert.equal(readMarker(path.join(dataDir, 'app.db')), 'CURRENT')
+  assert.ok(!afterState.events.some((event) => event[0] === 'stop'))
+  assert.ok(!fs.existsSync(path.join(dataDir, '.restore-in-progress')))
+  assert.ok(!fs.existsSync(`${fs.realpathSync(dataDir)}.restore-control`))
+})
+
+test('P6-R2 host-only 控制面：现有容器额外 ancestor bind 即使 Compose 未声明也必须拒绝', () => {
+  const root = fs.mkdtempSync(path.join(tmpDir, 'control-overlap-container-'))
+  const dataDir = path.join(root, 'data')
+  const backupsDir = path.join(dataDir, 'backups')
+  fs.mkdirSync(backupsDir, { recursive: true })
+  makeDb(path.join(dataDir, 'app.db'), 'CURRENT')
+  const snap = path.join(backupsDir, 'backup-overlap-container.db')
+  makeSnapshot(snap, 'SHOULD-NOT-INSTALL')
+  const { dir: dockerBin, stateFile } = installStatefulDockerBin(root)
+  const state = makeDockerState(dataDir)
+  state.containers[CONTAINER_A].extraBinds = [{ source: root, target: '/ops' }]
+  fs.writeFileSync(stateFile, JSON.stringify(state))
+
+  const r = runStatefulRestore(dataDir, backupsDir, snap, dockerBin, stateFile)
+  const afterState = readDockerState(stateFile)
+
+  assert.notEqual(r.status, 0, '🔴 stale/手工容器的额外 bind 也不得暴露 trusted control sibling')
+  assert.match(r.stderr, /host-only|control|bind|实际挂载|祖先/i)
+  assert.equal(readMarker(path.join(dataDir, 'app.db')), 'CURRENT')
+  assert.ok(!afterState.events.some((event) => event[0] === 'stop'))
+  assert.ok(!fs.existsSync(path.join(dataDir, '.restore-in-progress')))
+})
+
+test('P6-R2 host-only 控制面：不包含 control sibling 的独立额外 bind 不应被误拒', () => {
+  const root = fs.mkdtempSync(path.join(tmpDir, 'control-nonoverlap-bind-'))
+  const dataDir = path.join(root, 'data')
+  const independent = fs.mkdtempSync(path.join(tmpDir, 'control-independent-'))
+  const backupsDir = path.join(dataDir, 'backups')
+  fs.mkdirSync(backupsDir, { recursive: true })
+  makeDb(path.join(dataDir, 'app.db'), 'CURRENT')
+  const snap = path.join(backupsDir, 'backup-nonoverlap.db')
+  makeSnapshot(snap, 'SAFE-EXTRA-BIND')
+  const { dir: dockerBin, stateFile } = installStatefulDockerBin(root)
+  const state = makeDockerState(dataDir)
+  state.composeExtraBinds = [{ source: independent, target: '/app/assets' }]
+  state.containers[CONTAINER_A].extraBinds = [{ source: independent, target: '/app/assets' }]
+  fs.writeFileSync(stateFile, JSON.stringify(state))
+
+  const r = runStatefulRestore(dataDir, backupsDir, snap, dockerBin, stateFile)
+  assert.equal(r.status, 0, `独立 bind 不包含 host-only control，应允许恢复：\n${r.stdout}\n${r.stderr}`)
+  assert.equal(readMarker(path.join(dataDir, 'app.db')), 'SAFE-EXTRA-BIND')
+})
+
+test('P6-R2 网络身份：Compose-only 静态 IPv4 必须在停机/断网前 fail-closed', () => {
+  const root = fs.mkdtempSync(path.join(tmpDir, 'network-static-ip-'))
+  const dataDir = path.join(root, 'data')
+  const backupsDir = path.join(dataDir, 'backups')
+  fs.mkdirSync(backupsDir, { recursive: true })
+  makeDb(path.join(dataDir, 'app.db'), 'CURRENT')
+  const snap = path.join(backupsDir, 'backup-static-ip.db')
+  makeSnapshot(snap, 'SHOULD-NOT-INSTALL')
+  const { dir: dockerBin, stateFile } = installStatefulDockerBin(root)
+  const state = makeDockerState(dataDir)
+  state.composeNetworkMode = 'static-ipv4'
+  fs.writeFileSync(stateFile, JSON.stringify(state))
+
+  const r = runStatefulRestore(dataDir, backupsDir, snap, dockerBin, stateFile)
+  const afterState = readDockerState(stateFile)
+
+  assert.notEqual(r.status, 0, '🔴 无法无损重放的静态 IP 网络配置必须 fail-closed')
+  assert.match(r.stderr, /网络.*(静态|IPv4|重放|不支持)|ipv4_address/i)
+  assert.equal(readMarker(path.join(dataDir, 'app.db')), 'CURRENT')
+  assert.ok(!afterState.events.some((event) => event[0] === 'stop'), '静态网络门禁必须发生在停机前')
+  assert.ok(!afterState.events.some((event) => event[0] === 'network-disconnect'), '静态网络门禁不得先断网')
+  assert.ok(!fs.existsSync(path.join(dataDir, '.restore-in-progress')), '前置门禁失败不得留下 restore 锁')
+})
+
+test('P6-R2 网络身份：Compose-only interface_name 必须在停机/断网前 fail-closed', () => {
+  const root = fs.mkdtempSync(path.join(tmpDir, 'network-interface-name-'))
+  const dataDir = path.join(root, 'data')
+  const backupsDir = path.join(dataDir, 'backups')
+  fs.mkdirSync(backupsDir, { recursive: true })
+  makeDb(path.join(dataDir, 'app.db'), 'CURRENT')
+  const snap = path.join(backupsDir, 'backup-interface-name.db')
+  makeSnapshot(snap, 'SHOULD-NOT-INSTALL')
+  const { dir: dockerBin, stateFile } = installStatefulDockerBin(root)
+  const state = makeDockerState(dataDir)
+  state.composeNetworkMode = 'interface-name'
+  fs.writeFileSync(stateFile, JSON.stringify(state))
+
+  const r = runStatefulRestore(dataDir, backupsDir, snap, dockerBin, stateFile)
+  const afterState = readDockerState(stateFile)
+
+  assert.notEqual(r.status, 0, '🔴 无法无损重放的 interface_name 必须 fail-closed')
+  assert.match(r.stderr, /网络.*(interface|接口|重放|不支持)|interface_name/i)
+  assert.equal(readMarker(path.join(dataDir, 'app.db')), 'CURRENT')
+  assert.ok(!afterState.events.some((event) => event[0] === 'stop'), 'interface_name 门禁必须发生在停机前')
+  assert.ok(!afterState.events.some((event) => event[0] === 'network-disconnect'), 'interface_name 门禁不得先断网')
+  assert.ok(!fs.existsSync(path.join(dataDir, '.restore-in-progress')), '前置门禁失败不得留下 restore 锁')
+})
+
+test('P6-R2 网络身份：environment/label 中同名 interface_name 或 mac_address 不得触发误拒', () => {
+  const root = fs.mkdtempSync(path.join(tmpDir, 'network-key-false-positive-'))
+  const dataDir = path.join(root, 'data')
+  const backupsDir = path.join(dataDir, 'backups')
+  fs.mkdirSync(backupsDir, { recursive: true })
+  makeDb(path.join(dataDir, 'app.db'), 'CURRENT')
+  const snap = path.join(backupsDir, 'backup-network-key-false-positive.db')
+  makeSnapshot(snap, 'DYNAMIC-NETWORK-OK')
+  const { dir: dockerBin, stateFile } = installStatefulDockerBin(root)
+  const state = makeDockerState(dataDir)
+  state.composeNetworkMode = 'env-interface-name'
+  fs.writeFileSync(stateFile, JSON.stringify(state))
+
+  const r = runStatefulRestore(dataDir, backupsDir, snap, dockerBin, stateFile)
+  assert.equal(r.status, 0, `非网络字段的同名 key 不应误拒：\n${r.stdout}\n${r.stderr}`)
+  assert.equal(readMarker(path.join(dataDir, 'app.db')), 'DYNAMIC-NETWORK-OK')
+})
+
+test('P6-R2 网络身份：container-only 非零 GwPriority 必须在停机/断网前 fail-closed', () => {
+  const root = fs.mkdtempSync(path.join(tmpDir, 'network-gw-priority-'))
+  const dataDir = path.join(root, 'data')
+  const backupsDir = path.join(dataDir, 'backups')
+  fs.mkdirSync(backupsDir, { recursive: true })
+  makeDb(path.join(dataDir, 'app.db'), 'CURRENT')
+  const snap = path.join(backupsDir, 'backup-gw-priority.db')
+  makeSnapshot(snap, 'SHOULD-NOT-INSTALL')
+  const { dir: dockerBin, stateFile } = installStatefulDockerBin(root)
+  const state = makeDockerState(dataDir)
+  state.containers[CONTAINER_A].networks[0].gwPriority = 17
+  fs.writeFileSync(stateFile, JSON.stringify(state))
+
+  const r = runStatefulRestore(dataDir, backupsDir, snap, dockerBin, stateFile)
+  const afterState = readDockerState(stateFile)
+
+  assert.notEqual(r.status, 0, '🔴 现有容器的非零 GwPriority 无法由 aliases-only 重连无损重放')
+  assert.match(r.stderr, /网络.*(gateway|gw|优先级|重放|不支持)|GwPriority/i)
+  assert.equal(readMarker(path.join(dataDir, 'app.db')), 'CURRENT')
+  assert.ok(!afterState.events.some((event) => event[0] === 'stop'), 'GwPriority 门禁必须发生在停机前')
+  assert.ok(!afterState.events.some((event) => event[0] === 'network-disconnect'), 'GwPriority 门禁不得先断网')
+  assert.ok(!fs.existsSync(path.join(dataDir, '.restore-in-progress')), '前置门禁失败不得留下 restore 锁')
+})
+
+test('P6-R2 容器身份：停止态旧容器 config hash 陈旧时仍必须 fail-closed', () => {
+  const root = fs.mkdtempSync(path.join(tmpDir, 'network-stale-config-hash-'))
+  const dataDir = path.join(root, 'data')
+  const backupsDir = path.join(dataDir, 'backups')
+  fs.mkdirSync(backupsDir, { recursive: true })
+  makeDb(path.join(dataDir, 'app.db'), 'CURRENT')
+  const snap = path.join(backupsDir, 'backup-stale-config-hash.db')
+  makeSnapshot(snap, 'SHOULD-NOT-INSTALL')
+  const { dir: dockerBin, stateFile } = installStatefulDockerBin(root)
+  const state = makeDockerState(dataDir)
+  state.containers[CONTAINER_A].running = false
+  state.containers[CONTAINER_A].composeConfigHash = 'd'.repeat(64)
+  fs.writeFileSync(stateFile, JSON.stringify(state))
+
+  const r = runStatefulRestore(dataDir, backupsDir, snap, dockerBin, stateFile)
+  const afterState = readDockerState(stateFile)
+
+  assert.notEqual(r.status, 0, '🔴 停止态旧容器必须由 Compose config hash 漂移门禁拒绝')
+  assert.match(r.stderr, /config hash|recreate|配置.*不一致/i)
+  assert.equal(readMarker(path.join(dataDir, 'app.db')), 'CURRENT')
+  assert.ok(!afterState.events.some((event) => event[0] === 'stop'), 'config hash 门禁必须发生在停机前')
+  assert.ok(!fs.existsSync(path.join(dataDir, '.restore-in-progress')))
+  assert.ok(!fs.existsSync(`${fs.realpathSync(dataDir)}.restore-control`))
+})
+
+test('P6-R2 网络身份：Compose 显式 mac_address 必须在停机/断网前 fail-closed', () => {
+  const root = fs.mkdtempSync(path.join(tmpDir, 'network-compose-mac-address-'))
+  const dataDir = path.join(root, 'data')
+  const backupsDir = path.join(dataDir, 'backups')
+  fs.mkdirSync(backupsDir, { recursive: true })
+  makeDb(path.join(dataDir, 'app.db'), 'CURRENT')
+  const snap = path.join(backupsDir, 'backup-compose-mac.db')
+  makeSnapshot(snap, 'SHOULD-NOT-INSTALL')
+  const { dir: dockerBin, stateFile } = installStatefulDockerBin(root)
+  const state = makeDockerState(dataDir)
+  state.composeNetworkMode = 'mac-address'
+  fs.writeFileSync(stateFile, JSON.stringify(state))
+
+  const r = runStatefulRestore(dataDir, backupsDir, snap, dockerBin, stateFile)
+  const afterState = readDockerState(stateFile)
+
+  assert.notEqual(r.status, 0)
+  assert.match(r.stderr, /mac_address|MAC|网络.*不支持/i)
+  assert.equal(readMarker(path.join(dataDir, 'app.db')), 'CURRENT')
+  assert.ok(!afterState.events.some((event) => event[0] === 'stop'))
+  assert.ok(!afterState.events.some((event) => event[0] === 'network-disconnect'))
+  assert.ok(!fs.existsSync(`${fs.realpathSync(dataDir)}.restore-control`))
 })
 
 // ============================================================================
@@ -921,7 +2403,7 @@ test('复审三轮1：DB_PATH 未设置或=默认值 → 正常通过', () => {
   }
 })
 
-test('R3-新② trap 陷阱：stop 后 armed 标记写入失败，app 仍被重启且旧库不动', () => {
+test('R3-新② trap 陷阱：stop 后 armed 状态原子写入失败，app 仍被重启且旧库不动', () => {
   const { dataDir, backupsDir } = scene('trap-post-stop-install', 'CURRENT-POST-STOP')
   const snapshotPath = path.join(backupsDir, 'backup-2026-01-01T00-00-00-abcdef.db')
   makeSnapshot(snapshotPath, 'SNAPSHOT-NOT-APPLIED')
@@ -947,6 +2429,17 @@ fi
 `,
     { mode: 0o755 },
   )
+  fs.writeFileSync(
+    path.join(failBin, 'mktemp'),
+    `#!/bin/sh
+if [ "$1" = "$TEST_FAIL_MKTEMP_TEMPLATE" ]; then
+  echo "mktemp: injected armed marker failure" >&2
+  exit 73
+fi
+/usr/bin/mktemp "$@"
+`,
+    { mode: 0o755 },
+  )
 
   const logFile = path.join(path.dirname(dataDir), 'stub.log')
   fs.writeFileSync(logFile, '')
@@ -960,17 +2453,126 @@ fi
       DATA_DIR: dataDir,
       BACKUP_DIR: backupsDir,
       APP_URL: 'http://stub',
-      TEST_FAIL_INSTALL_TARGET: path.join(fs.realpathSync(dataDir), '.restore-in-progress', 'replace-armed'),
+      TEST_FAIL_INSTALL_TARGET: path.join(`${fs.realpathSync(dataDir)}.restore-control`, 'replace-armed'),
+      TEST_FAIL_MKTEMP_TEMPLATE: path.join(
+        `${fs.realpathSync(dataDir)}.restore-control`,
+        '.replace-armed.tmp.XXXXXX',
+      ),
     },
     encoding: 'utf8',
   })
 
   assert.equal(r.status, 73, `armed 标记写入失败应保留原退出码：\n${r.stdout}\n${r.stderr}`)
   const calls = fs.readFileSync(logFile, 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse)
-  const startCalls = calls.filter((c) => c[0] === 'compose' && c[1] === 'start')
+  const startCalls = calls.filter((c) => c[0] === 'start' && c[1] === CONTAINER_A)
   assert.ok(startCalls.length >= 1, `trap 应调用 start app（实际 start 调用 ${startCalls.length} 次）`)
   assert.equal(readMarker(path.join(dataDir, 'app.db')), 'CURRENT-POST-STOP', '最终 mv 未发生，旧库必须原样保留')
   assert.ok(!fs.existsSync(path.join(dataDir, '.restore-in-progress')), '安全退出应释放私有 stage/锁')
+})
+
+test('P6-R2 未运行容器：换库前失败不得把原本停止的 app 启起来', () => {
+  const { dataDir, backupsDir } = scene('trap-post-stop-initially-stopped', 'CURRENT-STOPPED')
+  const snapshotPath = path.join(backupsDir, 'backup-2026-01-01T00-00-00-stopped.db')
+  makeSnapshot(snapshotPath, 'SNAPSHOT-NOT-APPLIED')
+
+  const failBin = installArmedMarkerFailureBin(path.dirname(dataDir))
+
+  const logFile = path.join(path.dirname(dataDir), 'stub.log')
+  fs.writeFileSync(logFile, '')
+  // docker stub 的 .stopped 文件模拟 restore 开始前容器本来就是停止态。
+  fs.writeFileSync(logFile + '.stopped', '')
+  const control = `${fs.realpathSync(dataDir)}.restore-control`
+  const r = spawnSync('sh', [RESTORE_SH, snapshotPath], {
+    cwd: REPO,
+    env: {
+      ...process.env,
+      PATH: `${failBin}:${process.env.PATH}`,
+      STUB_LOG: logFile,
+      SUDO: '',
+      DATA_DIR: dataDir,
+      BACKUP_DIR: backupsDir,
+      TEST_FAIL_INSTALL_TARGET: path.join(control, 'replace-armed'),
+      TEST_FAIL_MKTEMP_TEMPLATE: path.join(control, '.replace-armed.tmp.XXXXXX'),
+    },
+    encoding: 'utf8',
+  })
+
+  assert.equal(r.status, 73, `换库前阶段失败应保留注入退出码：\n${r.stdout}\n${r.stderr}`)
+  const calls = fs.readFileSync(logFile, 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse)
+  assert.equal(
+    calls.filter((call) => call[0] === 'start' && call[1] === CONTAINER_A).length,
+    0,
+    '原本停止的 app 不得被未替换失败路径启动',
+  )
+  assert.ok(fs.existsSync(logFile + '.stopped'), '原本停止态必须保持停止')
+  assert.equal(readMarker(path.join(dataDir, 'app.db')), 'CURRENT-STOPPED', '换库前失败不得改动当前库')
+  assert.ok(!fs.existsSync(path.join(dataDir, '.restore-in-progress')), '未替换失败应释放 public stage/锁')
+})
+
+test('P6-R2 新建容器：Compose create 的停止态实例在换库前失败后仍保持停止', () => {
+  const { dataDir, backupsDir } = scene('trap-post-create-stopped', 'CURRENT-CREATED-STOPPED')
+  const snapshotPath = path.join(backupsDir, 'backup-created-stopped.db')
+  makeSnapshot(snapshotPath, 'SNAPSHOT-NOT-APPLIED')
+  const failBin = installArmedMarkerFailureBin(path.dirname(dataDir))
+  const logFile = path.join(path.dirname(dataDir), 'stub.log')
+  fs.writeFileSync(logFile, '')
+  const control = `${fs.realpathSync(dataDir)}.restore-control`
+
+  const r = spawnSync('sh', [RESTORE_SH, snapshotPath], {
+    cwd: REPO,
+    env: {
+      ...process.env,
+      PATH: `${failBin}:${process.env.PATH}`,
+      STUB_LOG: logFile,
+      SUDO: '',
+      DATA_DIR: dataDir,
+      BACKUP_DIR: backupsDir,
+      TEST_CONTAINER_MOUNT_MODE: 'container-missing',
+      TEST_FAIL_INSTALL_TARGET: path.join(control, 'replace-armed'),
+      TEST_FAIL_MKTEMP_TEMPLATE: path.join(control, '.replace-armed.tmp.XXXXXX'),
+    },
+    encoding: 'utf8',
+  })
+
+  const calls = fs.readFileSync(logFile, 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse)
+  assert.equal(r.status, 73, `create 后换库前失败应保留注入退出码：\n${r.stdout}\n${r.stderr}`)
+  assert.ok(calls.some((call) => call[0] === 'compose' && call[1] === 'create'), '前置：确实 create 了停止态容器')
+  assert.equal(calls.filter((call) => call[0] === 'start').length, 0, '刚 create 的停止态容器不得被失败路径启动')
+  assert.ok(fs.existsSync(logFile + '.stopped'), '刚 create 的容器必须保持停止态')
+  assert.equal(readMarker(path.join(dataDir, 'app.db')), 'CURRENT-CREATED-STOPPED')
+})
+
+test('P6-R2 镜像回滚：--after-image-rollback 的停止态旧容器在 DB 替换前不得启动', () => {
+  const { dataDir, backupsDir } = scene('trap-rollback-stopped', 'CURRENT-ROLLBACK-STOPPED')
+  const snapshotPath = path.join(backupsDir, 'preupgrade.db')
+  makeSnapshot(snapshotPath, 'ROLLBACK-SNAPSHOT-NOT-APPLIED')
+  fs.writeFileSync(path.join(dataDir, '.upgrade-in-progress'), snapshotPath + '\n')
+  const failBin = installArmedMarkerFailureBin(path.dirname(dataDir))
+  const logFile = path.join(path.dirname(dataDir), 'stub.log')
+  fs.writeFileSync(logFile, '')
+  fs.writeFileSync(logFile + '.stopped', '')
+  const control = `${fs.realpathSync(dataDir)}.restore-control`
+
+  const r = spawnSync('sh', [RESTORE_SH, '--after-image-rollback', snapshotPath], {
+    cwd: REPO,
+    env: {
+      ...process.env,
+      PATH: `${failBin}:${process.env.PATH}`,
+      STUB_LOG: logFile,
+      SUDO: '',
+      DATA_DIR: dataDir,
+      BACKUP_DIR: backupsDir,
+      TEST_FAIL_INSTALL_TARGET: path.join(control, 'replace-armed'),
+      TEST_FAIL_MKTEMP_TEMPLATE: path.join(control, '.replace-armed.tmp.XXXXXX'),
+    },
+    encoding: 'utf8',
+  })
+
+  const calls = fs.readFileSync(logFile, 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse)
+  assert.equal(r.status, 73, `rollback DB 替换前失败应保留注入退出码：\n${r.stdout}\n${r.stderr}`)
+  assert.equal(calls.filter((call) => call[0] === 'start').length, 0, 'DB 尚未恢复时不得启动旧镜像')
+  assert.ok(fs.existsSync(logFile + '.stopped'), 'rollback 的停止态容器必须保持停止')
+  assert.equal(readMarker(path.join(dataDir, 'app.db')), 'CURRENT-ROLLBACK-STOPPED')
 })
 
 test('P6-R2 现场临时快照：chmod 前已是 0600，chmod 失败时 trap 清掉残留', () => {
@@ -1168,10 +2770,9 @@ test('P6-R2 TOCTOU：快照 symlink 在校验后被改指 → 仍安装已校验
   fs.writeFileSync(
     path.join(swapBin, 'docker'),
     `#!/bin/sh
-if [ "$1" = "compose" ] && [ "$2" = "stop" ]; then
+if [ "$1" = "stop" ] && [ "$2" = "${CONTAINER_A}" ]; then
   /bin/rm -f "$TEST_SNAPSHOT_LINK"
   /bin/ln -s "$TEST_SWAPPED_TARGET" "$TEST_SNAPSHOT_LINK"
-  exit 0
 fi
 exec "${process.execPath}" "${path.join(binDir, 'docker-stub.mjs')}" "$@"
 `,
@@ -1220,9 +2821,8 @@ test('P6-R2 TOCTOU：普通快照文件在校验后被原子替换 → 仍安装
   fs.writeFileSync(
     path.join(swapBin, 'docker'),
     `#!/bin/sh
-if [ "$1" = "compose" ] && [ "$2" = "stop" ]; then
+if [ "$1" = "stop" ] && [ "$2" = "${CONTAINER_A}" ]; then
   /bin/mv -f "$TEST_REPLACEMENT" "$TEST_SNAPSHOT_PATH"
-  exit 0
 fi
 exec "${process.execPath}" "${path.join(binDir, 'docker-stub.mjs')}" "$@"
 `,
@@ -1305,14 +2905,16 @@ test('R6-P2③：快照 0600 时 quick_check 以 root 读（--user 0:0）', () =
 
   // 桩日志里 quick_check 的那行调用必须带 --user 0:0。找「含 immutable=1 的那行」（其它 run 不带这个）
   const calls = r.log.split('\n').filter((l) => l.includes('immutable=1'))
-  assert.equal(calls.length, 1, '应恰有一次 quick_check 调用')
-  const argv = JSON.parse(calls[0])
-  const userIdx = argv.indexOf('--user')
-  assert.ok(userIdx >= 0, '🔴 quick_check 必须带 --user（修复前缺此参数 → uid1000 读不了 root:root 0600）')
-  assert.equal(argv[userIdx + 1], '0:0', '🔴 必须提权到 root')
+  assert.equal(calls.length, 2, 'host-only 预校验与停机后同文件系统 stage 必须各跑一次 quick_check')
+  for (const call of calls) {
+    const argv = JSON.parse(call)
+    const userIdx = argv.indexOf('--user')
+    assert.ok(userIdx >= 0, '🔴 quick_check 必须带 --user（修复前缺此参数 → uid1000 读不了 root:root 0600）')
+    assert.equal(argv[userIdx + 1], '0:0', '🔴 必须提权到 root')
+  }
 })
 
-test('P6-R2：非 uid1000 且使用默认 sudo 时，宿主文件头检查也必须经提权读取私有 stage', () => {
+test('P6-R2：默认 sudo 的 root-owned readiness body 必须经提权写入，不能由普通 shell 重定向', () => {
   const { dataDir, backupsDir } = scene('logical-uid-sudo-stage', 'CURRENT')
   const snap = path.join(backupsDir, 'backup-logical-uid.db')
   makeSnapshot(snap, 'LOGICAL-UID-SNAPSHOT')
@@ -1344,12 +2946,21 @@ esac
   fs.writeFileSync(
     path.join(logicalBin, 'sudo'),
     `#!/bin/sh
+if [ -n "$TEST_ROOT_READY_BODY" ] && [ -e "$TEST_ROOT_READY_BODY" ]; then
+  /bin/chmod 600 "$TEST_ROOT_READY_BODY"
+fi
 printf '%s\\n' "$*" >> "$TEST_SUDO_LOG"
-FAKE_ELEVATED=1 exec "$@"
+FAKE_ELEVATED=1 "$@"
+rc=$?
+if [ -n "$TEST_ROOT_READY_BODY" ] && [ -e "$TEST_ROOT_READY_BODY" ]; then
+  /bin/chmod 000 "$TEST_ROOT_READY_BODY"
+fi
+exit "$rc"
 `,
     { mode: 0o755 },
   )
-  // 不能真的把测试文件 chown 给不存在的 uid2001/uid1000；记录后成功返回即可。
+  // 不能真的把 app.db chown 给不存在的 uid1000；记录后成功返回即可。两层锁目录本身不得再 chown
+  // 给调用者，否则 Linux caller=uid1000 时 app 与 restore 会共享写权限。
   fs.writeFileSync(
     path.join(logicalBin, 'chown'),
     '#!/bin/sh\nprintf \'%s\\n\' "$*" >> "$TEST_CHOWN_LOG"\nexit 0\n',
@@ -1382,7 +2993,7 @@ process.exit(r.status ?? 1)
 target=
 for arg in "$@"; do target="$arg"; done
 case "$target" in
-  */.restore-in-progress/snapshot.db)
+  *.restore-control/snapshot.db)
     printf '%s\\n' "elevated=\${FAKE_ELEVATED:-0} target=$target" >> "$TEST_HEAD_LOG"
     if [ "\${FAKE_ELEVATED:-0}" != "1" ]; then
       echo "head: $target: Permission denied" >&2
@@ -1404,9 +3015,11 @@ exec /usr/bin/head "$@"
     DATA_DIR: dataDir,
     BACKUP_DIR: backupsDir,
     APP_URL: 'http://stub',
+    READY_TIMEOUT: '8',
     TEST_SUDO_LOG: sudoLog,
     TEST_CHOWN_LOG: sudoLog,
     TEST_HEAD_LOG: headLog,
+    TEST_ROOT_READY_BODY: path.join(`${fs.realpathSync(dataDir)}.restore-control`, 'ready-body'),
   }
   delete env.SUDO
   const r = spawnSync('sh', [RESTORE_SH, snap], {
@@ -1417,7 +3030,14 @@ exec /usr/bin/head "$@"
 
   assert.equal(r.status, 0, `默认 sudo 路径也应成功：\n${r.stdout}\n${r.stderr}`)
   assert.equal(readMarker(path.join(dataDir, 'app.db')), 'LOGICAL-UID-SNAPSHOT')
-  assert.match(fs.readFileSync(sudoLog, 'utf8'), /chown .*\.restore-in-progress/, '锁目录属主调整应经 sudo')
+  const sudoCalls = fs.readFileSync(sudoLog, 'utf8')
+  assert.doesNotMatch(
+    sudoCalls,
+    /chown .*\.(restore-in-progress|restore-control)/,
+    '🔴 两层锁不得 chown 给可能与 app 相同的 caller UID',
+  )
+  assert.match(sudoCalls, /chmod 700 .*\.restore-in-progress/, 'public evidence 锁应以 root 权限收紧')
+  assert.match(sudoCalls, /chmod 700 .*\.restore-control/, 'host-only 控制锁应以 root 权限收紧')
   const headCalls = fs.readFileSync(headLog, 'utf8').trim().split('\n').filter(Boolean)
   assert.ok(headCalls.length >= 1, '前置：必须实际执行过私有 stage 的文件头读取')
   assert.ok(
@@ -1519,10 +3139,10 @@ fi
     detached: true,
     stdio: ['ignore', 'pipe', 'pipe'],
   })
-  const exited = collectExit(child)
+  const exited = collectExit(child, 30_000)
   let r: Awaited<typeof exited>
   try {
-    await waitForFile(mvDone)
+    await waitForFile(mvDone, 20_000)
     assert.ok(fs.existsSync(path.join(dataDir, 'app.db')), '前置：真 mv 已成功，目标库已存在')
     assert.ok(
       !fs.existsSync(path.join(dataDir, '.restore-in-progress', 'snapshot.db')),
@@ -1557,9 +3177,11 @@ fi
   assert.ok(shmGone, '🔴 trap 必须清掉旧库 -shm')
   assert.equal(startStates.length, 0, '库已替换但尚未 ready/accepted，信号收尾不得 start')
   const lock = path.join(dataDir, '.restore-in-progress')
+  const control = `${fs.realpathSync(dataDir)}.restore-control`
   assert.ok(fs.existsSync(lock), '库已替换的信号退出必须保留状态锁')
-  assert.ok(fs.existsSync(path.join(lock, 'sidecars-clean')), '应留下旧 sidecar 已清理证据')
-  assert.ok(!fs.existsSync(path.join(lock, 'ready-accepted')))
+  assert.ok(fs.existsSync(control), '库已替换的信号退出必须保留 host-only control')
+  assert.ok(fs.existsSync(path.join(control, 'sidecars-clean')), '应留下旧 sidecar 已清理证据')
+  assert.ok(!fs.existsSync(path.join(control, 'ready-accepted')))
 })
 }
 
@@ -1619,27 +3241,329 @@ fi
     detached: true,
     stdio: ['ignore', 'pipe', 'pipe'],
   })
-  const exited = collectExit(child)
-  await waitForFile(mvDone)
+  const exited = collectExit(child, 30_000)
+  await waitForFile(mvDone, 20_000)
   killProcessGroup(child, 'SIGKILL')
   const killed = await exited
 
   const lock = path.join(dataDir, '.restore-in-progress')
+  const control = `${fs.realpathSync(dataDir)}.restore-control`
   assert.equal(killed.code, null)
   assert.equal(killed.signal, 'SIGKILL', `应由不可捕获 SIGKILL 终止：\n${killed.stdout}\n${killed.stderr}`)
   assert.equal(fs.readFileSync(startStateFile, 'utf8'), '', 'SIGKILL 无 trap，不能假装已安全 start')
-  assert.ok(fs.existsSync(path.join(lock, 'replace-armed')), '进程级 SIGKILL 后 armed 状态文件必须保留')
+  assert.ok(fs.existsSync(path.join(control, 'replace-armed')), '进程级 SIGKILL 后 host-only armed 状态必须保留')
   assert.ok(!fs.existsSync(path.join(lock, 'snapshot.db')), 'stage 已被 mv，当前文件系统状态可判定数据库已替换')
   assert.ok(fs.existsSync(wal) && fs.existsSync(shm), '不可捕获信号下旧 sidecar 仍在，必须靠锁阻止误启动/再还原')
 
   const retry = runRestore(dataDir, backupsDir, snap)
   assert.equal(retry.status, 4, '🔴 下一次 restore 必须被持久锁阻断，不能踩着未清 sidecar 继续')
-  assert.match(retry.stderr, /数据库可能已替换|旧 WAL\/SHM 尚待确认/)
-  assert.doesNotMatch(retry.log, /"stop"|"start"/)
+  assert.match(retry.stderr, /数据库.*已替换.*尚未验收|旧 WAL\/SHM 尚待确认/)
+  assert.match(retry.log, /"stop"/, '下一次 restore 必须先按残锁 exact ID 尝试停机')
+  assert.doesNotMatch(retry.log, /"start"/, '未验收残锁绝不能重启 app')
   assert.equal(readMarker(path.join(dataDir, 'app.db')), 'SNAPSHOT-SIGKILL', '数据库本体确实已完成原子替换')
 })
 
-// trap 还必须在 `docker compose stop app` **之前**安装。否则 stop 已把服务停下、父 shell 尚未来得及
+test('P6-R2 残锁自愈：app-started 但未 accepted 时下一次 restore 必须先停精确容器再 exit 4', () => {
+  const root = fs.mkdtempSync(path.join(tmpDir, 'stale-app-started-lock-'))
+  const dataDir = path.join(root, 'data')
+  const backupsDir = path.join(dataDir, 'backups')
+  fs.mkdirSync(backupsDir, { recursive: true })
+  makeDb(path.join(dataDir, 'app.db'), 'CURRENT')
+  const snap = path.join(backupsDir, 'backup-stale-lock.db')
+  makeSnapshot(snap, 'UNUSED')
+  const control = `${fs.realpathSync(dataDir)}.restore-control`
+  fs.mkdirSync(control, { mode: 0o700 })
+  fs.writeFileSync(path.join(control, 'app-started'), '', { mode: 0o600 })
+  fs.writeFileSync(path.join(control, 'container-id'), CONTAINER_A + '\n', { mode: 0o600 })
+  fs.writeFileSync(
+    path.join(control, 'container-networks'),
+    `stub-network\t${NETWORK_ID}\tapp\tstub-app-a\n`,
+    { mode: 0o600 },
+  )
+  fs.writeFileSync(path.join(control, 'compose-project'), 'xiaojimao-hub\n', { mode: 0o600 })
+  fs.writeFileSync(path.join(control, 'compose-service'), 'app\n', { mode: 0o600 })
+  const { dir: dockerBin, stateFile } = installStatefulDockerBin(root)
+  fs.writeFileSync(stateFile, JSON.stringify(makeDockerState(dataDir)))
+
+  const r = runStatefulRestore(dataDir, backupsDir, snap, dockerBin, stateFile)
+  const afterState = readDockerState(stateFile)
+  assert.equal(r.status, 4, `残锁仍应以 4 阻断：\n${r.stdout}\n${r.stderr}`)
+  assert.equal(afterState.containers[CONTAINER_A].running, false, '🔴 报人工处理前必须先停未接受实例')
+  assert.match(r.stderr, /app.*启动.*未.*接受|未接受实例.*停止/i)
+  assert.equal(readMarker(path.join(dataDir, 'app.db')), 'CURRENT', '残锁处置不得修改数据库')
+})
+
+test('P6-R2 残锁 owner：PID 被复用但启动指纹不匹配时必须按 stale 收口未验收实例', () => {
+  const root = fs.mkdtempSync(path.join(tmpDir, 'stale-owner-pid-reused-'))
+  const dataDir = path.join(root, 'data')
+  const backupsDir = path.join(dataDir, 'backups')
+  fs.mkdirSync(backupsDir, { recursive: true })
+  makeDb(path.join(dataDir, 'app.db'), 'CURRENT')
+  const snap = path.join(backupsDir, 'backup-stale-owner.db')
+  makeSnapshot(snap, 'UNUSED')
+  const control = `${fs.realpathSync(dataDir)}.restore-control`
+  fs.mkdirSync(control, { mode: 0o700 })
+  fs.writeFileSync(path.join(control, 'app-started'), '', { mode: 0o600 })
+  fs.writeFileSync(path.join(control, 'container-id'), CONTAINER_A + '\n', { mode: 0o600 })
+  fs.writeFileSync(path.join(control, 'compose-project'), 'xiaojimao-hub\n', { mode: 0o600 })
+  fs.writeFileSync(path.join(control, 'compose-service'), 'app\n', { mode: 0o600 })
+  fs.writeFileSync(path.join(control, 'owner-pid'), `${process.pid}\n`, { mode: 0o600 })
+  fs.writeFileSync(path.join(control, 'owner-start-fingerprint'), 'definitely-not-this-process\n', { mode: 0o600 })
+  const { dir: dockerBin, stateFile } = installStatefulDockerBin(root)
+  fs.writeFileSync(stateFile, JSON.stringify(makeDockerState(dataDir)))
+
+  const r = runStatefulRestore(dataDir, backupsDir, snap, dockerBin, stateFile)
+  const afterState = readDockerState(stateFile)
+
+  assert.equal(r.status, 4, `残锁仍应以 4 阻断：\n${r.stdout}\n${r.stderr}`)
+  assert.equal(afterState.containers[CONTAINER_A].running, false, 'PID 复用不得绕过未验收实例 stop/隔离')
+  assert.match(r.stderr, /停止|隔离|未接受|未发布/i)
+})
+
+test('P6-R2 残锁 owner：PID 与启动指纹都匹配时不得干扰仍在运行的 restore', () => {
+  const root = fs.mkdtempSync(path.join(tmpDir, 'live-owner-fingerprint-'))
+  const dataDir = path.join(root, 'data')
+  const backupsDir = path.join(dataDir, 'backups')
+  fs.mkdirSync(backupsDir, { recursive: true })
+  makeDb(path.join(dataDir, 'app.db'), 'CURRENT')
+  const snap = path.join(backupsDir, 'backup-live-owner.db')
+  makeSnapshot(snap, 'UNUSED')
+  const fingerprint = spawnSync('ps', ['-o', 'lstart=', '-p', String(process.pid)], {
+    encoding: 'utf8',
+    env: { ...process.env, LC_ALL: 'C' },
+  }).stdout.trim()
+  assert.ok(fingerprint, '前置：测试进程必须能读取自己的启动指纹')
+  const control = `${fs.realpathSync(dataDir)}.restore-control`
+  fs.mkdirSync(control, { mode: 0o700 })
+  fs.writeFileSync(path.join(control, 'app-started'), '', { mode: 0o600 })
+  fs.writeFileSync(path.join(control, 'container-id'), CONTAINER_A + '\n', { mode: 0o600 })
+  fs.writeFileSync(path.join(control, 'compose-project'), 'xiaojimao-hub\n', { mode: 0o600 })
+  fs.writeFileSync(path.join(control, 'compose-service'), 'app\n', { mode: 0o600 })
+  fs.writeFileSync(path.join(control, 'owner-pid'), `${process.pid}\n`, { mode: 0o600 })
+  fs.writeFileSync(path.join(control, 'owner-start-fingerprint'), fingerprint + '\n', { mode: 0o600 })
+  const { dir: dockerBin, stateFile } = installStatefulDockerBin(root)
+  fs.writeFileSync(stateFile, JSON.stringify(makeDockerState(dataDir)))
+
+  const r = runStatefulRestore(dataDir, backupsDir, snap, dockerBin, stateFile)
+  const afterState = readDockerState(stateFile)
+
+  assert.equal(r.status, 4)
+  assert.equal(afterState.containers[CONTAINER_A].running, true, '匹配 owner 不得被第二个 restore 停止')
+  assert.match(r.stderr, /owner PID.*存活|并发 restore/i)
+})
+
+test('P6-R2 残锁自愈：replace 已完成且 sidecar/marker 已清但未启动时也先停并隔离 exact ID', () => {
+  const { root, dataDir, backupsDir, snap, dockerBin, stateFile } = publicationCase('stale-post-replace-lock')
+  const control = `${fs.realpathSync(dataDir)}.restore-control`
+  const publicLock = path.join(dataDir, '.restore-in-progress')
+  fs.mkdirSync(control, { mode: 0o700 })
+  fs.mkdirSync(publicLock, { mode: 0o700 })
+  for (const marker of ['replace-armed', 'sidecars-clean', 'upgrade-marker-clean']) {
+    fs.writeFileSync(path.join(control, marker), '\n', { mode: 0o600 })
+  }
+  fs.writeFileSync(path.join(control, 'container-id'), `${CONTAINER_A}\n`, { mode: 0o600 })
+  fs.writeFileSync(path.join(control, 'compose-project'), 'xiaojimao-hub\n', { mode: 0o600 })
+  fs.writeFileSync(path.join(control, 'compose-service'), 'app\n', { mode: 0o600 })
+
+  const r = runStatefulRestore(dataDir, backupsDir, snap, dockerBin, stateFile)
+  const afterState = readDockerState(stateFile)
+
+  assert.equal(r.status, 4)
+  assert.equal(afterState.containers[CONTAINER_A].running, false, '🔴 post-replace 残锁也必须精确停止 A')
+  assert.deepEqual(afterState.containers[CONTAINER_A].networks, [], 'post-replace 残锁必须确认无流量网络')
+  assert.match(r.stderr, /数据库.*替换|sidecar|停止.*隔离|人工/i)
+  assert.ok(fs.existsSync(control))
+})
+
+test('P6-R2 残锁自愈：docker inspect 故障不得伪装成 exact 容器不存在/已安全停止', () => {
+  const { root, dataDir, backupsDir, snap, dockerBin, stateFile } = publicationCase('stale-inspect-failure')
+  const control = `${fs.realpathSync(dataDir)}.restore-control`
+  fs.mkdirSync(control, { mode: 0o700 })
+  fs.writeFileSync(path.join(control, 'app-started'), '\n', { mode: 0o600 })
+  fs.writeFileSync(path.join(control, 'container-id'), `${CONTAINER_A}\n`, { mode: 0o600 })
+  fs.writeFileSync(path.join(control, 'compose-project'), 'xiaojimao-hub\n', { mode: 0o600 })
+  fs.writeFileSync(path.join(control, 'compose-service'), 'app\n', { mode: 0o600 })
+
+  const r = runStatefulRestore(dataDir, backupsDir, snap, dockerBin, stateFile, {
+    TEST_INSPECT_FAIL_ID: CONTAINER_A,
+  })
+  const afterState = readDockerState(stateFile)
+
+  assert.equal(r.status, 4)
+  assert.equal(afterState.containers[CONTAINER_A].running, true, '前置：inspect 故障时不能声称已真的停机')
+  assert.match(r.stderr, /无法确认|inspect|Docker.*状态|立即检查/i)
+  assert.doesNotMatch(r.stderr, /已按锁内精确 ID 停止并隔离实例/)
+  assert.ok(fs.existsSync(control))
+})
+
+test('P6-R2 残锁自愈：inspect 404 且 docker ps id filter 确认不存在时可安全报告残锁', () => {
+  const { root, dataDir, backupsDir, snap, dockerBin, stateFile } = publicationCase('stale-container-gone')
+  const control = `${fs.realpathSync(dataDir)}.restore-control`
+  fs.mkdirSync(control, { mode: 0o700 })
+  fs.writeFileSync(path.join(control, 'app-started'), '\n', { mode: 0o600 })
+  fs.writeFileSync(path.join(control, 'container-id'), `${CONTAINER_A}\n`, { mode: 0o600 })
+  fs.writeFileSync(path.join(control, 'compose-project'), 'xiaojimao-hub\n', { mode: 0o600 })
+  fs.writeFileSync(path.join(control, 'compose-service'), 'app\n', { mode: 0o600 })
+  const state = readDockerState(stateFile)
+  delete state.containers[CONTAINER_A]
+  state.current = ''
+  fs.writeFileSync(stateFile, JSON.stringify(state))
+
+  const r = runStatefulRestore(dataDir, backupsDir, snap, dockerBin, stateFile)
+
+  assert.equal(r.status, 4)
+  assert.match(r.stderr, /不存在|已移除|残锁|人工/i)
+  assert.doesNotMatch(r.stderr, /无法确认.*停止|立即检查 Docker 状态/i)
+  assert.ok(fs.existsSync(control))
+  assert.equal(readMarker(path.join(dataDir, 'app.db')), 'CURRENT')
+})
+
+test('P6-R2 published 残锁：Compose 漂到 B 时保留已验收 A，仅停止隔离未验收 B', () => {
+  const root = fs.mkdtempSync(path.join(tmpDir, 'stale-published-with-drift-'))
+  const dataA = path.join(root, 'data-a')
+  const dataB = path.join(root, 'data-b')
+  const backupsDir = path.join(dataA, 'backups')
+  fs.mkdirSync(backupsDir, { recursive: true })
+  makeDb(path.join(dataA, 'app.db'), 'A-PUBLISHED')
+  makeDb(path.join(dataB, 'app.db'), 'B-UNACCEPTED')
+  const snap = path.join(backupsDir, 'backup-unused.db')
+  makeSnapshot(snap, 'UNUSED')
+  const control = `${fs.realpathSync(dataA)}.restore-control`
+  fs.mkdirSync(control, { mode: 0o700 })
+  const accepted = `v2 ${CONTAINER_A} xiaojimao-hub app\n`
+  fs.writeFileSync(path.join(control, 'ready-accepted'), accepted, { mode: 0o600 })
+  fs.writeFileSync(path.join(control, 'network-published'), accepted, { mode: 0o600 })
+  fs.writeFileSync(path.join(control, 'container-id'), `${CONTAINER_A}\n`, { mode: 0o600 })
+  fs.writeFileSync(path.join(control, 'compose-project'), 'xiaojimao-hub\n', { mode: 0o600 })
+  fs.writeFileSync(path.join(control, 'compose-service'), 'app\n', { mode: 0o600 })
+  const { dir: dockerBin, stateFile } = installStatefulDockerBin(root)
+  const state = makeDockerState(dataA, dataB)
+  state.containers[CONTAINER_B].composeProject = state.composeProject
+  state.containers[CONTAINER_B].composeService = state.composeService
+  state.containers[CONTAINER_B].running = true
+  state.current = CONTAINER_B
+  state.composeSource = dataB
+  fs.writeFileSync(stateFile, JSON.stringify(state))
+
+  const r = runStatefulRestore(dataA, backupsDir, snap, dockerBin, stateFile, {
+    TEST_TRUNCATE_ALL_IDS_WITHOUT_FLAG: '1',
+  })
+  const afterState = readDockerState(stateFile)
+
+  assert.equal(r.status, 4)
+  assert.equal(afterState.containers[CONTAINER_A].running, true, 'trusted published A 不得反向停机')
+  assert.equal(afterState.containers[CONTAINER_A].networks.length, 1)
+  assert.equal(afterState.containers[CONTAINER_B].running, false, '🔴 未验收替代 B 必须精确停止')
+  assert.deepEqual(afterState.containers[CONTAINER_B].networks, [], '替代 B 必须撤回全部网络')
+  assert.ok(fs.existsSync(path.join(control, 'ready-accepted')))
+  assert.ok(fs.existsSync(path.join(control, 'network-published')))
+})
+
+test('P6-R2 published 残锁：仅剩 handoff 且枚举失败时持久化 ambiguous 证据', () => {
+  const root = fs.mkdtempSync(path.join(tmpDir, 'stale-published-handoff-enumeration-fail-'))
+  const dataA = path.join(root, 'data-a')
+  const dataB = path.join(root, 'data-b')
+  const backupsDir = path.join(dataA, 'backups')
+  fs.mkdirSync(backupsDir, { recursive: true })
+  makeDb(path.join(dataA, 'app.db'), 'A-PUBLISHED')
+  makeDb(path.join(dataB, 'app.db'), 'B-UNKNOWN')
+  const snap = path.join(backupsDir, 'backup-unused.db')
+  makeSnapshot(snap, 'UNUSED')
+  const physicalDataA = fs.realpathSync(dataA)
+  const control = `${physicalDataA}.restore-control`
+  const handoff = `${physicalDataA}.restore-control-accepted`
+  fs.writeFileSync(handoff, `v2 ${CONTAINER_A} xiaojimao-hub app\n`, { mode: 0o600 })
+  const { dir: dockerBin, stateFile } = installStatefulDockerBin(root)
+  const state = makeDockerState(dataA, dataB)
+  state.containers[CONTAINER_B].composeProject = state.composeProject
+  state.containers[CONTAINER_B].composeService = state.composeService
+  state.containers[CONTAINER_B].running = true
+  state.extraAppeared = true
+  state.current = CONTAINER_A
+  fs.writeFileSync(stateFile, JSON.stringify(state))
+
+  const r = runStatefulRestore(dataA, backupsDir, snap, dockerBin, stateFile, {
+    TEST_FAIL_SERVICE_PS_WHEN_EXTRA: '1',
+  })
+  const afterState = readDockerState(stateFile)
+  const ambiguous = path.join(control, 'ambiguous-publication')
+
+  assert.equal(r.status, 4)
+  assert.equal(afterState.containers[CONTAINER_A].running, true, 'published A 不得反向停机')
+  assert.equal(afterState.containers[CONTAINER_B].running, true, '前置：枚举失败时 B 的状态无法确认')
+  assert.ok(fs.existsSync(handoff), 'accepted handoff 必须保留')
+  assert.ok(fs.existsSync(ambiguous), '🔴 published 残锁枚举失败必须持久化 ambiguous 证据')
+  assert.equal(fs.statSync(ambiguous).mode & 0o777, 0o600)
+  assert.equal(fs.readFileSync(ambiguous, 'utf8'), `v2 ${CONTAINER_A} xiaojimao-hub app\n`)
+})
+
+test('P6-R2 published 残锁：仅剩 handoff 且 Compose ps 失败时同样持久化 ambiguous', () => {
+  const root = fs.mkdtempSync(path.join(tmpDir, 'stale-published-handoff-compose-fail-'))
+  const dataA = path.join(root, 'data-a')
+  const dataB = path.join(root, 'data-b')
+  const backupsDir = path.join(dataA, 'backups')
+  fs.mkdirSync(backupsDir, { recursive: true })
+  makeDb(path.join(dataA, 'app.db'), 'A-PUBLISHED')
+  makeDb(path.join(dataB, 'app.db'), 'B-UNKNOWN')
+  const snap = path.join(backupsDir, 'backup-unused.db')
+  makeSnapshot(snap, 'UNUSED')
+  const physicalDataA = fs.realpathSync(dataA)
+  const control = `${physicalDataA}.restore-control`
+  const handoff = `${physicalDataA}.restore-control-accepted`
+  fs.writeFileSync(handoff, `v2 ${CONTAINER_A} xiaojimao-hub app\n`, { mode: 0o600 })
+  const { dir: dockerBin, stateFile } = installStatefulDockerBin(root)
+  const state = makeDockerState(dataA, dataB)
+  state.containers[CONTAINER_B].composeProject = state.composeProject
+  state.containers[CONTAINER_B].composeService = state.composeService
+  state.containers[CONTAINER_B].running = true
+  state.extraAppeared = true
+  state.current = CONTAINER_A
+  fs.writeFileSync(stateFile, JSON.stringify(state))
+
+  const r = runStatefulRestore(dataA, backupsDir, snap, dockerBin, stateFile, {
+    TEST_FAIL_COMPOSE_PS_ALWAYS: '1',
+  })
+  const afterState = readDockerState(stateFile)
+  const ambiguous = path.join(control, 'ambiguous-publication')
+
+  assert.equal(r.status, 4)
+  assert.equal(afterState.containers[CONTAINER_A].running, true)
+  assert.equal(afterState.containers[CONTAINER_B].running, true)
+  assert.ok(fs.existsSync(handoff))
+  assert.ok(fs.existsSync(ambiguous))
+  assert.equal(fs.statSync(ambiguous).mode & 0o777, 0o600)
+  assert.equal(fs.readFileSync(ambiguous, 'utf8'), `v2 ${CONTAINER_A} xiaojimao-hub app\n`)
+})
+
+test('P6-R2 public 残锁：仅 DATA_DIR 内伪造 matching accepted/published 不得获得停机授权', () => {
+  const root = fs.mkdtempSync(path.join(tmpDir, 'public-forged-publication-lock-'))
+  const dataDir = path.join(root, 'data')
+  const backupsDir = path.join(dataDir, 'backups')
+  fs.mkdirSync(backupsDir, { recursive: true })
+  makeDb(path.join(dataDir, 'app.db'), 'CURRENT')
+  const snap = path.join(backupsDir, 'backup-legacy-forged.db')
+  makeSnapshot(snap, 'UNUSED')
+  const lock = path.join(dataDir, '.restore-in-progress')
+  const control = `${fs.realpathSync(dataDir)}.restore-control`
+  fs.mkdirSync(lock, { mode: 0o700 })
+  const forged = `v1 forged-public ${CONTAINER_A}\n`
+  fs.writeFileSync(path.join(lock, 'ready-accepted'), forged, { mode: 0o600 })
+  fs.writeFileSync(path.join(lock, 'network-published'), forged, { mode: 0o600 })
+  fs.writeFileSync(path.join(lock, 'container-id'), `${CONTAINER_A}\n`, { mode: 0o600 })
+  fs.writeFileSync(path.join(lock, 'container-networks'), 'stub-network\tapp\tstub-app-a\n', { mode: 0o600 })
+  const { dir: dockerBin, stateFile } = installStatefulDockerBin(root)
+  fs.writeFileSync(stateFile, JSON.stringify(makeDockerState(dataDir)))
+
+  const r = runStatefulRestore(dataDir, backupsDir, snap, dockerBin, stateFile)
+  const afterState = readDockerState(stateFile)
+
+  assert.equal(r.status, 4)
+  assert.equal(afterState.containers[CONTAINER_A].running, true, '🔴 app 可写的 public container-id 不得授权停止任意容器')
+  assert.doesNotMatch(r.stderr, /最终身份均已确认.*不自动停止/, '没有 host-only trusted control 时不得诊断为 finalized')
+  assert.ok(fs.existsSync(lock))
+})
+
+// trap 还必须在精确 `docker stop <captured-id>` **之前**安装。否则 stop 已把服务停下、父 shell 尚未来得及
 // 执行下一行时收到 TERM，会直接退出且永不 start。这里让 stop 桩在“已接到停机命令”后阻塞，再发真信号。
 test('R7-P1②：SIGTERM 落在 stop 命令窗口 → 保留旧 WAL 并重启 app，退出 143', async () => {
   const { dataDir, backupsDir } = scene('trap-stop-signal', 'CURRENT')
@@ -1656,7 +3580,7 @@ test('R7-P1②：SIGTERM 落在 stop 命令窗口 → 保留旧 WAL 并重启 ap
   fs.writeFileSync(
     path.join(stopBin, 'docker'),
     `#!/bin/sh
-if [ "$1" = "compose" ] && [ "$2" = "stop" ]; then
+if [ "$1" = "stop" ] && [ "$2" = "${CONTAINER_A}" ]; then
   : > "$TEST_STOP_ENTERED"
   while :; do sleep 1; done
 fi
@@ -1791,6 +3715,10 @@ fi
   assert.equal(fs.readFileSync(shm, 'utf8'), 'CURRENT-DB-SHM')
   assert.equal(readMarker(path.join(dataDir, 'app.db')), 'CURRENT-ARMED', 'app.db 必须仍是旧库')
   assert.ok(!fs.existsSync(path.join(dataDir, '.restore-in-progress')), 'mv 前优雅信号应清 stage 并释放锁')
+  assert.ok(
+    !fs.existsSync(`${fs.realpathSync(dataDir)}.restore-control`),
+    '🔴 mv 未发生且旧 app 已恢复后必须同步释放 host-only control，不能留下假 post-replace 残锁',
+  )
 })
 
 for (const { label, status, body } of [
@@ -1818,19 +3746,19 @@ for (const { label, status, body } of [
       TEST_READY_BODY: body,
     })
     const calls = r.log.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line) as string[])
-    const starts = calls.filter((call) => call[0] === 'compose' && call[1] === 'start')
-    const stops = calls.filter((call) => call[0] === 'compose' && call[1] === 'stop')
-    const lock = path.join(dataDir, '.restore-in-progress')
+    const starts = calls.filter((call) => call[0] === 'start' && call[1] === CONTAINER_A)
+    const stops = calls.filter((call) => call[0] === 'stop' && call[1] === CONTAINER_A)
+    const control = `${fs.realpathSync(dataDir)}.restore-control`
 
     assert.equal(r.status, 1, `🔴 ${label} 必须在 deadline 后失败：\n${r.stdout}\n${r.stderr}`)
     assert.doesNotMatch(r.stdout, /恢复完成/)
     assert.equal(starts.length, 1, '只允许正常路径的一次 start，EXIT trap 不得再 start')
     assert.equal(stops.length, 2, 'readiness 未接受时必须再 stop 一次并保持停机')
-    assert.ok(fs.existsSync(lock), '未接受的恢复必须保留状态锁')
-    assert.ok(fs.existsSync(path.join(lock, 'sidecars-clean')))
-    assert.ok(fs.existsSync(path.join(lock, 'upgrade-marker-clean')))
-    assert.ok(fs.existsSync(path.join(lock, 'app-started')))
-    assert.ok(!fs.existsSync(path.join(lock, 'ready-accepted')))
+    assert.ok(fs.existsSync(control), '未接受的恢复必须保留 host-only control')
+    assert.ok(fs.existsSync(path.join(control, 'sidecars-clean')))
+    assert.ok(fs.existsSync(path.join(control, 'upgrade-marker-clean')))
+    assert.ok(fs.existsSync(path.join(control, 'app-started')))
+    assert.ok(!fs.existsSync(path.join(control, 'ready-accepted')))
     assert.equal(readMarker(path.join(dataDir, 'app.db')), 'SNAPSHOT-UNACCEPTED')
   })
 }
@@ -1844,22 +3772,12 @@ test('P6-R2 readiness 严格接受：200 body 在 true 中夹 NUL 不得被 shel
   fs.mkdirSync(nulBin, { recursive: true })
   fs.writeFileSync(
     path.join(nulBin, 'docker'),
-    `#!/bin/sh\nexec "${process.execPath}" "${path.join(binDir, 'docker-stub.mjs')}" "$@"\n`,
-    { mode: 0o755 },
-  )
-  fs.writeFileSync(
-    path.join(nulBin, 'curl'),
     `#!/bin/sh
-out=
-while [ "$#" -gt 0 ]; do
-  if [ "$1" = "--output" ]; then out=$2; shift 2; else shift; fi
-done
-if [ -n "$out" ]; then
-  printf '{"ok":tru\\000e}' > "$out"
-  printf '200'
-else
-  printf '{"ok":tru\\000e}\\n200\\n'
+if [ "$1" = "exec" ]; then
+  printf '{"ok":tru\\000e}'
+  exit 0
 fi
+exec "${process.execPath}" "${path.join(binDir, 'docker-stub.mjs')}" "$@"
 `,
     { mode: 0o755 },
   )
@@ -1880,13 +3798,13 @@ fi
     encoding: 'utf8',
   })
   const calls = fs.readFileSync(logFile, 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line) as string[])
-  const lock = path.join(dataDir, '.restore-in-progress')
+  const control = `${fs.realpathSync(dataDir)}.restore-control`
 
   assert.equal(r.status, 1, `🔴 NUL 响应不得变成合法 JSON 后成功：\n${r.stdout}\n${r.stderr}`)
   assert.doesNotMatch(r.stdout, /恢复完成/)
-  assert.equal(calls.filter((call) => call[0] === 'compose' && call[1] === 'start').length, 1)
-  assert.equal(calls.filter((call) => call[0] === 'compose' && call[1] === 'stop').length, 2)
-  assert.ok(fs.existsSync(lock), 'NUL body 未接受时必须保留 restore 锁')
+  assert.equal(calls.filter((call) => call[0] === 'start' && call[1] === CONTAINER_A).length, 1)
+  assert.equal(calls.filter((call) => call[0] === 'stop' && call[1] === CONTAINER_A).length, 2)
+  assert.ok(fs.existsSync(control), 'NUL body 未接受时必须保留 host-only control')
   assert.equal(readMarker(path.join(dataDir, 'app.db')), 'SNAPSHOT-NUL-UNACCEPTED')
 })
 
@@ -1901,10 +3819,274 @@ test('P6-R2 readiness 严格接受：仅 200 + {"ok":true} 释放锁并宣告成
   const calls = r.log.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line) as string[])
   assert.equal(r.status, 0, `合法 readiness 应通过：\n${r.stdout}\n${r.stderr}`)
   assert.match(r.stdout, /恢复完成/)
-  assert.equal(calls.filter((call) => call[0] === 'compose' && call[1] === 'start').length, 1)
-  assert.equal(calls.filter((call) => call[0] === 'compose' && call[1] === 'stop').length, 1)
+  assert.equal(calls.filter((call) => call[0] === 'start' && call[1] === CONTAINER_A).length, 1)
+  assert.equal(calls.filter((call) => call[0] === 'stop' && call[1] === CONTAINER_A).length, 1)
   assert.ok(!fs.existsSync(path.join(dataDir, '.restore-in-progress')), '只有 accepted 后才释放锁')
   assert.equal(readMarker(path.join(dataDir, 'app.db')), 'SNAPSHOT-ACCEPTED')
+})
+
+test('P6-R2 network publication：按 exact NetworkID 重连全部网络并恢复捕获 aliases', () => {
+  const { dataDir, backupsDir, snap, dockerBin, stateFile } = publicationCase('network-reconnect-aliases')
+  const state = readDockerState(stateFile)
+  state.containers[CONTAINER_A].networks.push({
+    name: 'stub-network-2',
+    networkId: 'e'.repeat(64),
+    aliases: ['app-secondary', 'worker-visible'],
+    runtimeMacAddress: '02:42:ac:14:00:03',
+  })
+  fs.writeFileSync(stateFile, JSON.stringify(state))
+
+  const r = runStatefulRestore(dataDir, backupsDir, snap, dockerBin, stateFile)
+  const afterState = readDockerState(stateFile)
+
+  assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`)
+  assert.deepEqual(
+    afterState.containers[CONTAINER_A].networks
+      .map((network) => ({ id: network.networkId, name: network.name, aliases: [...network.aliases].sort() }))
+      .sort((a, b) => a.id.localeCompare(b.id)),
+    [
+      { id: NETWORK_ID, name: 'stub-network', aliases: ['app', 'stub-app-a'] },
+      { id: 'e'.repeat(64), name: 'stub-network-2', aliases: ['app-secondary', 'worker-visible'] },
+    ],
+  )
+  assert.ok(
+    afterState.events
+      .filter((event) => event[0] === 'network-connect')
+      .every((event) => event[3] === CONTAINER_A && event[4] === 'accepted'),
+    '全部 exact network connect 都必须发生在 ready-accepted 之后',
+  )
+})
+
+test('P6-R2 network publication：第一个 connect 失败也必须保持全隔离并记录 publication-failed', () => {
+  const { dataDir, backupsDir, snap, dockerBin, stateFile } = publicationCase('network-first-connect-fail')
+  const control = `${fs.realpathSync(dataDir)}.restore-control`
+
+  const r = runStatefulRestore(dataDir, backupsDir, snap, dockerBin, stateFile, {
+    TEST_FAIL_NETWORK_CONNECT: 'stub-network',
+  })
+  const afterState = readDockerState(stateFile)
+
+  assert.notEqual(r.status, 0)
+  assert.equal(afterState.containers[CONTAINER_A].running, false)
+  assert.deepEqual(afterState.containers[CONTAINER_A].networks, [])
+  assert.ok(fs.existsSync(path.join(control, 'ready-accepted')))
+  assert.ok(fs.existsSync(path.join(control, 'publication-failed')))
+  assert.ok(!fs.existsSync(path.join(control, 'network-published')))
+})
+
+test('P6-R2 network publication：第二个 connect 失败时回滚为全隔离并保留 accepted 状态', () => {
+  const { dataDir, backupsDir, snap, dockerBin, stateFile } = publicationCase('publication-network-fail')
+  const state = readDockerState(stateFile)
+  state.containers[CONTAINER_A].networks.push({
+    name: 'stub-network-2',
+    networkId: 'e'.repeat(64),
+    aliases: ['app-secondary'],
+  })
+  fs.writeFileSync(stateFile, JSON.stringify(state))
+  const control = `${fs.realpathSync(dataDir)}.restore-control`
+
+  const r = runStatefulRestore(dataDir, backupsDir, snap, dockerBin, stateFile, {
+    TEST_FAIL_NETWORK_CONNECT: 'stub-network-2',
+  })
+  const afterState = readDockerState(stateFile)
+
+  assert.notEqual(r.status, 0, '网络未完整恢复时不得成功')
+  assert.doesNotMatch(r.stdout, /恢复完成/)
+  assert.ok(fs.existsSync(control), '🔴 network publication 失败时 EXIT cleanup 不得释放 host-only control')
+  assert.ok(fs.existsSync(path.join(control, 'ready-accepted')), '已通过 strict readiness 的 accepted 证据必须保留')
+  assert.ok(fs.existsSync(path.join(control, 'container-networks')), '完整网络清单必须保留供重放/人工处置')
+  assert.ok(fs.existsSync(path.join(control, 'networks-isolated')), '失败后必须保留隔离阶段证据')
+  assert.ok(fs.existsSync(path.join(control, 'publication-failed')), '可确认全撤回时必须记录 accepted-but-unpublished')
+  assert.ok(!fs.existsSync(path.join(control, 'network-published')), '网络未完整重连时绝不能提交 network-published')
+  assert.equal(afterState.containers[CONTAINER_A].isolated, true, '🔴 部分 reconnect 失败必须撤回已连网络，恢复全隔离')
+  assert.ok(
+    afterState.events.some((event) => event[0] === 'network-connect-failed' && event[1] === 'stub-network-2'),
+    '前置：第二个 network connect 必须真实失败',
+  )
+})
+
+test('P6-R2 network publication：重连失败且撤回不完整时停实例并记录 ambiguous-publication', () => {
+  const { dataDir, backupsDir, snap, dockerBin, stateFile } = publicationCase('publication-network-rollback-fail')
+  const state = readDockerState(stateFile)
+  state.containers[CONTAINER_A].networks.push({
+    name: 'stub-network-2',
+    networkId: 'e'.repeat(64),
+    aliases: ['app-secondary'],
+  })
+  fs.writeFileSync(stateFile, JSON.stringify(state))
+  const control = `${fs.realpathSync(dataDir)}.restore-control`
+
+  const r = runStatefulRestore(dataDir, backupsDir, snap, dockerBin, stateFile, {
+    TEST_FAIL_NETWORK_CONNECT: 'stub-network-2',
+    TEST_FAIL_ROLLBACK_DISCONNECT: '1',
+  })
+  const afterState = readDockerState(stateFile)
+
+  assert.notEqual(r.status, 0)
+  assert.equal(
+    afterState.containers[CONTAINER_A].running,
+    false,
+    '🔴 accepted 但 network-published 未提交且无法重新隔离时必须停精确容器',
+  )
+  assert.ok(fs.existsSync(control))
+  assert.ok(fs.existsSync(path.join(control, 'ready-accepted')))
+  assert.ok(!fs.existsSync(path.join(control, 'network-published')))
+  assert.ok(fs.existsSync(path.join(control, 'networks-reconnecting')), '重连未完成的持久阶段证据必须保留')
+  assert.ok(fs.existsSync(path.join(control, 'ambiguous-publication')), '撤回失败必须留下明确发布状态不明证据')
+  assert.ok(afterState.events.some((event) => event[0] === 'network-disconnect-failed'))
+
+  const stopCountBeforeRetry = afterState.events.filter((event) => event[0] === 'stop' && event[1] === CONTAINER_A).length
+  const retry = runStatefulRestore(dataDir, backupsDir, snap, dockerBin, stateFile)
+  const afterRetry = readDockerState(stateFile)
+  assert.equal(retry.status, 4)
+  assert.match(retry.stderr, /accepted|readiness.*接受|network-published|停止.*隔离/i)
+  assert.ok(
+    afterRetry.events.filter((event) => event[0] === 'stop' && event[1] === CONTAINER_A).length > stopCountBeforeRetry,
+    '🔴 下次 restore 遇到 accepted-but-not-finalized 残锁时必须再次确认精确实例已停止',
+  )
+})
+
+test('P6-R2 accepted 控制锁释放：host-only rmdir 失败时保留 trusted 0600 handoff', () => {
+  const { dataDir, backupsDir, snap, dockerBin, stateFile } = publicationCase('control-release-rmdir-fail')
+  const physicalDataDir = fs.realpathSync(dataDir)
+  const dataB = path.join(path.dirname(dataDir), 'data-b')
+  makeDb(path.join(dataB, 'app.db'), 'B-UNACCEPTED')
+  fs.writeFileSync(stateFile, JSON.stringify(makeDockerState(dataDir, dataB)))
+  const control = `${physicalDataDir}.restore-control`
+  const trustedHandoff = `${physicalDataDir}.restore-control-accepted`
+  const failedOnce = path.join(path.dirname(dataDir), 'rmdir-failed-once')
+  fs.writeFileSync(
+    path.join(dockerBin, 'rmdir'),
+    `#!/bin/sh
+if [ "$1" = "$TEST_FAIL_RMDIR_TARGET" ] && [ ! -e "$TEST_FAIL_ONCE_MARKER" ]; then
+  : > "$TEST_FAIL_ONCE_MARKER"
+  exit 73
+fi
+/bin/rmdir "$@"
+`,
+    { mode: 0o755 },
+  )
+
+  const first = runStatefulRestore(dataDir, backupsDir, snap, dockerBin, stateFile, {
+    TEST_FAIL_RMDIR_TARGET: control,
+    TEST_FAIL_ONCE_MARKER: failedOnce,
+  })
+  const stopCount = readDockerState(stateFile).events.filter(
+    (event) => event[0] === 'stop' && event[1] === CONTAINER_A,
+  ).length
+
+  assert.notEqual(first.status, 0)
+  assert.doesNotMatch(first.stdout, /恢复完成/)
+  assert.ok(fs.existsSync(control), 'control rmdir 失败必须保留目录')
+  assert.ok(fs.existsSync(trustedHandoff), '🔴 trusted accepted 必须留在 app 不可见的 sibling handoff')
+  assert.equal(fs.statSync(trustedHandoff).mode & 0o777, 0o600)
+  assert.ok(fs.existsSync(failedOnce), '前置：rmdir 首次故障注入已命中')
+
+  const driftedState = readDockerState(stateFile)
+  driftedState.containers[CONTAINER_B].composeProject = driftedState.composeProject
+  driftedState.containers[CONTAINER_B].composeService = driftedState.composeService
+  driftedState.containers[CONTAINER_B].running = true
+  driftedState.current = CONTAINER_A
+  driftedState.composeSource = dataDir
+  fs.writeFileSync(stateFile, JSON.stringify(driftedState))
+
+  const retry = runStatefulRestore(dataDir, backupsDir, snap, dockerBin, stateFile)
+  const afterRetry = readDockerState(stateFile)
+  assert.equal(retry.status, 4)
+  assert.match(retry.stderr, /最终身份.*确认|锁释放未完成|readiness.*确认/i)
+  assert.equal(
+    afterRetry.events.filter((event) => event[0] === 'stop' && event[1] === CONTAINER_A).length,
+    stopCount,
+    'trusted published 残锁不得误停已接受实例',
+  )
+  assert.equal(
+    afterRetry.containers[CONTAINER_B].running,
+    false,
+    '🔴 handoff 必须保留 project/service 元数据，使下次 restore 能枚举并停止非当前额外 B',
+  )
+  assert.match(
+    fs.readFileSync(trustedHandoff, 'utf8'),
+    new RegExp(`^v2 ${CONTAINER_A} xiaojimao-hub app\\n$`),
+    'trusted handoff 必须携带 accepted exact ID 与 service 枚举身份',
+  )
+})
+
+test('P6-R2 accepted 控制锁释放：trusted accepted handoff rename 失败时原 marker 保持 0600', () => {
+  const { dataDir, backupsDir, snap, dockerBin, stateFile } = publicationCase('control-release-rename-fail')
+  const physicalDataDir = fs.realpathSync(dataDir)
+  const control = `${physicalDataDir}.restore-control`
+  const trustedAccepted = path.join(control, 'ready-accepted')
+  const failedOnce = path.join(path.dirname(dataDir), 'accepted-rename-failed-once')
+  fs.writeFileSync(
+    path.join(dockerBin, 'mv'),
+    `#!/bin/sh
+source=
+for arg in "$@"; do
+  [ "$arg" = "--" ] && continue
+  case "$arg" in -*) continue ;; esac
+  source=$arg
+  break
+done
+if [ "$source" = "$TEST_FAIL_ACCEPTED_RENAME_SOURCE" ] && [ ! -e "$TEST_FAIL_ONCE_MARKER" ]; then
+  : > "$TEST_FAIL_ONCE_MARKER"
+  exit 75
+fi
+/bin/mv "$@"
+`,
+    { mode: 0o755 },
+  )
+
+  const r = runStatefulRestore(dataDir, backupsDir, snap, dockerBin, stateFile, {
+    TEST_FAIL_ACCEPTED_RENAME_SOURCE: trustedAccepted,
+    TEST_FAIL_ONCE_MARKER: failedOnce,
+  })
+
+  assert.notEqual(r.status, 0)
+  assert.doesNotMatch(r.stdout, /恢复完成/)
+  assert.ok(fs.existsSync(trustedAccepted), 'trusted rename 失败必须保留原 accepted marker')
+  assert.equal(fs.statSync(trustedAccepted).mode & 0o777, 0o600)
+  assert.ok(!fs.existsSync(`${physicalDataDir}.restore-control-accepted`))
+  assert.ok(fs.existsSync(failedOnce), '前置：accepted rename 首次故障注入已命中')
+})
+
+test('P6-R2 accepted 控制锁释放：状态 unlink 失败时保留 trusted 0600 handoff 与明确诊断', () => {
+  const { dataDir, backupsDir, snap, dockerBin, stateFile } = publicationCase('control-release-unlink-fail')
+  const physicalDataDir = fs.realpathSync(dataDir)
+  const control = `${physicalDataDir}.restore-control`
+  const trustedHandoff = `${physicalDataDir}.restore-control-accepted`
+  const readyBody = path.join(control, 'ready-body')
+  const failedOnce = path.join(path.dirname(dataDir), 'control-unlink-failed-once')
+  fs.writeFileSync(
+    path.join(dockerBin, 'rm'),
+    `#!/bin/sh
+for arg in "$@"; do
+  if [ "$arg" = "$TEST_FAIL_UNLINK_TARGET" ] && [ ! -e "$TEST_FAIL_ONCE_MARKER" ]; then
+    : > "$TEST_FAIL_ONCE_MARKER"
+    exit 74
+  fi
+done
+/bin/rm "$@"
+`,
+    { mode: 0o755 },
+  )
+
+  const first = runStatefulRestore(dataDir, backupsDir, snap, dockerBin, stateFile, {
+    TEST_FAIL_UNLINK_TARGET: readyBody,
+    TEST_FAIL_ONCE_MARKER: failedOnce,
+  })
+
+  assert.notEqual(first.status, 0)
+  assert.doesNotMatch(first.stdout, /恢复完成/)
+  assert.ok(fs.existsSync(control), '控制状态未清完时目录必须保留')
+  assert.ok(fs.existsSync(trustedHandoff), '🔴 accepted 必须已原子交接到 host-only sibling')
+  assert.equal(fs.statSync(trustedHandoff).mode & 0o777, 0o600)
+  assert.ok(fs.existsSync(failedOnce), '前置：状态 unlink 首次故障注入已命中')
+
+  const retry = runStatefulRestore(dataDir, backupsDir, snap, dockerBin, stateFile, {
+    TEST_FAIL_UNLINK_TARGET: readyBody,
+  })
+  assert.equal(retry.status, 4)
+  assert.match(retry.stderr, /最终身份.*确认|锁释放未完成|readiness.*确认/i)
 })
 
 // ②a 反向窗口：旧 sidecar 已清理、app 已为新库创建 WAL 后 readiness 失败。
@@ -1947,6 +4129,7 @@ test('R7-P1②：readiness 失败后保留新 WAL，停机并保留未接受恢�
       TEST_WAL_PATH: wal,
       TEST_SHM_PATH: shm,
       TEST_CREATE_SIDECARS_ON_START: '1',
+      TEST_READY_EXIT: '7',
     },
     encoding: 'utf8',
   })
@@ -1958,11 +4141,11 @@ test('R7-P1②：readiness 失败后保留新 WAL，停机并保留未接受恢�
   assert.equal(fs.readFileSync(wal, 'utf8'), 'NEW-DB-WAL', '🔴 新库 WAL 不得被 EXIT trap 误删')
   assert.equal(fs.readFileSync(shm, 'utf8'), 'NEW-DB-SHM')
   const calls = fs.readFileSync(logFile, 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line) as string[])
-  assert.equal(calls.filter((call) => call[0] === 'compose' && call[1] === 'stop').length, 2)
-  const lock = path.join(dataDir, '.restore-in-progress')
-  assert.ok(fs.existsSync(lock), 'readiness 失败必须保留锁')
-  assert.ok(fs.existsSync(path.join(lock, 'app-started')))
-  assert.ok(!fs.existsSync(path.join(lock, 'ready-accepted')))
+  assert.equal(calls.filter((call) => call[0] === 'stop' && call[1] === CONTAINER_A).length, 2)
+  const control = `${fs.realpathSync(dataDir)}.restore-control`
+  assert.ok(fs.existsSync(control), 'readiness 失败必须保留 host-only control')
+  assert.ok(fs.existsSync(path.join(control, 'app-started')))
+  assert.ok(!fs.existsSync(path.join(control, 'ready-accepted')))
 })
 
 test('P6-R2 post-replace：.upgrade-in-progress 删除失败时保持停机并保留阶段锁', () => {
@@ -2011,13 +4194,14 @@ done
   })
   const calls = fs.readFileSync(logFile, 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line) as string[])
   const lock = path.join(dataDir, '.restore-in-progress')
+  const control = `${fs.realpathSync(dataDir)}.restore-control`
   assert.equal(r.status, 73, `应保留 rm 原退出码：\n${r.stdout}\n${r.stderr}`)
-  assert.equal(calls.filter((call) => call[0] === 'compose' && call[1] === 'start').length, 0, '标记未清不得启动')
-  assert.equal(calls.filter((call) => call[0] === 'compose' && call[1] === 'stop').length, 2, '收尾再 stop 保证停机')
+  assert.equal(calls.filter((call) => call[0] === 'start' && call[1] === CONTAINER_A).length, 0, '标记未清不得启动')
+  assert.equal(calls.filter((call) => call[0] === 'stop' && call[1] === CONTAINER_A).length, 2, '收尾再 stop 保证停机')
   assert.ok(fs.existsSync(marker), '注入失败应保留升级标记')
   assert.ok(fs.existsSync(lock), '必须保留 restore 锁')
-  assert.ok(fs.existsSync(path.join(lock, 'sidecars-clean')))
-  assert.ok(!fs.existsSync(path.join(lock, 'upgrade-marker-clean')))
+  assert.ok(fs.existsSync(path.join(control, 'sidecars-clean')))
+  assert.ok(!fs.existsSync(path.join(control, 'upgrade-marker-clean')))
   assert.equal(readMarker(path.join(dataDir, 'app.db')), 'PRE-UPGRADE')
 })
 
@@ -2074,12 +4258,15 @@ done
   })
 
   const calls = fs.readFileSync(logFile, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l))
-  const starts = calls.filter((c) => c[0] === 'compose' && c[1] === 'start')
+  const starts = calls.filter((c) => c[0] === 'start' && c[1] === CONTAINER_A)
   assert.equal(r.status, 1, `sidecar 清理失败应以 1 退出：\n${r.stdout}\n${r.stderr}`)
   assert.equal(starts.length, 0, '🔴 旧 sidecar 未清掉时绝不能调用 start')
   assert.ok(fs.existsSync(wal) && fs.existsSync(shm), '前置：注入确实让旧 sidecar 保持存在')
   assert.match(r.stderr, /拒绝重启 app|app 保持停止/, '必须明确说明是为防混库而保持停机')
-  assert.ok(fs.existsSync(path.join(dataDir, '.restore-in-progress', 'replace-armed')), '不安全失败必须保留 armed 锁')
+  assert.ok(
+    fs.existsSync(path.join(`${fs.realpathSync(dataDir)}.restore-control`, 'replace-armed')),
+    '不安全失败必须保留 host-only armed 状态',
+  )
   assert.equal(readMarker(path.join(dataDir, 'app.db')), 'SNAPSHOT-RM-FAIL', '数据库本体已经原子替换成功')
 })
 
@@ -2126,8 +4313,13 @@ test('R7-P1② 反向：换库前就失败时，当前库的 -wal/-shm 必须原
   // 且 trap 仍须重启 app（两个目标不能顾此失彼）
   const calls = r.log.trim().split('\n').filter(Boolean).map((l) => JSON.parse(l))
   assert.ok(
-    calls.filter((c) => c[0] === 'compose' && c[1] === 'start').length >= 1,
+    calls.filter((c) => c[0] === 'start' && c[1] === CONTAINER_A).length >= 1,
     '🔴 trap 仍须重启 app',
+  )
+  assert.ok(!fs.existsSync(path.join(dataDir, '.restore-in-progress')), '未换库的优雅失败必须释放 public stage/锁')
+  assert.ok(
+    !fs.existsSync(`${fs.realpathSync(dataDir)}.restore-control`),
+    '🔴 未换库且旧 app 已安全重启后必须释放 host-only control，不能留下假残锁',
   )
 })
 
@@ -2206,6 +4398,7 @@ if (mode === 'curl') {
 }
 if (mode === 'sleep') {
   const seconds = Number(args[0])
+  if (!Number.isInteger(seconds)) process.exit(0)
   state.sleepCalls.push(seconds)
   state.now += seconds
   fs.writeFileSync(file, JSON.stringify(state))
@@ -2238,7 +4431,7 @@ process.exit(98)
       TEST_CLOCK_FILE: clockFile,
     },
     encoding: 'utf8',
-    timeout: 10_000,
+    timeout: 30_000,
   })
   const state = JSON.parse(fs.readFileSync(clockFile, 'utf8')) as {
     now: number

@@ -81,17 +81,18 @@ export function backupDb(dbPath: string, backupDir: string, keep: number, now: D
   const rand = crypto.randomBytes(3).toString('hex')
   const target = path.resolve(backupDir, `backup-${ts}-${rand}.db`)
 
-  // 🔴 原子发布（P6-R2 复审必修 2）：先写**不匹配 BACKUP_RE 的临时名**，VACUUM 全程成功后才
-  //    rename 成 backup-*.db。若直接写最终名，VACUUM 中途断电/进程被杀会留下一个「有 SQLite 头
-  //    但内容截断」的 backup-*.db——它同时污染两条判据：latestBackupDay 认它是「今天已备过」
-  //    → 整天不再备份；BACKUP_KEEP 轮转集也认它 → 占一个名额把真好备份挤出去。两条都是静默的。
-  //    rename 同目录内是原子的（不跨设备），故不存在「改到一半的文件名」。
+  // 🔴 进程可见 namespace 的原子发布（P6-R2 复审必修 2）：先写**不匹配 BACKUP_RE 的临时名**，
+  //    VACUUM 全程成功后才在同目录 rename 成 backup-*.db。对仍在运行的进程而言，最终名不会以
+  //    “改到一半”的状态可见；若直接写最终名，进程被杀会留下有 SQLite 头但内容截断的有效命名，
+  //    同时污染 latestBackupDay 与 BACKUP_KEEP 判据。
   //    临时名以 `.tmp-` 打头：既不匹配 BACKUP_RE（不进轮转集），也不匹配 backupLocalDay 的文件名
   //    模式（不被当成「今天备过了」）——残缺产物再也影响不了任何判据。
   //    ⚠️ 遗留清理：tmp 落盘后的**任何**失败路径都由下面那一个 catch 统一删掉（见不变量 B）；
-  //    只有**硬杀**（SIGKILL/断电）会留下一个
-  //    .tmp-backup-*.db。它无害（不进任何判据），手动删即可。故意不自动清扫同目录的
-  //    .tmp-*：手动 `scripts/backup.ts` 与 worker 的每日备份是两个进程，扫一遍会误删对方正在写的那份。
+  //    SIGKILL 仍可能留下 `.tmp-backup-*.db`。它可能包含完整敏感数据库，只能保证创建起不宽于
+  //    0600、且不会被当成有效备份；必须先核对无活跃写入，再由运维校验/清理。故意不自动清扫同目录
+  //    `.tmp-*`：手动 `scripts/backup.ts` 与 worker 每日备份是两个进程，扫一遍会误删对方正在写的文件。
+  //    ⚠️ 本实现没有对 tmp、最终文件或目录执行 fsync；不承诺宿主掉电后 tmp/最终名/缺失状态或落盘
+  //    顺序。rename 的保证仅限进程可见 namespace，不是断电持久性协议。
   const tmp = path.resolve(backupDir, `.tmp-backup-${ts}-${rand}.db`)
 
   // 🔴 不变量 B（P6-R2 R7-P2⑤，codex R6 指出）：`tmp` 一旦落盘，**此后任何**失败路径都必须清掉它。
@@ -106,8 +107,8 @@ export function backupDb(dbPath: string, backupDir: string, keep: number, now: D
   //    发布锁 / rename / 轮转），单一清理出口。将来在这中间插新步骤也自动被覆盖，不会再漏。
   //    ⚠️ rename 成功之后才抛错（轮转阶段）时，tmp 已不存在，`force: true` 的 rmSync 是空操作
   //       ——不会误删刚发布的 target。
-  //    ⚠️ 硬杀（SIGKILL/断电）仍会留 tmp：它不进轮转/每日判据，但内容仍是敏感全库，不能称为
-  //       “无害”。因此在 VACUUM 写首字节前先原子创建 0600 空文件；后续 chmod 只是发布前纵深防御。
+  //    ⚠️ SIGKILL 仍会留 tmp：它不进轮转/每日判据，但内容仍是敏感全库。因此在 VACUUM 写首字节前
+  //       先创建 0600 空文件；后续 chmod 只是发布前纵深防御，不增加宿主掉电持久性保证。
   //       遗留文件由运维手动删；故意不自动清扫同目录 .tmp-*（会误删并发进程正在写的文件）。
   let tmpOwned = false
   try {

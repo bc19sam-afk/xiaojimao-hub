@@ -3,23 +3,26 @@
 # 从快照恢复数据库（P6-R2，docs/deploy.md §5.2 手工步骤的脚本化）
 #
 # **宿主侧运行**（在 docker-compose.yml 所在目录，即仓库根）。流程：
-#   Compose + 现有容器 /app/data bind 核对 → 互斥锁 + 私有 stage 校验 → 停 app → 现场 app.db 存为 backups/pre-restore.db
-#   → armed + 原子 mv stage 为 app.db（0600 / uid1000）→ 删旧 -wal/-shm/.upgrade-in-progress
-#   → 起 app → 仅接受 /api/ready 的 HTTP 200 + {"ok":true} → 释放锁
+#   Compose + 容器/mount/网络身份核对 → host-only 控制锁 + app 不可见预校验副本 → 停 app
+#   → 同文件系统 stage 二次校验 → 现场 app.db 存为 backups/pre-restore.db → armed + 原子 mv
+#   → 停止态断开捕获容器的全部流量网络 → 精确启动该容器 → 容器内校验 /api/ready
+#   → 先持久化 ready-accepted → 按 network ID + aliases 恢复网络 → network-published
+#   → 最后身份复核 → 原子保全 accepted 并释放 host-only control
 #
 # 用法：
 #   ./scripts/restore.sh data/backups/backup-2026-07-26T01-00-00-a1b2c3.db
 #   ./scripts/restore.sh --after-image-rollback data/backups/preupgrade.db
 #
 # 环境变量：
-#   SUDO=        操作账号已是 uid1000 / macOS Docker Desktop 时置空跳过 sudo（默认用 sudo）
+#   SUDO=        仅当宿主 UID 与容器 uid1000 明确隔离（常见于 macOS Docker Desktop）时可置空；
+#                Linux uid1000 调用者必须保留默认 sudo（或用 root），否则无法隔离锁/stage 与 app
 #   DATA_DIR     宿主数据目录，默认 data。🔴 **必须与 docker-compose.yml 里绑到 /app/data 的宿主
 #                路径一致**（默认那条是 `./data:/app/data`）：脚本按它定位要还原的库文件，容器按
 #                compose 那条绑定定位它实际读的库——两者必须指同一个目录，否则还原了个 app 根本
 #                不读的文件。脚本会在锁定/停机/写库前同时核对 Compose 与现有 app 容器实际挂载，
 #                并固定到物理绝对路径；无法唯一确认就拒绝。
 #   BACKUP_DIR   备份目录，默认 $DATA_DIR/backups
-#   APP_URL      校验地址，默认 http://127.0.0.1:3000
+#   APP_URL      超时后的宿主侧排障提示地址，默认 http://127.0.0.1:3000；恢复门禁固定在捕获容器内探测
 #   READY_TIMEOUT 等 /api/ready 通过的秒数上限，默认 60（与 docs/deploy.md 承诺一致）
 # =============================================================================
 set -eu
@@ -34,7 +37,7 @@ fi
 APP_URL="${APP_URL:-http://127.0.0.1:3000}"
 READY_TIMEOUT="${READY_TIMEOUT:-60}"
 
-# READY_TIMEOUT 会进入算术展开和 curl/sleep 参数，必须在任何 docker、停机或文件替换之前验证。
+# READY_TIMEOUT 会进入算术展开和 probe/sleep 参数，必须在任何 docker、停机或文件替换之前验证。
 # 只接受 1..86400 的十进制正整数：既避免 /bin/sh 把 abc 当变量名/0，也避免超大值造成无限值守。
 if ! printf '%s\n' "$READY_TIMEOUT" | grep -Eq '^[1-9][0-9]{0,4}$'; then
   echo "❌ READY_TIMEOUT 必须是 1..86400 的十进制正整数，得到：$READY_TIMEOUT" >&2
@@ -103,8 +106,8 @@ fi
 #    `data/backups` 按 §2 是 0700 且属主 uid1000，操作账号不是 1000 时 `cd` 必然 Permission denied。
 #    故显式判空并中止。
 # 🔴 R4-P1②：路径归一时解符号链接。恢复源可能是指向 pre-restore.db 的一层/多层链接；必须先
-# 解析到真实目标，再在 stop 前复制到私有 stage。这样后面的现场留存即使覆盖原 pre-restore.db，
-# 最终还原仍使用已校验的 stage，不会静默丢掉二次反悔回滚点。
+# 解析到真实目标，再在 stop 前复制到 app 未挂载的 host-only 预校验副本。这样后面的现场留存即使
+# 覆盖原 pre-restore.db，最终还原仍使用已固化副本，不会静默丢掉二次反悔回滚点。
 #
 # `cd -P` 追踪目录段，再对 basename 段**循环** readlink 直到不再是链接。必须循环而不是解一层：
 # `snap.db -> mid.db -> pre-restore.db` 只解一层会留下仍会变化的中间链接。readlink 给相对目标时按其
@@ -156,30 +159,200 @@ absdir() {
   printf '%s\n' "$_d"
 }
 
+# 目录物理身份：规范路径只能挡 symlink 换靶，挡不住同一路径被 rename 后换成另一个目录。
+# macOS/BSD 与 GNU stat 参数不同，按顺序探测；两者都失败即 fail-closed。
+path_identity() {
+  _identity=$(stat -f '%d:%i' -- "$1" 2>/dev/null || true)
+  case "$_identity" in
+    *[!0-9:]*|'') _identity="" ;;
+  esac
+  if [ -z "$_identity" ]; then
+    _identity=$(stat -Lc '%d:%i' -- "$1" 2>/dev/null || true)
+    case "$_identity" in
+      *[!0-9:]*|'') _identity="" ;;
+    esac
+  fi
+  if [ -z "$_identity" ]; then
+    echo "❌ 无法读取目录 dev/inode 身份：$1" >&2
+    return 1
+  fi
+  printf '%s\n' "$_identity"
+}
+
+path_contains() {
+  _path_root=${1%/}
+  _path_candidate=$2
+  [ "$_path_root" = "/" ] && return 0
+  [ "$_path_candidate" = "$_path_root" ] ||
+    [ "${_path_candidate#"$_path_root"/}" != "$_path_candidate" ]
+}
+
+validate_control_not_exposed_by_binds() {
+  _bind_label=$1
+  _bind_sources=$2
+  _control_candidate="${DATA_DIR}.restore-control"
+  _control_handoff_candidate="${DATA_DIR}.restore-control-accepted"
+
+  while IFS= read -r _bind_source; do
+    [ -n "$_bind_source" ] || continue
+    if [ ! -e "$_bind_source" ]; then
+      echo "❌ ${_bind_label} bind source 不存在，无法证明 host-only 控制面不可见：$_bind_source" >&2
+      return 1
+    fi
+    _bind_abs=$(abspath "$_bind_source") || return 1
+    if [ -d "$_bind_abs" ] && {
+      path_contains "$_bind_abs" "$_control_candidate" ||
+        path_contains "$_bind_abs" "$_control_handoff_candidate"
+    }; then
+      echo "❌ ${_bind_label} bind source 是 host-only restore 控制路径的祖先，拒绝恢复。" >&2
+      echo "   Bind source: $_bind_abs" >&2
+      echo "   Control:     $_control_candidate" >&2
+      return 1
+    fi
+    if [ "$_bind_abs" = "$_control_candidate" ] || [ "$_bind_abs" = "$_control_handoff_candidate" ]; then
+      echo "❌ ${_bind_label} 直接绑定了 host-only restore 控制路径，拒绝恢复：$_bind_abs" >&2
+      return 1
+    fi
+  done <<EOF
+$_bind_sources
+EOF
+}
+
+RESTORE_CONTAINER_ID=""
+RESTORE_DATA_IDENTITY=""
+RESTORE_COMPOSE_DATA_ABS=""
+RESTORE_CONTAINER_DATA_ABS=""
+RESTORE_CONTAINER_IMAGE=""
+RESTORE_COMPOSE_PROJECT=""
+RESTORE_COMPOSE_SERVICE=""
+RESTORE_COMPOSE_CONFIG_HASH=""
+RESTORE_CONTAINER_WAS_RUNNING=""
+IDENTITY_DRIFTED=0
+
 # restore 的宿主目标必须同时匹配 Compose 配置与现有唯一 app 容器实际绑到 /app/data 的 bind
 # source。所有查询只读；任何缺失、歧义、named volume、解析失败或路径不一致都在创建 restore 锁、
 # 停服务和写数据库之前 fail closed。
 validate_compose_data_bind() {
   _compose_json=$(docker compose config --format json app 2>/dev/null) || {
     echo "❌ 无法解析 docker compose 配置，不能确认 /app/data 的宿主 bind source；恢复已中止。" >&2
-    exit 1
+    return 1
   }
+  _compose_hash_rows=$(docker compose config --hash app 2>/dev/null) || {
+    echo "❌ 无法计算当前 app Compose config hash；不能证明停止态容器配置未陈旧。" >&2
+    return 1
+  }
+  _compose_config_hash=$(printf '%s\n' "$_compose_hash_rows" | awk 'NF == 2 && $1 == "app" { print $2 }')
+  _compose_hash_count=$(printf '%s\n' "$_compose_config_hash" | awk 'NF { count++ } END { print count + 0 }')
+  _compose_config_hash=$(printf '%s\n' "$_compose_config_hash" | awk 'NF { print; exit }')
+  if [ "$_compose_hash_count" -ne 1 ] || [ "${#_compose_config_hash}" -ne 64 ]; then
+    echo "❌ 当前 app Compose config hash 缺失或歧义；恢复已中止。" >&2
+    return 1
+  fi
+  case "$_compose_config_hash" in *[!0-9a-f]*)
+    echo "❌ 当前 app Compose config hash 格式异常；恢复已中止。" >&2
+    return 1
+  esac
+  if [ -n "$RESTORE_COMPOSE_CONFIG_HASH" ] && [ "$_compose_config_hash" != "$RESTORE_COMPOSE_CONFIG_HASH" ]; then
+    echo "❌ 恢复期间 Compose app 配置 hash 已变化，拒绝继续。" >&2
+    return 1
+  fi
 
-  # Docker Compose 的 JSON 是缩进后的规范化模型。这里只接受未转义的普通 Unix 路径；若 source
-  # 含 JSON 转义或结构不是预期的 volumes 数组，宁可拒绝，也不猜测一个可能指向错误数据库的路径。
-  _data_mounts=$(printf '%s\n' "$_compose_json" | awk '
+  # Docker Compose 的 JSON 是缩进后的规范化模型。这里精确进入 services.app 的 direct child，
+  # 只解析它的 networks 与 volumes：environment/labels/其他 service/顶层 networks 里即使出现
+  # interface_name、mac_address 等同名 key，也不能误判成 app endpoint 配置。
+  #
+  # 路径只接受未转义的普通 Unix 字符串；若 JSON 含转义或结构不是预期对象/数组，宁可拒绝，也不
+  # 猜测一个可能指向错误数据库或把 host-only 控制 sibling 暴露给 app 的 bind source。
+  _compose_records=$(printf '%s\n' "$_compose_json" | awk '
     function indent_of(line) {
       match(line, /^[[:space:]]*/)
       return RLENGTH
     }
     BEGIN {
+      in_services = 0
+      in_app = 0
+      in_networks = 0
+      in_endpoint = 0
       in_volumes = 0
       in_mount = 0
+      saw_services = 0
+      saw_app = 0
       saw_volumes = 0
       bad = 0
     }
-    /^[[:space:]]*"volumes"[[:space:]]*:[[:space:]]*\[[[:space:]]*$/ {
-      if (in_volumes) bad = 1
+
+    !in_services && /^[[:space:]]*"services"[[:space:]]*:[[:space:]]*\{[[:space:]]*$/ {
+      in_services = 1
+      services_indent = indent_of($0)
+      saw_services = 1
+      next
+    }
+    in_services && !in_app && indent_of($0) == services_indent + 2 &&
+      /^[[:space:]]*"app"[[:space:]]*:[[:space:]]*\{[[:space:]]*$/ {
+      in_app = 1
+      app_indent = indent_of($0)
+      saw_app = 1
+      next
+    }
+
+    in_app && !in_networks && !in_volumes && indent_of($0) == app_indent + 2 &&
+      /^[[:space:]]*"mac_address"[[:space:]]*:/ {
+      print "BAD\tservices.app.mac_address"
+      next
+    }
+    in_app && !in_networks && indent_of($0) == app_indent + 2 &&
+      /^[[:space:]]*"networks"[[:space:]]*:[[:space:]]*\{[[:space:]]*$/ {
+      in_networks = 1
+      networks_indent = indent_of($0)
+      next
+    }
+    in_networks {
+      line_indent = indent_of($0)
+      if (!in_endpoint && line_indent == networks_indent && $0 ~ /^[[:space:]]*\}[,]?[[:space:]]*$/) {
+        in_networks = 0
+        next
+      }
+      if (!in_endpoint && line_indent == networks_indent + 2 &&
+          $0 ~ /^[[:space:]]*"[^"\\]+"[[:space:]]*:[[:space:]]*\{[[:space:]]*$/) {
+        in_endpoint = 1
+        endpoint_indent = line_indent
+        next
+      }
+      if (!in_endpoint && line_indent == networks_indent + 2 &&
+          $0 ~ /^[[:space:]]*"[^"\\]+"[[:space:]]*:[[:space:]]*null[,]?[[:space:]]*$/) {
+        next
+      }
+      if (!in_endpoint && line_indent == networks_indent + 2 &&
+          $0 ~ /^[[:space:]]*"[^"\\]+"[[:space:]]*:[[:space:]]*\{\}[,]?[[:space:]]*$/) {
+        next
+      }
+      if (!in_endpoint && line_indent == networks_indent + 2) {
+        bad = 1
+        next
+      }
+      if (in_endpoint && line_indent == endpoint_indent && $0 ~ /^[[:space:]]*\}[,]?[[:space:]]*$/) {
+        in_endpoint = 0
+        next
+      }
+      if (in_endpoint && line_indent == endpoint_indent + 2) {
+        key = $0
+        sub(/^[[:space:]]*"/, "", key)
+        sub(/"[[:space:]]*:.*$/, "", key)
+        if (key == "ipv4_address" || key == "ipv6_address" || key == "link_local_ips" ||
+            key == "mac_address" || key == "interface_name" || key == "driver_opts") {
+          print "BAD\tservices.app.networks.*." key
+        } else if (key == "priority" || key == "gw_priority") {
+          value = $0
+          sub(/^[^:]*:[[:space:]]*/, "", value)
+          sub(/[,[:space:]]*$/, "", value)
+          if (value !~ /^-?0([.]0+)?$/) print "BAD\tservices.app.networks.*." key
+        }
+      }
+      next
+    }
+
+    in_app && !in_volumes && indent_of($0) == app_indent + 2 &&
+      /^[[:space:]]*"volumes"[[:space:]]*:[[:space:]]*\[[[:space:]]*$/ {
       in_volumes = 1
       volumes_indent = indent_of($0)
       saw_volumes = 1
@@ -222,81 +395,238 @@ validate_compose_data_bind() {
         next
       }
       if (in_mount && line_indent == mount_indent && $0 ~ /^[[:space:]]*\}[,]?[[:space:]]*$/) {
-        if (target == "/app/data") {
-          if (type == "" || source == "") bad = 1
-          print type "\t" source
-        }
+        if (type == "" || source == "" || target == "") bad = 1
+        print "MOUNT\t" type "\t" source "\t" target
         in_mount = 0
         next
       }
+      next
+    }
+
+    in_app && !in_networks && !in_volumes && indent_of($0) == app_indent &&
+      /^[[:space:]]*\}[,]?[[:space:]]*$/ {
+      in_app = 0
+      next
+    }
+    in_services && !in_app && indent_of($0) == services_indent &&
+      /^[[:space:]]*\}[,]?[[:space:]]*$/ {
+      in_services = 0
+      next
     }
     END {
-      if (bad || in_mount || in_volumes || !saw_volumes) exit 2
+      if (bad || in_endpoint || in_networks || in_mount || in_volumes || in_app ||
+          in_services || !saw_services || !saw_app || !saw_volumes) exit 2
     }
   ') || {
-    echo "❌ 无法可靠解析 Compose 中 /app/data 的挂载配置；恢复已中止。" >&2
-    exit 1
+    echo "❌ 无法可靠解析 Compose app 的网络/挂载配置；恢复已中止。" >&2
+    return 1
   }
+
+  _unsupported_compose_networks=$(printf '%s\n' "$_compose_records" | awk -F '\t' '$1 == "BAD" { print $2 }')
+  if [ -n "$_unsupported_compose_networks" ]; then
+    echo "❌ Compose app 网络包含 restore 无法无损重放的静态/自定义端点配置；恢复已中止：" >&2
+    printf '   %s\n' "$_unsupported_compose_networks" >&2
+    echo "   当前恢复器仅支持动态地址与 aliases；不会猜测或重放静态网络参数。" >&2
+    return 1
+  fi
+
+  _data_mounts=$(printf '%s\n' "$_compose_records" | awk -F '\t' \
+    '$1 == "MOUNT" && $4 == "/app/data" { print $2 "\t" $3 }')
 
   _mount_count=$(printf '%s\n' "$_data_mounts" | awk 'NF { count++ } END { print count + 0 }')
   if [ "$_mount_count" -ne 1 ]; then
     echo "❌ Compose 必须为 app 的 /app/data 配置唯一一个宿主 bind source；检测到 ${_mount_count} 个。" >&2
-    exit 1
+    return 1
   fi
 
   _mount_type=$(printf '%s\n' "$_data_mounts" | awk -F '\t' 'NR == 1 { print $1 }')
   _mount_source=$(printf '%s\n' "$_data_mounts" | awk 'NR == 1 { tab = index($0, "\t"); if (tab > 0) print substr($0, tab + 1) }')
   if [ "$_mount_type" != "bind" ] || [ -z "$_mount_source" ]; then
     echo "❌ Compose 的 /app/data 必须是可解析的宿主 bind source，不能使用 named volume。" >&2
-    exit 1
+    return 1
   fi
 
-  _compose_data_abs=$(absdir "$_mount_source") || exit 1
-  _requested_data_abs=$(absdir "$DATA_DIR") || exit 1
+  _compose_data_abs=$(absdir "$_mount_source") || return 1
+  _requested_data_abs=$(absdir "$DATA_DIR") || return 1
   if [ "$_compose_data_abs" != "$_requested_data_abs" ]; then
     echo "❌ DATA_DIR 与 Compose 的 /app/data bind source 不一致，拒绝恢复。" >&2
     echo "   DATA_DIR: $_requested_data_abs" >&2
     echo "   Compose:  $_compose_data_abs" >&2
-    exit 1
+    return 1
   fi
+
+  _compose_bind_sources=$(printf '%s\n' "$_compose_records" | awk -F '\t' \
+    '$1 == "MOUNT" && $2 == "bind" { print $3 }')
+  validate_control_not_exposed_by_binds "Compose app" "$_compose_bind_sources" || return 1
 
   # `docker compose start` 会复用现有容器，不会按刚修改过的 Compose 配置重建。故还要核对将被
   # start 的唯一 app 容器：它当前实际挂到 /app/data 的 bind source 也必须与配置和 DATA_DIR 一致。
-  _container_ids=$(docker compose ps --all -q app 2>/dev/null) || {
+  _container_ids=$(docker compose ps --all --no-trunc -q app 2>/dev/null) || {
     echo "❌ 无法查询现有 app 容器，不能确认其 /app/data 实际挂载；恢复已中止。" >&2
-    exit 1
+    return 1
   }
   _container_count=$(printf '%s\n' "$_container_ids" | awk 'NF { count++ } END { print count + 0 }')
+  if [ "$_container_count" -eq 0 ] && [ -z "$RESTORE_CONTAINER_ID" ]; then
+    echo "→ 当前尚无 app 容器，按已核验 Compose 配置 create 为停止态"
+    if ! docker compose create app; then
+      echo "❌ 无法 create app 停止态容器；恢复已中止。" >&2
+      return 1
+    fi
+    _container_ids=$(docker compose ps --all --no-trunc -q app 2>/dev/null) || return 1
+    _container_count=$(printf '%s\n' "$_container_ids" | awk 'NF { count++ } END { print count + 0 }')
+  fi
   if [ "$_container_count" -ne 1 ]; then
     echo "❌ 恢复前必须存在唯一一个 app 容器；检测到 ${_container_count} 个。" >&2
     echo "   请先按当前 Compose 配置 create/recreate 为停止态，再重新运行 restore。" >&2
-    exit 1
+    return 1
   fi
   _container_id=$(printf '%s\n' "$_container_ids" | awk 'NF { print; exit }')
+  if ! printf '%s\n' "$_container_id" | grep -Eq '^[0-9a-f]{64}$'; then
+    echo "❌ Compose app 容器 ID 不是完整 64 位十六进制值，拒绝继续恢复。" >&2
+    return 1
+  fi
+  _inspected_container_id=$(docker inspect --format '{{.Id}}' "$_container_id" 2>/dev/null) || {
+    echo "❌ 无法反向核对 Compose 捕获的完整 app 容器 ID。" >&2
+    return 1
+  }
+  if [ "$_inspected_container_id" != "$_container_id" ]; then
+    echo "❌ docker inspect 返回的容器 ID 与 Compose 捕获值不一致，拒绝继续恢复。" >&2
+    echo "   Compose: $_container_id" >&2
+    echo "   Inspect: $_inspected_container_id" >&2
+    return 1
+  fi
+  if [ -n "$RESTORE_CONTAINER_ID" ] && [ "$_container_id" != "$RESTORE_CONTAINER_ID" ]; then
+    echo "❌ app 容器身份已漂移，拒绝继续恢复。" >&2
+    echo "   Captured: $RESTORE_CONTAINER_ID" >&2
+    echo "   Current:  $_container_id" >&2
+    return 1
+  fi
   _container_mounts=$(docker inspect --format \
     '{{range .Mounts}}{{if eq .Destination "/app/data"}}{{printf "%s\t%s\n" .Type .Source}}{{end}}{{end}}' \
     "$_container_id" 2>/dev/null) || {
     echo "❌ 无法读取 app 容器的 /app/data 实际挂载；恢复已中止。" >&2
-    exit 1
+    return 1
   }
   _container_mount_count=$(printf '%s\n' "$_container_mounts" | awk 'NF { count++ } END { print count + 0 }')
   if [ "$_container_mount_count" -ne 1 ]; then
     echo "❌ app 容器必须为 /app/data 配置唯一一个实际挂载；检测到 ${_container_mount_count} 个。" >&2
-    exit 1
+    return 1
   fi
   _container_mount_type=$(printf '%s\n' "$_container_mounts" | awk -F '\t' 'NR == 1 { print $1 }')
   _container_mount_source=$(printf '%s\n' "$_container_mounts" | awk 'NR == 1 { tab = index($0, "\t"); if (tab > 0) print substr($0, tab + 1) }')
   if [ "$_container_mount_type" != "bind" ] || [ -z "$_container_mount_source" ]; then
     echo "❌ app 容器的 /app/data 实际挂载必须是可解析的宿主 bind source。" >&2
-    exit 1
+    return 1
   fi
-  _container_data_abs=$(absdir "$_container_mount_source") || exit 1
+  _container_data_abs=$(absdir "$_container_mount_source") || return 1
   if [ "$_container_data_abs" != "$_compose_data_abs" ]; then
     echo "❌ 现有 app 容器的 /app/data 挂载与当前 Compose 配置不一致，拒绝恢复。" >&2
     echo "   Container: $_container_data_abs" >&2
     echo "   Compose:   $_compose_data_abs" >&2
     echo "   请先 create/recreate app 为停止态，使实际挂载与 Compose 一致。" >&2
-    exit 1
+    return 1
+  fi
+
+  _container_bind_rows=$(docker inspect --format \
+    '{{range .Mounts}}{{if eq .Type "bind"}}{{printf "XJM_BIND\t%s\t%s\n" .Source .Destination}}{{end}}{{end}}' \
+    "$_container_id" 2>/dev/null) || {
+    echo "❌ 无法枚举 app 容器全部实际 bind mounts；不能证明 host-only 控制面不可见。" >&2
+    return 1
+  }
+  if printf '%s\n' "$_container_bind_rows" | awk -F '\t' \
+    'NF && ($1 != "XJM_BIND" || NF != 3 || $2 == "" || $3 == "") { bad = 1 } END { exit bad ? 0 : 1 }'; then
+    echo "❌ app 容器实际 bind mount 输出格式异常；恢复已中止。" >&2
+    return 1
+  fi
+  _container_bind_sources=$(printf '%s\n' "$_container_bind_rows" | awk -F '\t' '$1 == "XJM_BIND" { print $2 }')
+  validate_control_not_exposed_by_binds "app 容器实际" "$_container_bind_sources" || return 1
+
+  _data_identity=$(path_identity "$_requested_data_abs") || return 1
+  if [ -n "$RESTORE_DATA_IDENTITY" ] && [ "$_data_identity" != "$RESTORE_DATA_IDENTITY" ]; then
+    echo "❌ DATA_DIR 物理 dev/inode 已变化，拒绝继续恢复。" >&2
+    echo "   Captured: $RESTORE_DATA_IDENTITY" >&2
+    echo "   Current:  $_data_identity" >&2
+    return 1
+  fi
+  if [ -n "$RESTORE_COMPOSE_DATA_ABS" ] && [ "$_compose_data_abs" != "$RESTORE_COMPOSE_DATA_ABS" ]; then
+    echo "❌ Compose /app/data bind source 已变化，拒绝继续恢复。" >&2
+    return 1
+  fi
+  if [ -n "$RESTORE_CONTAINER_DATA_ABS" ] && [ "$_container_data_abs" != "$RESTORE_CONTAINER_DATA_ABS" ]; then
+    echo "❌ 已捕获容器的 /app/data mount source 已变化，拒绝继续恢复。" >&2
+    return 1
+  fi
+  if [ -z "$RESTORE_CONTAINER_WAS_RUNNING" ]; then
+    _container_was_running=$(docker inspect --format '{{.State.Running}}' "$_container_id" 2>/dev/null) || {
+      echo "❌ 无法读取已捕获 app 容器的初始运行态；恢复已中止。" >&2
+      return 1
+    }
+    case "$_container_was_running" in
+      true|false) RESTORE_CONTAINER_WAS_RUNNING="$_container_was_running" ;;
+      *)
+        echo "❌ 已捕获 app 容器的初始运行态格式异常，拒绝继续恢复。" >&2
+        return 1
+        ;;
+    esac
+  fi
+  _container_image=$(docker inspect --format '{{.Image}}' "$_container_id" 2>/dev/null) || {
+    echo "❌ 无法读取已捕获 app 容器的镜像身份。" >&2
+    return 1
+  }
+  if ! printf '%s\n' "$_container_image" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
+    echo "❌ app 容器镜像身份格式异常，拒绝继续恢复。" >&2
+    return 1
+  fi
+  if [ -n "$RESTORE_CONTAINER_IMAGE" ] && [ "$_container_image" != "$RESTORE_CONTAINER_IMAGE" ]; then
+    echo "❌ 已捕获 app 容器的镜像身份已变化，拒绝继续恢复。" >&2
+    return 1
+  fi
+  _compose_labels=$(docker inspect --format \
+    '{{index .Config.Labels "com.docker.compose.project"}}{{printf "\t"}}{{index .Config.Labels "com.docker.compose.service"}}{{printf "\t"}}{{index .Config.Labels "com.docker.compose.oneoff"}}{{printf "\t"}}{{index .Config.Labels "com.docker.compose.config-hash"}}' \
+    "$_container_id" 2>/dev/null) || {
+    echo "❌ 无法读取已捕获 app 容器的 Compose project/service 身份。" >&2
+    return 1
+  }
+  _compose_project=$(printf '%s\n' "$_compose_labels" | awk -F '\t' 'NF == 4 { print $1 }')
+  _compose_service=$(printf '%s\n' "$_compose_labels" | awk -F '\t' 'NF == 4 { print $2 }')
+  _compose_oneoff=$(printf '%s\n' "$_compose_labels" | awk -F '\t' 'NF == 4 { print $3 }')
+  _container_config_hash=$(printf '%s\n' "$_compose_labels" | awk -F '\t' 'NF == 4 { print $4 }')
+  if ! printf '%s\n' "$_compose_project" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$' || \
+     [ "$_compose_service" != "app" ] || [ "$_compose_oneoff" != "False" ]; then
+    echo "❌ app 容器缺少可靠的 Compose project/service/non-oneoff 身份标签。" >&2
+    return 1
+  fi
+  if [ "$_container_config_hash" != "$_compose_config_hash" ]; then
+    echo "❌ 已捕获 app 容器的 Compose config hash 与当前配置不一致；请先 recreate 为停止态。" >&2
+    return 1
+  fi
+  if [ -n "$RESTORE_COMPOSE_PROJECT" ] && [ "$_compose_project" != "$RESTORE_COMPOSE_PROJECT" ]; then
+    echo "❌ 已捕获 app 容器的 Compose project 身份已变化，拒绝继续恢复。" >&2
+    return 1
+  fi
+  if [ -n "$RESTORE_COMPOSE_SERVICE" ] && [ "$_compose_service" != "$RESTORE_COMPOSE_SERVICE" ]; then
+    echo "❌ 已捕获 app 容器的 Compose service 身份已变化，拒绝继续恢复。" >&2
+    return 1
+  fi
+
+  # `docker compose ps` 只代表 Compose 当前指针；并发 recreate 或手工保留的旧实例可能仍带着同一
+  # project/service/non-oneoff 标签，却不再出现在该指针里。恢复期间任何第二个语义 app 都可能用旧库
+  # readiness 冒充目标实例，或在发布窗口继续接流量，因此必须把标签枚举与当前指针合并后要求唯一。
+  _service_label_ids=$(docker ps -a --no-trunc -q \
+    --filter "label=com.docker.compose.project=$_compose_project" \
+    --filter "label=com.docker.compose.service=$_compose_service" \
+    --filter "label=com.docker.compose.oneoff=False" 2>/dev/null) || {
+    echo "❌ 无法枚举同一 Compose project/service 的 app 容器；恢复已中止。" >&2
+    return 1
+  }
+  _service_ids=$(printf '%s\n%s\n' "$_container_ids" "$_service_label_ids" | awk 'NF && !seen[$0]++')
+  _service_count=$(printf '%s\n' "$_service_ids" | awk 'NF { count++ } END { print count + 0 }')
+  _service_only=$(printf '%s\n' "$_service_ids" | awk 'NF { print; exit }')
+  if [ "$_service_count" -ne 1 ] || [ "$_service_only" != "$_container_id" ]; then
+    echo "❌ 检测到额外或漂移的同 project/service app 容器，拒绝继续恢复。" >&2
+    echo "   Captured/current: $_container_id" >&2
+    printf '   Candidate: %s\n' $_service_ids >&2
+    return 1
   fi
 
   # 后续锁、marker、app.db 操作只使用已经核验过的物理绝对路径，避免 symlink 在校验后换靶。
@@ -306,6 +636,48 @@ validate_compose_data_bind() {
   fi
   MARKER="$DATA_DIR/.upgrade-in-progress"
   DB="$DATA_DIR/app.db"
+  RESTORE_CONTAINER_ID="$_container_id"
+  RESTORE_DATA_IDENTITY="$_data_identity"
+  RESTORE_COMPOSE_DATA_ABS="$_compose_data_abs"
+  RESTORE_CONTAINER_DATA_ABS="$_container_data_abs"
+  RESTORE_CONTAINER_IMAGE="$_container_image"
+  RESTORE_COMPOSE_PROJECT="$_compose_project"
+  RESTORE_COMPOSE_SERVICE="$_compose_service"
+  RESTORE_COMPOSE_CONFIG_HASH="$_compose_config_hash"
+}
+
+verify_restore_identity() {
+  _phase="$1"
+  if validate_compose_data_bind; then
+    return 0
+  fi
+  IDENTITY_DRIFTED=1
+  echo "🛑 容器/挂载/DATA_DIR 身份在${_phase}发生漂移；拒绝继续，实例将保持停止。" >&2
+  return 1
+}
+
+verify_captured_container_stopped() {
+  _stopped_phase="$1"
+  _running=$(docker inspect --format '{{.State.Running}}' "$RESTORE_CONTAINER_ID" 2>/dev/null || true)
+  if [ "$_running" != "false" ]; then
+    IDENTITY_DRIFTED=1
+    echo "❌ 已捕获 app 容器在${_stopped_phase}并非停止态；拒绝让 app 接触已校验 stage。" >&2
+    return 1
+  fi
+}
+
+verify_captured_container_isolated() {
+  _isolated_phase="$1"
+  _isolated_network_ids=$(read_container_network_ids) || {
+    IDENTITY_DRIFTED=1
+    echo "❌ 无法在${_isolated_phase}确认已捕获 app 容器的网络集合；拒绝继续。" >&2
+    return 1
+  }
+  if printf '%s\n' "$_isolated_network_ids" | awk 'NF { found = 1 } END { exit found ? 0 : 1 }'; then
+    IDENTITY_DRIFTED=1
+    echo "❌ 已捕获 app 容器在${_isolated_phase}不再处于零网络隔离态；拒绝接受 readiness。" >&2
+    return 1
+  fi
 }
 
 # 借 app 镜像里的 node 跑一段只读/备份 JS。本脚本本就依赖 docker compose（下面要 stop/start），
@@ -362,6 +734,88 @@ CALLER_UID="$(id -u)"
 CALLER_GID="$(id -g)"
 if [ "$CALLER_UID" = "0" ]; then SUDO="${SUDO-}"; else SUDO="${SUDO-sudo}"; fi
 
+state_file_exists() {
+  $SUDO test -f "$1"
+}
+
+state_dir_exists() {
+  $SUDO test -d "$1"
+}
+
+state_path_exists() {
+  $SUDO test -e "$1"
+}
+
+state_symlink_exists() {
+  $SUDO test -L "$1"
+}
+
+read_restore_state() {
+  $SUDO cat -- "$1" 2>/dev/null || true
+}
+
+process_start_fingerprint() {
+  _fingerprint_pid="$1"
+  case "$_fingerprint_pid" in *[!0-9]*|'') return 1 ;; esac
+  LC_ALL=C ps -o lstart= -p "$_fingerprint_pid" 2>/dev/null | awk '
+    NF { count++; line = $0 }
+    END {
+      if (count != 1) exit 1
+      sub(/^[[:space:]]+/, "", line)
+      sub(/[[:space:]]+$/, "", line)
+      if (line == "") exit 1
+      print line
+    }
+  '
+}
+
+parse_accepted_state() {
+  _accepted_parsed=$(printf '%s\n' "$1" | awk '
+    NR == 1 && NF == 4 && $1 == "v2" {
+      print $2 "\t" $3 "\t" $4
+      valid = 1
+      next
+    }
+    { invalid = 1 }
+    END { if (NR != 1 || !valid || invalid) exit 1 }
+  ') || return 1
+  PARSED_ACCEPTED_CONTAINER_ID=$(printf '%s\n' "$_accepted_parsed" | awk -F '\t' '{ print $1 }')
+  PARSED_ACCEPTED_COMPOSE_PROJECT=$(printf '%s\n' "$_accepted_parsed" | awk -F '\t' '{ print $2 }')
+  PARSED_ACCEPTED_COMPOSE_SERVICE=$(printf '%s\n' "$_accepted_parsed" | awk -F '\t' '{ print $3 }')
+  printf '%s\n' "$PARSED_ACCEPTED_CONTAINER_ID" | grep -Eq '^[0-9a-f]{64}$' || return 1
+  printf '%s\n' "$PARSED_ACCEPTED_COMPOSE_PROJECT" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$' || return 1
+  printf '%s\n' "$PARSED_ACCEPTED_COMPOSE_SERVICE" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$' || return 1
+}
+
+write_restore_state() {
+  _state_file="$1"
+  _state_value="$2"
+  _state_dir=$(dirname -- "$_state_file") || return 1
+  _state_base=$(basename -- "$_state_file") || return 1
+  $SUDO sh -c '
+    set -eu
+    state_dir=$1
+    state_base=$2
+    state_value=$3
+    umask 077
+    state_tmp=$(mktemp "$state_dir/.${state_base}.tmp.XXXXXX")
+    trap '\''rm -f "$state_tmp"'\'' EXIT HUP INT TERM
+    printf "%s\n" "$state_value" > "$state_tmp"
+    chmod 600 "$state_tmp"
+    mv -- "$state_tmp" "$state_dir/$state_base"
+    trap - EXIT HUP INT TERM
+  ' restore-state "$_state_dir" "$_state_base" "$_state_value"
+}
+
+# Linux 上若宿主调用者与 app 都是 uid1000，且显式禁用 sudo，那么 DATA_DIR 内的同文件系统 stage
+# 无法与 app 隔离。macOS Docker Desktop 的宿主 uid 与 VM uid 映射不同，继续支持 SUDO= 路径。
+if [ "$(uname -s 2>/dev/null || true)" != "Darwin" ] && \
+   [ "$CALLER_UID" = "1000" ] && [ -z "$SUDO" ]; then
+  echo "❌ Linux uid1000 调用者不能用 SUDO= 运行 restore：app 也是 uid1000，无法隔离已校验 stage。" >&2
+  echo "   请保留默认 sudo（或直接以 root 运行），以便 stage 在 replace 前保持 app 不可写。" >&2
+  exit 2
+fi
+
 # 属主移交（-o 1000 -g 1000）：容器以 uid1000 跑，宿主文件须归 1000，否则容器起来写不了库。
 # 但**不能提权时 chown 必失败**——install 会中途报错、留下一个截断的目标文件。而这恰是
 # macOS/Windows Docker Desktop 的常态（uid 自动映射、本就无需 chown，见 docs §2 的跳过注）。
@@ -388,6 +842,211 @@ if [ -z "$SNAPSHOT" ]; then
   exit 2
 fi
 
+# 残锁必须早于 Compose 当前指针校验处理：上次 restore 若在 app-started 后被 SIGKILL，Compose 可能
+# 已被并发 recreate 到 B。此时先按锁内捕获的精确 A ID 停实例，再报告人工处理；不能先因 A/B 不匹配
+# 退出、把尚未 network-published 的实例继续留在线上。
+DATA_DIR=$(absdir "$DATA_DIR") || exit 1
+if [ "$BACKUP_DIR_IS_DEFAULT" = "1" ]; then BACKUP_DIR="$DATA_DIR/backups"; fi
+MARKER="$DATA_DIR/.upgrade-in-progress"
+DB="$DATA_DIR/app.db"
+EARLY_RESTORE_LOCK="$DATA_DIR/.restore-in-progress"
+EARLY_RESTORE_CONTROL="${DATA_DIR}.restore-control"
+EARLY_CONTROL_ACCEPTED_HANDOFF="${DATA_DIR}.restore-control-accepted"
+EARLY_PUBLISHED_COMPOSE_PROJECT=""
+EARLY_PUBLISHED_COMPOSE_SERVICE=""
+
+if state_symlink_exists "$EARLY_RESTORE_CONTROL" || state_symlink_exists "$EARLY_CONTROL_ACCEPTED_HANDOFF"; then
+  echo "❌ host-only restore 控制路径不能是符号链接：$EARLY_RESTORE_CONTROL" >&2
+  exit 4
+fi
+
+early_restore_owner_is_live() {
+  _owner_pid=$(read_restore_state "$EARLY_RESTORE_CONTROL/owner-pid")
+  case "$_owner_pid" in *[!0-9]*|'') return 1 ;; esac
+  _owner_fingerprint=$(read_restore_state "$EARLY_RESTORE_CONTROL/owner-start-fingerprint")
+  [ -n "$_owner_fingerprint" ] || return 1
+  kill -0 "$_owner_pid" 2>/dev/null || return 1
+  _current_owner_fingerprint=$(process_start_fingerprint "$_owner_pid") || return 1
+  [ "$_current_owner_fingerprint" = "$_owner_fingerprint" ]
+}
+
+container_absence_is_confirmed() {
+  _absent_target="$1"
+  _absent_matches=$(docker ps -a -q --no-trunc --filter "id=$_absent_target" 2>/dev/null) || return 1
+  ! printf '%s\n' "$_absent_matches" | awk 'NF { found = 1 } END { exit found ? 0 : 1 }'
+}
+
+early_restore_is_published() {
+  EARLY_PUBLISHED_CONTAINER_ID=""
+  EARLY_PUBLISHED_COMPOSE_PROJECT=""
+  EARLY_PUBLISHED_COMPOSE_SERVICE=""
+  if state_file_exists "$EARLY_CONTROL_ACCEPTED_HANDOFF"; then
+    _published_handoff=$(read_restore_state "$EARLY_CONTROL_ACCEPTED_HANDOFF")
+    parse_accepted_state "$_published_handoff" || return 1
+  else
+    state_file_exists "$EARLY_RESTORE_CONTROL/ready-accepted" || return 1
+    state_file_exists "$EARLY_RESTORE_CONTROL/network-published" || return 1
+    _published_accepted=$(read_restore_state "$EARLY_RESTORE_CONTROL/ready-accepted")
+    _published_network=$(read_restore_state "$EARLY_RESTORE_CONTROL/network-published")
+    [ "$_published_accepted" = "$_published_network" ] || return 1
+    parse_accepted_state "$_published_accepted" || return 1
+  fi
+  EARLY_PUBLISHED_CONTAINER_ID="$PARSED_ACCEPTED_CONTAINER_ID"
+  EARLY_PUBLISHED_COMPOSE_PROJECT="$PARSED_ACCEPTED_COMPOSE_PROJECT"
+  EARLY_PUBLISHED_COMPOSE_SERVICE="$PARSED_ACCEPTED_COMPOSE_SERVICE"
+  if state_file_exists "$EARLY_RESTORE_CONTROL/container-id"; then
+    [ "$(read_restore_state "$EARLY_RESTORE_CONTROL/container-id")" = "$EARLY_PUBLISHED_CONTAINER_ID" ] || return 1
+  fi
+}
+
+early_stop_and_isolate() {
+  _early_target="$1"
+  [ -n "$_early_target" ] || return 1
+  if ! docker inspect "$_early_target" >/dev/null 2>&1; then
+    if container_absence_is_confirmed "$_early_target"; then
+      return 0
+    fi
+    echo "❌ 无法通过 Docker inspect 确认容器状态：$_early_target" >&2
+    return 1
+  fi
+  docker stop "$_early_target" >/dev/null 2>&1 || true
+  [ "$(docker inspect --format '{{.State.Running}}' "$_early_target" 2>/dev/null || true)" = "false" ] || return 1
+  _early_network_ids=$(docker inspect --format \
+    '{{range $settings := .NetworkSettings.Networks}}{{printf "%s\n" $settings.NetworkID}}{{end}}' \
+    "$_early_target" 2>/dev/null) || return 1
+  for _early_network_id in $_early_network_ids; do
+    docker network disconnect -f "$_early_network_id" "$_early_target" >/dev/null 2>&1 || true
+  done
+  _early_remaining=$(docker inspect --format \
+    '{{range $settings := .NetworkSettings.Networks}}{{printf "%s\n" $settings.NetworkID}}{{end}}' \
+    "$_early_target" 2>/dev/null) || return 1
+  ! printf '%s\n' "$_early_remaining" | awk 'NF { found = 1 } END { exit found ? 0 : 1 }'
+}
+
+early_restore_service_container_ids() {
+  _early_project=$(read_restore_state "$EARLY_RESTORE_CONTROL/compose-project")
+  _early_service=$(read_restore_state "$EARLY_RESTORE_CONTROL/compose-service")
+  if ! printf '%s\n' "$_early_project" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$' || \
+     ! printf '%s\n' "$_early_service" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$'; then
+    _early_project="$EARLY_PUBLISHED_COMPOSE_PROJECT"
+    _early_service="$EARLY_PUBLISHED_COMPOSE_SERVICE"
+  fi
+  _early_label_ids=""
+  if printf '%s\n' "$_early_project" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$' && \
+     printf '%s\n' "$_early_service" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$'; then
+    _early_label_ids=$(docker ps -a --no-trunc -q \
+      --filter "label=com.docker.compose.project=$_early_project" \
+      --filter "label=com.docker.compose.service=$_early_service" \
+      --filter "label=com.docker.compose.oneoff=False" 2>/dev/null) || return 1
+  fi
+  _early_compose_ids=$(docker compose ps --all --no-trunc -q app 2>/dev/null) || return 1
+  printf '%s\n%s\n' "$_early_label_ids" "$_early_compose_ids" | awk 'NF && !seen[$0]++'
+}
+
+persist_early_published_ambiguity() {
+  if ! state_dir_exists "$EARLY_RESTORE_CONTROL"; then
+    if state_path_exists "$EARLY_RESTORE_CONTROL" || state_symlink_exists "$EARLY_RESTORE_CONTROL"; then
+      return 1
+    fi
+    $SUDO mkdir -m 700 "$EARLY_RESTORE_CONTROL" || return 1
+  fi
+  $SUDO chmod 700 "$EARLY_RESTORE_CONTROL" || return 1
+  write_restore_state \
+    "$EARLY_RESTORE_CONTROL/ambiguous-publication" \
+    "v2 $EARLY_PUBLISHED_CONTAINER_ID $EARLY_PUBLISHED_COMPOSE_PROJECT $EARLY_PUBLISHED_COMPOSE_SERVICE"
+}
+
+early_unpublished_restore_requires_containment() {
+  state_file_exists "$EARLY_RESTORE_CONTROL/ready-accepted" || \
+    state_file_exists "$EARLY_RESTORE_CONTROL/networks-reconnecting" || \
+    state_file_exists "$EARLY_RESTORE_CONTROL/ambiguous-publication" || \
+    state_file_exists "$EARLY_RESTORE_CONTROL/publication-failed" || \
+    state_file_exists "$EARLY_RESTORE_CONTROL/app-started" || \
+    state_file_exists "$EARLY_RESTORE_CONTROL/networks-isolated" || \
+    state_file_exists "$EARLY_RESTORE_CONTROL/sidecars-clean" || \
+    state_file_exists "$EARLY_RESTORE_CONTROL/upgrade-marker-clean" || \
+    { state_file_exists "$EARLY_RESTORE_CONTROL/replace-armed" && \
+      ! state_path_exists "$EARLY_RESTORE_LOCK/snapshot.db"; }
+}
+
+if state_path_exists "$EARLY_RESTORE_CONTROL" || state_file_exists "$EARLY_CONTROL_ACCEPTED_HANDOFF" || \
+   state_dir_exists "$EARLY_RESTORE_LOCK"; then
+  echo "🛑 已有另一个 restore 或上次异常中断的状态锁：$EARLY_RESTORE_LOCK" >&2
+  if early_restore_is_published; then
+    _published_cleanup_failed=0
+    _published_container_exists=1
+    if ! docker inspect "$EARLY_PUBLISHED_CONTAINER_ID" >/dev/null 2>&1; then
+      if container_absence_is_confirmed "$EARLY_PUBLISHED_CONTAINER_ID"; then
+        _published_container_exists=0
+      else
+        _published_cleanup_failed=1
+      fi
+    fi
+    _published_candidate_ids=$(early_restore_service_container_ids) || _published_cleanup_failed=1
+    for _published_candidate_id in $_published_candidate_ids; do
+      [ "$_published_candidate_id" = "$EARLY_PUBLISHED_CONTAINER_ID" ] && continue
+      early_stop_and_isolate "$_published_candidate_id" || _published_cleanup_failed=1
+    done
+    if [ "$_published_cleanup_failed" = "0" ]; then
+      if [ "$_published_container_exists" = "1" ]; then
+        echo "   状态显示：readiness 与 network-published 已确认；保留 exact 已验收实例，并停止/隔离其他 service 候选。" >&2
+      else
+        echo "   状态显示：已验收 exact 容器已不存在；其他未验收 service 候选已停止/隔离。" >&2
+      fi
+    else
+      if ! persist_early_published_ambiguity; then
+        echo "   ❌ 无法把 published 残锁的不确定状态持久化到 host-only control。" >&2
+      fi
+      echo "   ❌ 已发布残锁的 Docker 状态无法完整确认；请立即核对 exact 与替代实例。" >&2
+    fi
+  elif early_restore_owner_is_live; then
+    echo "   状态显示：锁内 owner PID 仍存活；按并发 restore 处理，不干扰其容器。" >&2
+  elif early_unpublished_restore_requires_containment; then
+    _stale_stop_failed=0
+    _stale_container_id=$(read_restore_state "$EARLY_RESTORE_CONTROL/container-id")
+    if printf '%s\n' "$_stale_container_id" | grep -Eq '^[0-9a-f]{64}$'; then
+      early_stop_and_isolate "$_stale_container_id" || _stale_stop_failed=1
+    else
+      _stale_stop_failed=1
+    fi
+    _stale_current_ids=$(early_restore_service_container_ids) || _stale_stop_failed=1
+    for _stale_current_id in $_stale_current_ids; do
+      [ -n "$_stale_current_id" ] || continue
+      if [ "$_stale_current_id" != "$_stale_container_id" ]; then
+        early_stop_and_isolate "$_stale_current_id" || _stale_stop_failed=1
+      fi
+    done
+    if [ "$_stale_stop_failed" = "0" ]; then
+      if state_file_exists "$EARLY_RESTORE_CONTROL/ready-accepted"; then
+        if state_file_exists "$EARLY_RESTORE_CONTROL/ambiguous-publication"; then
+          echo "   状态显示：readiness 已接受但上次网络发布结果不明；已精确停止并撤回当前 endpoint。" >&2
+        elif state_file_exists "$EARLY_RESTORE_CONTROL/networks-reconnecting"; then
+          echo "   状态显示：readiness 已接受但 network-published 未提交；已精确停止并隔离实例。" >&2
+        else
+          echo "   状态显示：readiness 已接受但尚未发布网络；已按锁内精确 ID 停止并隔离实例。" >&2
+        fi
+      elif state_file_exists "$EARLY_RESTORE_CONTROL/sidecars-clean" || \
+           state_file_exists "$EARLY_RESTORE_CONTROL/upgrade-marker-clean" || \
+           { state_file_exists "$EARLY_RESTORE_CONTROL/replace-armed" && \
+             ! state_path_exists "$EARLY_RESTORE_LOCK/snapshot.db"; }; then
+        echo "   状态显示：数据库已替换但 app 尚未验收；已按锁内精确 ID 停止并隔离实例。" >&2
+      else
+        echo "   状态显示：app 曾启动或可能启动但尚未接受；已按锁内精确 ID 停止并隔离实例。" >&2
+      fi
+    else
+      echo "   ❌ 无法确认所有未发布实例均已停止/隔离；请立即检查 Docker 状态。" >&2
+    fi
+  elif state_file_exists "$EARLY_RESTORE_CONTROL/replace-armed" && ! state_path_exists "$EARLY_RESTORE_LOCK/snapshot.db"; then
+    echo "   状态显示：数据库可能已替换，但旧 WAL/SHM 与后续阶段尚待确认；保持 app 停止。" >&2
+  elif state_file_exists "$EARLY_RESTORE_CONTROL/replace-armed"; then
+    echo "   状态显示：替换已武装但私有 stage 仍在，数据库大概率尚未替换；仍需人工核对。" >&2
+  else
+    echo "   状态显示：中断发生在 app 启动前；未干扰可能仍在执行的 restore 进程。" >&2
+  fi
+  echo "   restore 锁与阶段证据保持原样，请核对数据库/日志后人工处置。" >&2
+  exit 4
+fi
+
 validate_compose_data_bind
 
 [ -f "$SNAPSHOT" ] || { echo "❌ 快照不存在：$SNAPSHOT" >&2; exit 1; }
@@ -404,18 +1063,20 @@ fi
 
 # 🔴 分叉守卫（docs §5.2）：标记在＝上次升级没走完。此时若直接 start，新镜像 entrypoint 见 schema
 #    落后会拿刚还原的旧库重跑同一个失败迁移，回滚白做。旧代码/镜像只能先 build/pull 并 create
-#    为停止态；数据库恢复完成前严禁 up/start。当前安全 restore 脚本还要先复制到 checkout 外保留。
+#    为停止态；数据库恢复完成前严禁 up/start。当前安全 restore.sh 必须先复制到
+#    checkout 外保留。
 if [ -f "$MARKER" ] && [ "$AFTER_ROLLBACK" -eq 0 ]; then
   cat >&2 <<EOF
 🛑 检测到未完结的升级标记：$MARKER
    直接恢复会白做：新镜像启动时见 schema 落后，会拿还原后的旧库重跑同一个失败迁移。
    正确顺序：
-     1) RECOVERY_SH="\$(mktemp)"; cp "$0" "\$RECOVERY_SH"; chmod 700 "\$RECOVERY_SH"
+     1) RECOVERY_SH="\$(mktemp)"; install -m 700 "$0" "\$RECOVERY_SH"
      2) docker compose stop app
      3) 把代码/镜像退回旧版本（git checkout <旧提交/tag>，或改 compose 切回旧镜像 tag）
      4) docker compose build app
      5) docker compose create --force-recreate app   # 只重建为停止态，绝不运行 entrypoint
-     6) "\$RECOVERY_SH" --after-image-rollback <升级前快照路径> && rm -f "\$RECOVERY_SH"
+     6) "\$RECOVERY_SH" --after-image-rollback <升级前快照路径>
+        成功后：rm -f "\$RECOVERY_SH"
    🔴 第 6 步前禁止 docker compose up/start；否则旧服务会在旧库恢复前启动并可能写入中间 schema。
 EOF
   exit 3
@@ -424,81 +1085,368 @@ fi
 echo "→ 恢复源：$SNAPSHOT"
 echo "→ 目标库：$DB"
 
-# 🔴 restore 互斥 + 进程间状态：所有校验、替换与信号收尾都围绕 DATA_DIR 内的私有锁目录。
+# 🔴 restore 互斥 + 进程间状态分成两层：DATA_DIR 内只保留停机期同文件系统 stage；
+# 真正的身份、隔离、accepted 与 network-published 证据位于未挂进 app 的宿主 sibling
+# 控制目录。Compose 与容器所有 bind source 都会先检查，不能包含该 sibling。
 #
 # 1) `mkdir` 是跨进程原子的：同一 DATA_DIR 同时只能有一个 restore，避免两个进程共享临时恢复源 /
 #    pre-restore.tmp 后互相覆盖、rename，进而破坏“stage 是否仍存在”的状态判据。
-# 2) 源快照先 install 为锁目录里的 0600 `snapshot.db`，**校验和最终 mv 使用同一份私有副本**：
-#    原始路径（含 symlink 或普通文件）在校验后被替换，也不会变成“校验 A、安装 B”。
-# 3) `replace-armed` 在最终 mv 前创建；它与 snapshot.db 是否仍存在共同编码进程可见阶段：
+# 2) 源快照先固化到 host-only 控制目录并校验；停机后再复制到 DATA_DIR 内 `snapshot.db`，用 cmp +
+#    header + quick_check 二次确认。app 运行时看不到预校验副本，本地 stage 在 mv 前也不交给 uid1000。
+# 3) `replace-armed` 在最终 mv 前创建；它与本地 snapshot.db 是否仍存在共同编码进程可见阶段：
 #      armed + stage 存在   → mv 未成功，当前 DB/WAL 必须保留；
 #      armed + stage 不存在 → mv 已成功，旧 WAL/SHM 必须清掉后才能 start。
 #    因为状态在文件系统 namespace 里，进程被 SIGKILL 后锁目录仍会阻止下一次 restore，并给出
 #    人工恢复线索。这里没有 fsync 屏障，**不承诺宿主断电后的元数据持久顺序**；见 docs §5.2。
 RESTORE_LOCK="$DATA_DIR/.restore-in-progress"
+RESTORE_CONTROL_LOCK="${DATA_DIR}.restore-control"
+RESTORE_CONTROL_ACCEPTED_HANDOFF="${DATA_DIR}.restore-control-accepted"
+RESTORE_VALIDATED_SNAPSHOT="$RESTORE_CONTROL_LOCK/snapshot.db"
+RESTORE_CONTROL_ARMED_MARKER="$RESTORE_CONTROL_LOCK/replace-armed"
+RESTORE_CONTROL_SIDECARS_CLEAN_MARKER="$RESTORE_CONTROL_LOCK/sidecars-clean"
+RESTORE_CONTROL_UPGRADE_MARKER_CLEAN_MARKER="$RESTORE_CONTROL_LOCK/upgrade-marker-clean"
+RESTORE_CONTROL_APP_STARTED_MARKER="$RESTORE_CONTROL_LOCK/app-started"
+RESTORE_CONTROL_READY_BODY="$RESTORE_CONTROL_LOCK/ready-body"
+RESTORE_CONTROL_NETWORKS_FILE="$RESTORE_CONTROL_LOCK/container-networks"
+RESTORE_CONTROL_NETWORKS_ISOLATED_MARKER="$RESTORE_CONTROL_LOCK/networks-isolated"
+RESTORE_CONTROL_NETWORKS_RECONNECTING_MARKER="$RESTORE_CONTROL_LOCK/networks-reconnecting"
+RESTORE_CONTROL_NETWORK_PUBLISHED="$RESTORE_CONTROL_LOCK/network-published"
+RESTORE_CONTROL_AMBIGUOUS_PUBLICATION="$RESTORE_CONTROL_LOCK/ambiguous-publication"
+RESTORE_CONTROL_PUBLICATION_FAILED="$RESTORE_CONTROL_LOCK/publication-failed"
 RESTORE_STAGE="$RESTORE_LOCK/snapshot.db"
-RESTORE_ARMED_MARKER="$RESTORE_LOCK/replace-armed"
-RESTORE_SIDECARS_CLEAN_MARKER="$RESTORE_LOCK/sidecars-clean"
-RESTORE_UPGRADE_MARKER_CLEAN_MARKER="$RESTORE_LOCK/upgrade-marker-clean"
-RESTORE_APP_STARTED_MARKER="$RESTORE_LOCK/app-started"
-RESTORE_READY_ACCEPTED_MARKER="$RESTORE_LOCK/ready-accepted"
-RESTORE_READY_BODY="$RESTORE_LOCK/ready-body"
+RESTORE_CONTROL_READY_ACCEPTED="$RESTORE_CONTROL_LOCK/ready-accepted"
+RESTORE_CONTROL_OWNER_PID_FILE="$RESTORE_CONTROL_LOCK/owner-pid"
+RESTORE_CONTROL_OWNER_START_FINGERPRINT_FILE="$RESTORE_CONTROL_LOCK/owner-start-fingerprint"
+RESTORE_CONTROL_CONTAINER_ID_FILE="$RESTORE_CONTROL_LOCK/container-id"
+RESTORE_CONTROL_COMPOSE_PROJECT_FILE="$RESTORE_CONTROL_LOCK/compose-project"
+RESTORE_CONTROL_COMPOSE_SERVICE_FILE="$RESTORE_CONTROL_LOCK/compose-service"
+RESTORE_CONTROL_DATA_IDENTITY_FILE="$RESTORE_CONTROL_LOCK/data-identity"
+RESTORE_CONTROL_CONTAINER_SOURCE_FILE="$RESTORE_CONTROL_LOCK/container-data-source"
+RESTORE_CONTROL_CONTAINER_IMAGE_FILE="$RESTORE_CONTROL_LOCK/container-image"
+RESTORE_CONTROL_CONTAINER_WAS_RUNNING_FILE="$RESTORE_CONTROL_LOCK/container-was-running"
 PRE_RESTORE_TMP="$BACKUP_DIR/pre-restore.db.tmp"
+READY_BODY_TMP=""
 LOCK_HELD=0
 STOP_ATTEMPTED=0
-READY_ACCEPTED=0
+RELEASE_FAILED=0
 
-release_restore_lock() {
-  [ "$LOCK_HELD" = "1" ] || return 0
-  if [ ! -d "$RESTORE_LOCK" ]; then
-    LOCK_HELD=0
+accepted_state_value() {
+  printf 'v2 %s %s %s\n' \
+    "$RESTORE_CONTAINER_ID" "$RESTORE_COMPOSE_PROJECT" "$RESTORE_COMPOSE_SERVICE"
+}
+
+restore_is_published() {
+  _published_expected=$(accepted_state_value)
+  if state_file_exists "$RESTORE_CONTROL_ACCEPTED_HANDOFF"; then
+    [ "$(read_restore_state "$RESTORE_CONTROL_ACCEPTED_HANDOFF")" = "$_published_expected" ]
+    return
+  fi
+  state_file_exists "$RESTORE_CONTROL_READY_ACCEPTED" || return 1
+  state_file_exists "$RESTORE_CONTROL_NETWORK_PUBLISHED" || return 1
+  [ "$(read_restore_state "$RESTORE_CONTROL_READY_ACCEPTED")" = "$_published_expected" ] || return 1
+  [ "$(read_restore_state "$RESTORE_CONTROL_NETWORK_PUBLISHED")" = "$_published_expected" ]
+}
+
+remove_restore_control_contents() {
+  $SUDO rm -f \
+    "$RESTORE_VALIDATED_SNAPSHOT" \
+    "$RESTORE_CONTROL_ARMED_MARKER" \
+    "$RESTORE_CONTROL_SIDECARS_CLEAN_MARKER" \
+    "$RESTORE_CONTROL_UPGRADE_MARKER_CLEAN_MARKER" \
+    "$RESTORE_CONTROL_APP_STARTED_MARKER" \
+    "$RESTORE_CONTROL_READY_BODY" \
+    "$RESTORE_CONTROL_NETWORKS_FILE" \
+    "$RESTORE_CONTROL_NETWORKS_ISOLATED_MARKER" \
+    "$RESTORE_CONTROL_NETWORKS_RECONNECTING_MARKER" \
+    "$RESTORE_CONTROL_NETWORK_PUBLISHED" \
+    "$RESTORE_CONTROL_AMBIGUOUS_PUBLICATION" \
+    "$RESTORE_CONTROL_PUBLICATION_FAILED" \
+    "$RESTORE_CONTROL_OWNER_PID_FILE" \
+    "$RESTORE_CONTROL_OWNER_START_FINGERPRINT_FILE" \
+    "$RESTORE_CONTROL_CONTAINER_ID_FILE" \
+    "$RESTORE_CONTROL_COMPOSE_PROJECT_FILE" \
+    "$RESTORE_CONTROL_COMPOSE_SERVICE_FILE" \
+    "$RESTORE_CONTROL_DATA_IDENTITY_FILE" \
+    "$RESTORE_CONTROL_CONTAINER_SOURCE_FILE" \
+    "$RESTORE_CONTROL_CONTAINER_IMAGE_FILE" \
+    "$RESTORE_CONTROL_CONTAINER_WAS_RUNNING_FILE" \
+    "$RESTORE_CONTROL_READY_ACCEPTED"
+}
+
+release_restore_control() {
+  if ! state_dir_exists "$RESTORE_CONTROL_LOCK"; then
     return 0
   fi
-  if ! $SUDO rm -f \
-    "$RESTORE_STAGE" \
-    "$RESTORE_ARMED_MARKER" \
-    "$RESTORE_SIDECARS_CLEAN_MARKER" \
-    "$RESTORE_UPGRADE_MARKER_CLEAN_MARKER" \
-    "$RESTORE_APP_STARTED_MARKER" \
-    "$RESTORE_READY_ACCEPTED_MARKER" \
-    "$RESTORE_READY_BODY"; then
-    echo "❌ 无法清理 restore 锁目录里的临时状态：$RESTORE_LOCK" >&2
+
+  _control_expected=$(accepted_state_value)
+  if state_file_exists "$RESTORE_CONTROL_READY_ACCEPTED" && state_file_exists "$RESTORE_CONTROL_ACCEPTED_HANDOFF"; then
+    echo "❌ trusted ready-accepted 与 control handoff 同时存在，拒绝释放控制锁。" >&2
+    return 1
+  fi
+  if ! restore_is_published; then
+    echo "❌ host-only 控制面尚未完成 network-published，拒绝释放。" >&2
+    return 1
+  fi
+  if state_file_exists "$RESTORE_CONTROL_READY_ACCEPTED"; then
+    if state_path_exists "$RESTORE_CONTROL_ACCEPTED_HANDOFF" || state_symlink_exists "$RESTORE_CONTROL_ACCEPTED_HANDOFF"; then
+      echo "❌ host-only accepted handoff 已存在，拒绝覆盖或移入未知目录。" >&2
+      return 1
+    fi
+    if ! $SUDO chmod 600 "$RESTORE_CONTROL_READY_ACCEPTED" || \
+       ! $SUDO mv -- "$RESTORE_CONTROL_READY_ACCEPTED" "$RESTORE_CONTROL_ACCEPTED_HANDOFF"; then
+      echo "❌ 无法把 trusted accepted 原子交接到 host-only handoff。" >&2
+      return 1
+    fi
+  elif [ "$(read_restore_state "$RESTORE_CONTROL_ACCEPTED_HANDOFF")" != "$_control_expected" ]; then
+    echo "❌ host-only accepted handoff 内容不匹配，拒绝释放。" >&2
+    return 1
+  fi
+
+  if ! remove_restore_control_contents; then
+    echo "❌ 无法清理 host-only restore 控制状态：$RESTORE_CONTROL_LOCK" >&2
+    return 1
+  fi
+  if ! $SUDO rmdir "$RESTORE_CONTROL_LOCK"; then
+    echo "❌ 无法释放 host-only restore 控制锁；trusted handoff/目录保留。" >&2
+    return 1
+  fi
+}
+
+discard_unreplaced_restore_control() {
+  [ "${1:-}" = "confirmed-unreplaced" ] || {
+    echo "❌ 缺少换库前状态证明，拒绝丢弃 restore 控制锁。" >&2
+    return 1
+  }
+  if ! state_dir_exists "$RESTORE_CONTROL_LOCK"; then
+    return 0
+  fi
+
+  # cleanup 已在删除 public stage **之前**用 armed+stage 判据固化 `_post_replace=0`。public stage 随后
+  # 被删除，不能在这里再次用“armed + stage absent”重算，否则会把我们自己的清理误判成 mv 已成功。
+  # 仍显式拒绝任何只可能出现在 post-replace/accepted/published 的阶段，避免未来误用本函数。
+  if restore_was_accepted || \
+     state_file_exists "$RESTORE_CONTROL_SIDECARS_CLEAN_MARKER" || \
+     state_file_exists "$RESTORE_CONTROL_UPGRADE_MARKER_CLEAN_MARKER" || \
+     state_file_exists "$RESTORE_CONTROL_APP_STARTED_MARKER" || \
+     state_file_exists "$RESTORE_CONTROL_NETWORKS_ISOLATED_MARKER" || \
+     state_file_exists "$RESTORE_CONTROL_NETWORKS_RECONNECTING_MARKER" || \
+     state_file_exists "$RESTORE_CONTROL_NETWORK_PUBLISHED" || \
+     state_file_exists "$RESTORE_CONTROL_ACCEPTED_HANDOFF"; then
+    echo "❌ restore 已进入换库或发布阶段，拒绝按未替换路径清理控制锁。" >&2
+    return 1
+  fi
+  if ! remove_restore_control_contents; then
+    echo "❌ 无法清理未替换 restore 的临时控制状态：$RESTORE_CONTROL_LOCK" >&2
+    return 1
+  fi
+  if ! $SUDO rmdir "$RESTORE_CONTROL_LOCK"; then
+    echo "❌ 无法释放未替换 restore 的 host-only 控制锁：$RESTORE_CONTROL_LOCK" >&2
+    return 1
+  fi
+}
+
+clear_restore_control_handoff() {
+  state_file_exists "$RESTORE_CONTROL_ACCEPTED_HANDOFF" || return 0
+  if ! $SUDO rm -f "$RESTORE_CONTROL_ACCEPTED_HANDOFF"; then
+    echo "❌ restore 已完成但无法清理 host-only accepted handoff；它会继续阻断下一次 restore。" >&2
+    return 1
+  fi
+}
+
+release_public_restore_lock() {
+  [ "$LOCK_HELD" = "1" ] || return 0
+  if ! state_dir_exists "$RESTORE_LOCK"; then
+    LOCK_HELD=0
+    return
+  fi
+
+  # public 目录只在捕获容器已确认停止时存在；app start 前清空并 rmdir。app 运行后 shell 不再
+  # 通过 DATA_DIR 下的 pathname 读写任何状态，所有授权/诊断均由 host-only control 承担。
+  if ! $SUDO rm -f "$RESTORE_STAGE"; then
+    echo "❌ 无法清理停机期 public restore stage：$RESTORE_LOCK" >&2
     return 1
   fi
   if ! $SUDO rmdir "$RESTORE_LOCK"; then
-    echo "❌ 无法释放 restore 锁：${RESTORE_LOCK}（请确认目录内无未知文件后人工处理）" >&2
+    echo "❌ 无法释放停机期 public restore stage：${RESTORE_LOCK}（请确认目录内无未知文件）" >&2
     return 1
   fi
   LOCK_HELD=0
 }
 
+release_restore_lock() {
+  release_public_restore_lock || return 1
+  release_restore_control || return 1
+  clear_restore_control_handoff
+}
+
 db_was_replaced() {
-  [ -f "$RESTORE_SIDECARS_CLEAN_MARKER" ] ||
-    [ -f "$RESTORE_UPGRADE_MARKER_CLEAN_MARKER" ] ||
-    [ -f "$RESTORE_APP_STARTED_MARKER" ] ||
-    [ -f "$RESTORE_READY_ACCEPTED_MARKER" ] ||
-    { [ -f "$RESTORE_ARMED_MARKER" ] && [ ! -e "$RESTORE_STAGE" ]; }
+  state_file_exists "$RESTORE_CONTROL_SIDECARS_CLEAN_MARKER" ||
+    state_file_exists "$RESTORE_CONTROL_UPGRADE_MARKER_CLEAN_MARKER" ||
+    state_file_exists "$RESTORE_CONTROL_APP_STARTED_MARKER" ||
+    state_file_exists "$RESTORE_CONTROL_READY_ACCEPTED" ||
+    state_file_exists "$RESTORE_CONTROL_ACCEPTED_HANDOFF" ||
+    { state_file_exists "$RESTORE_CONTROL_ARMED_MARKER" && ! state_path_exists "$RESTORE_STAGE"; }
 }
 
 sidecars_are_clean() {
-  [ -f "$RESTORE_SIDECARS_CLEAN_MARKER" ] ||
-    [ -f "$RESTORE_UPGRADE_MARKER_CLEAN_MARKER" ] ||
-    [ -f "$RESTORE_APP_STARTED_MARKER" ] ||
-    [ -f "$RESTORE_READY_ACCEPTED_MARKER" ]
+  state_file_exists "$RESTORE_CONTROL_SIDECARS_CLEAN_MARKER" ||
+    state_file_exists "$RESTORE_CONTROL_UPGRADE_MARKER_CLEAN_MARKER" ||
+    state_file_exists "$RESTORE_CONTROL_APP_STARTED_MARKER" ||
+    state_file_exists "$RESTORE_CONTROL_READY_ACCEPTED"
 }
 
 restore_was_accepted() {
-  [ "$READY_ACCEPTED" = "1" ] || [ -f "$RESTORE_READY_ACCEPTED_MARKER" ]
+  state_file_exists "$RESTORE_CONTROL_READY_ACCEPTED" ||
+    state_file_exists "$RESTORE_CONTROL_ACCEPTED_HANDOFF"
 }
 
-mark_restore_phase() {
-  $SUDO install -m 600 /dev/null "$1"
+validate_replayable_container_networks() {
+  _network_endpoint_details=$(docker inspect --format \
+    '{{range $name, $settings := .NetworkSettings.Networks}}{{with $settings.IPAMConfig}}{{if .IPv4Address}}{{printf "%s\tstatic-ipv4\n" $name}}{{end}}{{if .IPv6Address}}{{printf "%s\tstatic-ipv6\n" $name}}{{end}}{{with .LinkLocalIPs}}{{printf "%s\tlink-local\n" $name}}{{end}}{{end}}{{with $settings.DriverOpts}}{{printf "%s\tdriver-opts\n" $name}}{{end}}{{with $settings.Links}}{{printf "%s\tlinks\n" $name}}{{end}}{{if ne $settings.GwPriority 0}}{{printf "%s\tgw-priority\t%d\n" $name $settings.GwPriority}}{{end}}{{end}}' \
+    "$RESTORE_CONTAINER_ID" 2>/dev/null) || {
+    echo "❌ 无法核对已捕获 app 容器的网络端点配置。" >&2
+    return 1
+  }
+
+  # 运行态 endpoint MAC 是 Docker 动态属性，不是恢复身份；方案 A 只固化 NetworkID/name/aliases。
+  # 显式 MAC 已在 Compose 配置层拒绝，这里继续拒绝其他无法无损重放的端点参数。
+  if printf '%s\n' "$_network_endpoint_details" | awk 'NF { found = 1 } END { exit found ? 0 : 1 }'; then
+    echo "❌ app 容器网络含 restore 无法无损重放的静态/自定义端点配置：" >&2
+    printf '   %s\n' "$_network_endpoint_details" >&2
+    echo "   当前恢复器只支持动态 endpoint 与 network aliases；已在停机前 fail-closed。" >&2
+    return 1
+  fi
+}
+
+read_container_network_manifest() {
+  _manifest_rows=$(docker inspect --format \
+    '{{range $name, $settings := .NetworkSettings.Networks}}{{printf "XJM_NETWORK_RECORD\t%s\t%s" $name $settings.NetworkID}}{{range $settings.Aliases}}{{printf "\t%s" .}}{{end}}{{printf "\n"}}{{end}}' \
+    "$RESTORE_CONTAINER_ID" 2>/dev/null) || return 1
+  printf '%s\n' "$_manifest_rows" | awk -F '\t' '
+    NF {
+      if ($1 != "XJM_NETWORK_RECORD" || NF < 3) exit 1
+      if ($2 == "" || $2 !~ /^[A-Za-z0-9_.-]+$/) exit 1
+      if (length($3) != 64 || $3 ~ /[^0-9a-f]/) exit 1
+      for (i = 4; i <= NF; i++) {
+        if ($i == "" || $i !~ /^[A-Za-z0-9_.-]+$/) exit 1
+      }
+      for (i = 2; i <= NF; i++) {
+        printf "%s%s", (i == 2 ? "" : "\t"), $i
+      }
+      printf "\n"
+      found = 1
+    }
+    END { if (!found) exit 1 }
+  '
+}
+
+read_container_network_ids() {
+  _network_id_rows=$(docker inspect --format \
+    '{{range $settings := .NetworkSettings.Networks}}{{printf "XJM_NETWORK_ID\t%s\n" $settings.NetworkID}}{{end}}' \
+    "$RESTORE_CONTAINER_ID" 2>/dev/null) || return 1
+  printf '%s\n' "$_network_id_rows" | awk -F '\t' '
+    NF {
+      if ($1 != "XJM_NETWORK_ID" || NF != 2 || length($2) != 64 || $2 ~ /[^0-9a-f]/) exit 1
+      print $2
+    }
+  '
+}
+
+capture_container_networks() {
+  validate_replayable_container_networks || return 1
+  _network_manifest=$(read_container_network_manifest) || {
+    echo "❌ 无法读取已捕获 app 容器的网络身份。" >&2
+    return 1
+  }
+  write_restore_state "$RESTORE_CONTROL_NETWORKS_FILE" "$_network_manifest" || return 1
+}
+
+disconnect_container_networks() {
+  _disconnect_force="${1:-0}"
+  state_file_exists "$RESTORE_CONTROL_NETWORKS_FILE" || return 1
+  _network_manifest=$(read_restore_state "$RESTORE_CONTROL_NETWORKS_FILE")
+  _captured_ids=$(printf '%s\n' "$_network_manifest" | awk -F '\t' 'NF { print $2 }')
+  _current_ids=$(read_container_network_ids) || return 1
+  _disconnect_ids=$(printf '%s\n%s\n' "$_captured_ids" "$_current_ids" | awk 'NF' | sort -u)
+  for _network_id in $_disconnect_ids; do
+    if [ "$_disconnect_force" = "1" ]; then
+      docker network disconnect -f "$_network_id" "$RESTORE_CONTAINER_ID" >/dev/null 2>&1 || true
+    else
+      docker network disconnect "$_network_id" "$RESTORE_CONTAINER_ID" >/dev/null 2>&1 || true
+    fi
+  done
+  _remaining_ids=$(read_container_network_ids) || return 1
+  if printf '%s\n' "$_remaining_ids" | awk 'NF { found = 1 } END { exit found ? 0 : 1 }'; then
+    echo "❌ 无法确认已捕获容器完全断网。" >&2
+    return 1
+  fi
+  write_restore_state "$RESTORE_CONTROL_NETWORKS_ISOLATED_MARKER" "" || return 1
+}
+
+reconnect_container_networks() {
+  state_file_exists "$RESTORE_CONTROL_NETWORKS_FILE" || return 1
+  _network_manifest=$(read_restore_state "$RESTORE_CONTROL_NETWORKS_FILE")
+  while IFS= read -r _network_line; do
+    _network_name=$(printf '%s\n' "$_network_line" | awk -F '\t' '{ print $1 }')
+    _network_id=$(printf '%s\n' "$_network_line" | awk -F '\t' '{ print $2 }')
+    [ -n "$_network_name" ] || continue
+    set -- docker network connect
+    _network_aliases=$(printf '%s\n' "$_network_line" | awk -F '\t' '{ for (i = 3; i <= NF; i++) print $i }')
+    for _network_alias in $_network_aliases; do
+      set -- "$@" --alias "$_network_alias"
+    done
+    set -- "$@" "$_network_id" "$RESTORE_CONTAINER_ID"
+    "$@" >/dev/null || return 1
+  done <<EOF
+$_network_manifest
+EOF
+  verify_container_network_manifest "网络重连后"
+}
+
+normalize_network_manifest() {
+  awk -F '\t' '
+    NF {
+      print "N\t" $1 "\t" $2
+      for (i = 3; i <= NF; i++) print "A\t" $1 "\t" $i
+    }
+  ' | sort
+}
+
+verify_container_network_manifest() {
+  _manifest_phase="$1"
+  _actual_manifest=$(read_container_network_manifest) || {
+    echo "❌ ${_manifest_phase}无法读取 endpoint 身份。" >&2
+    return 1
+  }
+  _expected_manifest=$(read_restore_state "$RESTORE_CONTROL_NETWORKS_FILE")
+  _expected_normalized=$(printf '%s\n' "$_expected_manifest" | normalize_network_manifest)
+  _actual_normalized=$(printf '%s\n' "$_actual_manifest" | normalize_network_manifest)
+  if [ "$_expected_normalized" != "$_actual_normalized" ]; then
+    echo "❌ ${_manifest_phase}的 NetworkID/name/aliases 与捕获清单不一致。" >&2
+    return 1
+  fi
+}
+
+probe_captured_readiness() {
+  _probe_timeout="$1"
+  docker exec --user 0:0 "$RESTORE_CONTAINER_ID" node -e '
+    const timeoutMs = Number(process.argv[1]) * 1000
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), timeoutMs)
+    fetch("http://127.0.0.1:3000/api/ready", { redirect: "manual", signal: controller.signal })
+      .then(async (response) => {
+        process.stdout.write(Buffer.from(await response.arrayBuffer()))
+        if (response.status !== 200) process.exitCode = 8
+      })
+      .catch(() => { process.exitCode = 7 })
+      .finally(() => clearTimeout(timer))
+  ' "$_probe_timeout"
 }
 
 ready_body_is_ok() {
   # body 直接从 0600 文件按原始字节读取，绝不经过无法保存 NUL 的 shell 变量。固定响应契约只有
   # 单字段对象 {"ok":true}；token 间只允许 JSON 的 space/tab/CR/LF，任何额外字节都拒绝。
-  LC_ALL=C od -An -v -t u1 "$1" 2>/dev/null | awk '
+  LC_ALL=C $SUDO od -An -v -t u1 "$1" 2>/dev/null | awk '
     function is_ws(byte) {
       return byte == 32 || byte == 9 || byte == 10 || byte == 13
     }
@@ -536,20 +1484,96 @@ clean_replaced_sidecars() {
   # sidecars-clean 或更晚阶段存在时，app 可能已为新库创建自己的 WAL；绝不能重复删除。
   sidecars_are_clean && return 0
   # armed 不存在＝尚未进入替换，绝不能碰当前库可能承载已提交数据的 WAL。
-  [ -f "$RESTORE_ARMED_MARKER" ] || return 0
+  state_file_exists "$RESTORE_CONTROL_ARMED_MARKER" || return 0
   # stage 仍在＝最终 mv 尚未成功，app.db/WAL 仍属于当前库，必须原样保留。
-  [ ! -e "$RESTORE_STAGE" ] || return 0
+  ! state_path_exists "$RESTORE_STAGE" || return 0
   if ! $SUDO rm -f "$DB-wal" "$DB-shm"; then
     echo "❌ 数据库已替换，但无法删除旧 WAL/SHM；为防混库，拒绝重启 app。" >&2
     echo "   请保持 app 停止，修复权限后删除：$DB-wal $DB-shm。" >&2
     return 1
   fi
-  # 用同目录原子 rename 把 armed 推进为 sidecars-clean，避免“旧 sidecar 已删但阶段尚未记录”的
-  # 信号窗口。信号落在 mv 内部时，trap 看到的必然是 armed 或 sidecars-clean 之一。
-  if ! $SUDO mv -- "$RESTORE_ARMED_MARKER" "$RESTORE_SIDECARS_CLEAN_MARKER"; then
-    echo "❌ 旧 WAL/SHM 已删除，但无法记录 sidecars-clean 阶段；拒绝重启 app。" >&2
+  # host-only marker 在 app 不可见的目录内原子推进。信号若落在 sidecar 删除与
+  # marker rename 之间，app 仍未启动；cleanup 重复 rm -f 是幂等且不会碰新库 WAL。
+  if ! $SUDO mv -- "$RESTORE_CONTROL_ARMED_MARKER" "$RESTORE_CONTROL_SIDECARS_CLEAN_MARKER"; then
+    echo "❌ 旧 WAL/SHM 已删除，但无法推进 host-only sidecars-clean 阶段；拒绝重启 app。" >&2
     return 1
   fi
+}
+
+container_network_ids_for() {
+  docker inspect --format \
+    '{{range $settings := .NetworkSettings.Networks}}{{printf "%s\n" $settings.NetworkID}}{{end}}' \
+    "$1" 2>/dev/null
+}
+
+stop_and_isolate_container() {
+  _target_id="$1"
+  [ -n "$_target_id" ] || return 1
+  if ! docker inspect "$_target_id" >/dev/null 2>&1; then
+    if container_absence_is_confirmed "$_target_id"; then
+      return 0
+    fi
+    echo "❌ 无法通过 Docker inspect 确认容器状态：$_target_id" >&2
+    return 1
+  fi
+  docker stop "$_target_id" >/dev/null 2>&1 || true
+  if [ "$(docker inspect --format '{{.State.Running}}' "$_target_id" 2>/dev/null || true)" != "false" ]; then
+    echo "❌ 无法确认容器已停止：$_target_id" >&2
+    return 1
+  fi
+  _target_network_ids=$(container_network_ids_for "$_target_id") || return 1
+  for _target_network_id in $_target_network_ids; do
+    docker network disconnect -f "$_target_network_id" "$_target_id" >/dev/null 2>&1 || true
+  done
+  _remaining_target_networks=$(container_network_ids_for "$_target_id") || return 1
+  if printf '%s\n' "$_remaining_target_networks" | awk 'NF { found = 1 } END { exit found ? 0 : 1 }'; then
+    echo "❌ 容器已停止，但无法确认其流量网络已撤回：$_target_id" >&2
+    return 1
+  fi
+}
+
+restore_service_container_ids() {
+  _label_ids=$(docker ps -a --no-trunc -q \
+    --filter "label=com.docker.compose.project=$RESTORE_COMPOSE_PROJECT" \
+    --filter "label=com.docker.compose.service=$RESTORE_COMPOSE_SERVICE" \
+    --filter "label=com.docker.compose.oneoff=False" 2>/dev/null) || {
+    echo "❌ 无法枚举同一 Compose project/service 的 app 容器；不能证明所有候选已收口。" >&2
+    return 1
+  }
+  _compose_ids=$(docker compose ps --all --no-trunc -q app 2>/dev/null) || {
+    echo "❌ 无法读取 Compose 当前 app 指针；不能证明所有候选已收口。" >&2
+    return 1
+  }
+  printf '%s\n%s\n' "$_label_ids" "$_compose_ids" | awk 'NF && !seen[$0]++'
+}
+
+stop_unpublished_restore_targets() {
+  _stop_failed=0
+  _service_ids=""
+  if ! _service_ids=$(restore_service_container_ids); then
+    _stop_failed=1
+  fi
+  _target_ids=$(printf '%s\n%s\n' "$RESTORE_CONTAINER_ID" "$_service_ids" | awk 'NF && !seen[$0]++')
+  for _target_id in $_target_ids; do
+    [ -n "$_target_id" ] || continue
+    if ! stop_and_isolate_container "$_target_id"; then
+      _stop_failed=1
+    fi
+  done
+  [ "$_stop_failed" = "0" ]
+}
+
+stop_drifted_extra_targets() {
+  _stop_failed=0
+  _service_ids=$(restore_service_container_ids) || return 1
+  for _target_id in $_service_ids; do
+    [ -n "$_target_id" ] || continue
+    [ "$_target_id" = "$RESTORE_CONTAINER_ID" ] && continue
+    if ! stop_and_isolate_container "$_target_id"; then
+      _stop_failed=1
+    fi
+  done
+  [ "$_stop_failed" = "0" ]
 }
 
 cleanup_restore() {
@@ -557,11 +1581,8 @@ cleanup_restore() {
   trap - EXIT INT TERM
   _keep_lock=0
   _post_replace=0
-  _accepted=0
 
-  if restore_was_accepted; then
-    _accepted=1
-  elif db_was_replaced; then
+  if db_was_replaced; then
     _post_replace=1
     if ! clean_replaced_sidecars; then
       _keep_lock=1
@@ -569,19 +1590,60 @@ cleanup_restore() {
     fi
   fi
 
-  if [ "$_post_replace" = "1" ]; then
+  if [ "$IDENTITY_DRIFTED" = "1" ]; then
+    _keep_lock=1
+    if restore_is_published; then
+      if ! stop_drifted_extra_targets; then
+        [ "$_exit_rc" -ne 0 ] || _exit_rc=1
+        write_restore_state "$RESTORE_CONTROL_AMBIGUOUS_PUBLICATION" "$(accepted_state_value)" || true
+        echo "🛑 无法完整枚举/收口已发布实例之外的 service 候选；发布身份状态不明。" >&2
+      fi
+      echo "🛑 restore 身份在 network-published 后漂移：已尝试停止未验收的替代实例，已验收实例与状态锁保留。" >&2
+    elif ! stop_unpublished_restore_targets; then
+      [ "$_exit_rc" -ne 0 ] || _exit_rc=1
+      write_restore_state "$RESTORE_CONTROL_AMBIGUOUS_PUBLICATION" "$(accepted_state_value)" || true
+    fi
+    echo "🛑 restore 身份漂移：未发布实例已尝试停止/隔离，状态锁保留。" >&2
+  elif restore_is_published; then
+    # network-published 是唯一提交点。此后即使信号落在锁释放收尾，也不得反向停机。
+    # 若主路径已尝试 release 且失败，accepted/control 必须原样保留；EXIT cleanup 不能用第二次
+    # 瞬时成功把首次失败证据抹掉，留下“exit 1 但无残锁”的模糊现场。
+    if [ "$RELEASE_FAILED" = "1" ]; then
+      _keep_lock=1
+    else
+      _keep_lock=0
+    fi
+  elif restore_was_accepted; then
+    _keep_lock=1
+    # ready-accepted 先于任何 network connect 持久化。若优雅失败发生在发布过程，停止精确
+    # 容器并撤回所有已见 endpoint；无法确认撤回时保留 ambiguous-publication。
+    if ! stop_unpublished_restore_targets; then
+      [ "$_exit_rc" -ne 0 ] || _exit_rc=1
+      write_restore_state "$RESTORE_CONTROL_AMBIGUOUS_PUBLICATION" "$(accepted_state_value)" || true
+    fi
+    echo "🛑 readiness 已接受但 network-published 尚未提交；已尝试停止并撤回网络，accepted 证据保留。" >&2
+  elif [ "$_post_replace" = "1" ]; then
     _keep_lock=1
     # 库已替换但尚未 ready/accepted：即使 start 命令可能只执行了一半，也再次 stop 并保留现场。
     # 此时绝不再 start；人工确认前锁目录持续阻断下一次 restore。
-    if [ "$STOP_ATTEMPTED" = "1" ] && ! docker compose stop app; then
+    if [ "$STOP_ATTEMPTED" = "1" ] && ! stop_unpublished_restore_targets; then
       echo "❌ restore 收尾无法确认 app 已停止；请立即保持服务隔离并人工检查。" >&2
       [ "$_exit_rc" -ne 0 ] || _exit_rc=1
     fi
     echo "🛑 数据库已替换但恢复尚未被 readiness 接受；app 保持停止，restore 锁与阶段证据已保留。" >&2
-  elif [ "$_accepted" != "1" ] && [ "$STOP_ATTEMPTED" = "1" ]; then
-    # 数据库尚未替换：当前 DB/WAL 仍是一体，恢复旧 app 运行并释放本次临时锁。
-    if ! docker compose start app; then
-      echo "❌ restore 收尾无法重启 app；请执行 docker compose start app 并检查日志。" >&2
+  elif [ "$STOP_ATTEMPTED" = "1" ]; then
+    # 数据库尚未替换：当前 DB/WAL 仍是一体。只有 restore 开始前本来就在运行的 app 才能重启；
+    # 对原本停止态（包括刚 create 出来的停止态）绝不能因失败路径把旧镜像启动到中间状态。
+    if [ "$RESTORE_CONTAINER_WAS_RUNNING" = "true" ]; then
+      if ! verify_restore_identity "恢复旧 app 前" || ! docker start "$RESTORE_CONTAINER_ID" >/dev/null; then
+        echo "❌ restore 收尾无法安全重启已捕获 app 容器；请检查容器身份与日志。" >&2
+        _keep_lock=1
+        [ "$_exit_rc" -ne 0 ] || _exit_rc=1
+      fi
+    elif [ "$RESTORE_CONTAINER_WAS_RUNNING" = "false" ]; then
+      echo "→ app 在 restore 开始前已是停止态；换库前失败后保持停止，不启动旧镜像。" >&2
+    else
+      echo "❌ 无法确认 app 在 restore 开始前的运行态；拒绝自动启动并保留状态锁。" >&2
       _keep_lock=1
       [ "$_exit_rc" -ne 0 ] || _exit_rc=1
     fi
@@ -593,65 +1655,101 @@ cleanup_restore() {
     echo "❌ 无法清理现场留存临时文件：$PRE_RESTORE_TMP" >&2
     [ "$_exit_rc" -ne 0 ] || _exit_rc=1
   fi
+  if [ -n "$READY_BODY_TMP" ]; then
+    if ! rm -f -- "$READY_BODY_TMP"; then
+      echo "⚠️ 无法清理调用者侧 readiness 临时响应：$READY_BODY_TMP" >&2
+    fi
+    READY_BODY_TMP=""
+  fi
 
   if [ "$_keep_lock" = "0" ]; then
-    if ! release_restore_lock; then
+    if [ "$_post_replace" = "0" ]; then
+      if ! release_public_restore_lock || ! discard_unreplaced_restore_control confirmed-unreplaced; then
+        _keep_lock=1
+        [ "$_exit_rc" -ne 0 ] || _exit_rc=1
+      fi
+    elif ! release_restore_lock; then
       _keep_lock=1
       [ "$_exit_rc" -ne 0 ] || _exit_rc=1
     fi
   fi
   if [ "$_keep_lock" != "0" ]; then
-    echo "🛑 已保留 restore 状态锁：${RESTORE_LOCK}；完成上面的人工处置后再移除。" >&2
+    echo "🛑 已保留 restore host-only 状态锁：${RESTORE_CONTROL_LOCK}；完成上面的人工处置后再移除。" >&2
   fi
 
   exit "$_exit_rc"
 }
 
-if ! $SUDO mkdir "$RESTORE_LOCK"; then
-  if [ -e "$RESTORE_LOCK" ]; then
-    echo "🛑 已有另一个 restore 或上次异常中断的状态锁：$RESTORE_LOCK" >&2
-    if [ -f "$RESTORE_READY_ACCEPTED_MARKER" ]; then
-      echo "   状态显示：readiness 已接受，但锁释放未完成；核对 app 与锁目录后再人工处置。" >&2
-    elif [ -f "$RESTORE_APP_STARTED_MARKER" ]; then
-      echo "   状态显示：app 曾启动但 readiness 未接受；保持 app 停止，检查恢复后的库与日志。" >&2
-    elif [ -f "$RESTORE_UPGRADE_MARKER_CLEAN_MARKER" ]; then
-      echo "   状态显示：升级标记已清、app 尚未被接受；保持 app 停止，切勿直接 start。" >&2
-    elif [ -f "$RESTORE_SIDECARS_CLEAN_MARKER" ]; then
-      echo "   状态显示：旧 WAL/SHM 已清、后续阶段未完成；保持 app 停止，切勿直接 start。" >&2
-    elif [ -f "$RESTORE_ARMED_MARKER" ] && [ ! -e "$RESTORE_STAGE" ]; then
-      echo "   状态显示：数据库可能已替换、旧 WAL/SHM 尚待确认。保持 app 停止，切勿直接 start。" >&2
-    elif [ -f "$RESTORE_ARMED_MARKER" ]; then
-      echo "   状态显示：替换已武装但 stage 仍在，数据库大概率尚未替换；仍需先确认现场。" >&2
-    else
-      echo "   状态显示：中断发生在替换前或清理后；请确认无 restore 进程再人工检查/移除锁。" >&2
-    fi
+RESTORE_OWNER_START_FINGERPRINT=$(process_start_fingerprint "$$") || {
+  echo "❌ 无法读取 restore owner 的进程启动指纹；恢复已中止。" >&2
+  exit 1
+}
+
+if ! $SUDO mkdir "$RESTORE_CONTROL_LOCK"; then
+  if state_path_exists "$RESTORE_CONTROL_LOCK" || state_file_exists "$RESTORE_CONTROL_ACCEPTED_HANDOFF"; then
+    echo "🛑 已有另一个 restore 或上次异常中断的 host-only 控制锁：$RESTORE_CONTROL_LOCK" >&2
     exit 4
-  else
-    echo "❌ 无法创建 restore 状态锁：${RESTORE_LOCK}（目录权限、只读文件系统或磁盘故障）。" >&2
-    exit 1
   fi
+  echo "❌ 无法创建 host-only restore 控制锁：$RESTORE_CONTROL_LOCK" >&2
+  exit 1
 fi
-LOCK_HELD=1
 trap cleanup_restore EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-# 锁目录属于宿主调用者而不是容器 uid1000：shell 需要持续读取其中的状态文件名。stage 文件本身仍按
-# OWN 交给容器 uid1000；宿主读取其内容时必须走 $SUDO（见下方文件头检查）。
-if [ -n "$SUDO" ] && [ "$CALLER_UID" != "0" ]; then
-  $SUDO chown "$CALLER_UID:$CALLER_GID" "$RESTORE_LOCK"
-fi
-$SUDO chmod 700 "$RESTORE_LOCK"
+# host-only control 必须先于 stop/任何 public 路径取得，且始终是唯一授权状态。DATA_DIR 仍由 app
+# uid1000 写入，故其中的 public 子目录即使 root-owned 也能被父目录 owner rename；app 未确认停止前
+# 绝不创建或写该目录。control 与后续停机期 public stage 都保持创建者所有、0700，不 chown 给 caller。
+$SUDO chmod 700 "$RESTORE_CONTROL_LOCK"
+write_restore_state "$RESTORE_CONTROL_OWNER_PID_FILE" "$$" || {
+  echo "❌ 无法记录 host-only restore owner PID；恢复已中止。" >&2
+  exit 1
+}
+write_restore_state "$RESTORE_CONTROL_OWNER_START_FINGERPRINT_FILE" "$RESTORE_OWNER_START_FINGERPRINT" || {
+  echo "❌ 无法记录 host-only restore owner 启动指纹；恢复已中止。" >&2
+  exit 1
+}
+write_restore_state "$RESTORE_CONTROL_CONTAINER_ID_FILE" "$RESTORE_CONTAINER_ID" || {
+  echo "❌ 无法记录 host-only app 容器 ID；恢复已中止。" >&2
+  exit 1
+}
+write_restore_state "$RESTORE_CONTROL_COMPOSE_PROJECT_FILE" "$RESTORE_COMPOSE_PROJECT" || {
+  echo "❌ 无法记录 Compose project 身份；恢复已中止。" >&2
+  exit 1
+}
+write_restore_state "$RESTORE_CONTROL_COMPOSE_SERVICE_FILE" "$RESTORE_COMPOSE_SERVICE" || {
+  echo "❌ 无法记录 Compose service 身份；恢复已中止。" >&2
+  exit 1
+}
+write_restore_state "$RESTORE_CONTROL_DATA_IDENTITY_FILE" "$RESTORE_DATA_IDENTITY" || {
+  echo "❌ 无法记录 DATA_DIR dev/inode 身份；恢复已中止。" >&2
+  exit 1
+}
+write_restore_state "$RESTORE_CONTROL_CONTAINER_SOURCE_FILE" "$RESTORE_CONTAINER_DATA_ABS" || {
+  echo "❌ 无法记录 app 容器 mount source；恢复已中止。" >&2
+  exit 1
+}
+write_restore_state "$RESTORE_CONTROL_CONTAINER_IMAGE_FILE" "$RESTORE_CONTAINER_IMAGE" || {
+  echo "❌ 无法记录 app 容器镜像身份；恢复已中止。" >&2
+  exit 1
+}
+write_restore_state "$RESTORE_CONTROL_CONTAINER_WAS_RUNNING_FILE" "$RESTORE_CONTAINER_WAS_RUNNING" || {
+  echo "❌ 无法记录 app 容器初始运行态；恢复已中止。" >&2
+  exit 1
+}
+capture_container_networks || {
+  echo "❌ 无法固化 app 容器网络身份；恢复已中止。" >&2
+  exit 1
+}
 
-echo "→ 固化恢复源到私有 stage（0600）：$RESTORE_STAGE"
-# shellcheck disable=SC2086  # $OWN 需按词拆分成 -o 1000 -g 1000（或空）
-if ! $SUDO install $OWN -m 600 "$SNAPSHOT_ABS" "$RESTORE_STAGE"; then
-  echo "❌ 无法复制恢复源到私有 stage；app 未停、当前数据库未改动。" >&2
+echo "→ 固化恢复源到 app 不可见的 host-only 预校验副本（0600）：$RESTORE_VALIDATED_SNAPSHOT"
+if ! $SUDO install -m 600 "$SNAPSHOT_ABS" "$RESTORE_VALIDATED_SNAPSHOT"; then
+  echo "❌ 无法复制恢复源到 host-only 预校验副本；app 未停、当前数据库未改动。" >&2
   exit 1
 fi
 
-# 快照必须是 SQLite 库文件——错传日志/空文件不能进入 stop/替换阶段。检查的是私有 stage，
-# 后续最终 mv 仍使用它，故不存在校验后源内容被替换的 TOCTOU。
-if [ "$($SUDO head -c 15 "$RESTORE_STAGE" 2>/dev/null || true)" != "SQLite format 3" ]; then
+# 快照必须是 SQLite 库文件——错传日志/空文件不能进入 stop/替换阶段。检查的是 app 不可见的
+# host-only 固化副本；停机后同文件系统 stage 还会再次逐字节和 SQLite 校验。
+if [ "$($SUDO head -c 15 "$RESTORE_VALIDATED_SNAPSHOT" 2>/dev/null || true)" != "SQLite format 3" ]; then
   echo "❌ 不是 SQLite 库文件（缺 'SQLite format 3' 文件头）：$SNAPSHOT" >&2
   exit 1
 fi
@@ -690,7 +1788,7 @@ echo "→ 校验快照完整性（PRAGMA quick_check + header 1/1 单文件格�
 #       docs §5.3 的 sync-backups.sh 异机备份链路取的都是 backupDb() 的 VACUUM 产物（0101），
 #       正常运维路径不受影响。
 #    ⚠️ 非默认 DB_PATH 也不再给出弱化手工配方；所有恢复都必须复用同一套校验和状态机。
-node_with_snapshot "$RESTORE_STAGE" '
+node_with_snapshot "$RESTORE_VALIDATED_SNAPSHOT" '
   const fs = require("fs")
   const { DatabaseSync } = require("node:sqlite")
   // 先看文件头：offset 18/19 = write/read format version。仅 1/1 是本恢复器已知安全的单文件形态。
@@ -744,9 +1842,56 @@ EOF
 
 # trap 必须在 stop **之前**安装：未替换时的失败/信号会保留当前 DB/WAL 并恢复旧 app；一旦库已
 # 替换但尚未 ready/accepted，收尾则再次 stop、保留锁与阶段证据，绝不自动 start 或释放锁。
+verify_restore_identity "stop 前" || exit 1
 STOP_ATTEMPTED=1
-echo "→ 停 app（释放对 app.db 的写锁）"
-docker compose stop app
+echo "→ 停已捕获 app 容器（释放对 app.db 的写锁）：$RESTORE_CONTAINER_ID"
+docker stop "$RESTORE_CONTAINER_ID" >/dev/null
+verify_restore_identity "stop 后" || exit 1
+verify_captured_container_stopped "复制本地 stage 前" || exit 1
+
+if ! $SUDO mkdir "$RESTORE_LOCK"; then
+  if state_path_exists "$RESTORE_LOCK" || state_symlink_exists "$RESTORE_LOCK"; then
+    echo "🛑 app 已停止，但 DATA_DIR 内 public stage 路径已被占用：$RESTORE_LOCK" >&2
+    echo "   host-only control 保留本次身份；未写数据库，请核对该路径后再重试。" >&2
+    exit 4
+  fi
+  echo "❌ 无法创建停机期 public restore stage：$RESTORE_LOCK" >&2
+  exit 1
+fi
+LOCK_HELD=1
+$SUDO chmod 700 "$RESTORE_LOCK"
+verify_captured_container_stopped "public stage 初始化后" || exit 1
+
+# 预校验副本在 host-only 控制目录，app 运行时不可读写；停机后再复制到 DATA_DIR 内同文件系统 stage。
+# 该 stage 故意不 chown 给 uid1000，直到原子替换已经完成，避免外部误启动 app 时出现校验后篡改。
+echo "→ 复制 host-only 已校验副本到同文件系统 replace stage"
+if ! $SUDO install -m 600 "$RESTORE_VALIDATED_SNAPSHOT" "$RESTORE_STAGE"; then
+  echo "❌ 无法创建同文件系统 replace stage；当前数据库未改动。" >&2
+  exit 1
+fi
+if ! $SUDO cmp -s "$RESTORE_VALIDATED_SNAPSHOT" "$RESTORE_STAGE"; then
+  echo "❌ replace stage 与 host-only 已校验副本不一致；拒绝替换数据库。" >&2
+  exit 1
+fi
+node_with_snapshot "$RESTORE_STAGE" '
+  const fs = require("fs")
+  const { DatabaseSync } = require("node:sqlite")
+  const fd = fs.openSync("/snap.db", "r")
+  const hdr = Buffer.alloc(20)
+  try { fs.readSync(fd, hdr, 0, 20, 0) } finally { fs.closeSync(fd) }
+  if (hdr[18] !== 1 || hdr[19] !== 1) process.exit(2)
+  const d = new DatabaseSync("file:/snap.db?immutable=1", { readOnly: true })
+  try {
+    const r = d.prepare("PRAGMA quick_check").get()
+    if (!r || r.quick_check !== "ok") process.exit(1)
+  } finally {
+    d.close()
+  }
+' || {
+  echo "❌ 停机后本地 replace stage 未通过二次 header/quick_check；当前数据库未改动。" >&2
+  exit 1
+}
+verify_captured_container_stopped "replace stage 二次校验后" || exit 1
 
 # 现场先存一份：单文件覆盖式，仿 preupgrade.db 的钉住模式——文件名不匹配 ^backup-.*\.db$，
 # 故不进 BACKUP_KEEP 轮转集，也不会被 latestBackupDay 误当成「今天的日常备份」。
@@ -758,10 +1903,10 @@ if [ -f "$DB" ]; then
 
   # 🔴 自毁防护（P6-R2 复审必修 1）：用户跑过一次 restore 后想拿 pre-restore.db 回到最初状态，
   #    是最自然的二次反悔路径。但本步会用**当前 app.db** 重建同名文件；若仍从原路径读取，恢复源
-  #    会在 install 前被覆盖。现在所有源都已在 stop 前固化到 $RESTORE_STAGE，并对那一份做过校验，
+  #    会在 install 前被覆盖。现在所有源都已在 stop 前固化到 $RESTORE_VALIDATED_SNAPSHOT，并校验，
   #    所以即使原始 SNAPSHOT 就是 pre-restore.db，本步覆盖原文件也不影响最终恢复内容。
 
-  # 🔴 必须 VACUUM INTO，绝不能 cp/install：库跑 WAL 模式，`docker compose stop` 发 SIGTERM 后进程
+  # 🔴 必须 VACUUM INTO，绝不能 cp/install：库跑 WAL 模式，精确 `docker stop` 发 SIGTERM 后进程
   #    不做 checkpoint 就退出，最后一段已提交数据只躺在 app.db-wal 里。裸拷主文件会丢这段，而下面
   #    紧接着 `rm -f "$DB-wal"` 会把唯一副本删掉——等用户想反悔时，回滚点已残缺且不可挽回。
   #    （同 lib/backup.ts 顶部那条 WAL 安全纪律；preupgrade.db 也是 VACUUM INTO 产的。）
@@ -797,9 +1942,25 @@ fi
 # 🔴 原子还原（P6-R2 R4④ + R7-P1②）：私有 stage 已完整写好、收紧权限并通过校验；先创建 armed
 #    标记，再把同一文件原子 mv 为 app.db。EXIT/INT/TERM 与进程级 SIGKILL 后，可用当前文件系统
 #    可见的 armed + stage 状态判断 mv 结果；不把它冒充为未经 fsync 的宿主断电一致性保证。
+verify_restore_identity "数据库 replace 前" || exit 1
+verify_captured_container_stopped "数据库 replace 前" || exit 1
 echo "→ 原子还原已校验 stage 为 ${DB}（0600 / uid1000）"
-$SUDO install -m 600 /dev/null "$RESTORE_ARMED_MARKER"
+write_restore_state "$RESTORE_CONTROL_ARMED_MARKER" "" || {
+  _phase_rc=$?
+  echo "❌ 无法记录 host-only replace-armed 阶段；数据库尚未替换。" >&2
+  exit "$_phase_rc"
+}
 $SUDO mv -- "$RESTORE_STAGE" "$DB"  # DATA_DIR 内同一文件系统，rename 原子
+if [ -n "$OWN" ]; then
+  $SUDO chown 1000:1000 "$DB" || {
+    echo "❌ 数据库已替换但无法交还 uid1000；保持 app 停止并保留 restore 锁。" >&2
+    exit 1
+  }
+fi
+$SUDO chmod 600 "$DB" || {
+  echo "❌ 数据库已替换但无法确认 0600；保持 app 停止并保留 restore 锁。" >&2
+  exit 1
+}
 
 # -wal/-shm 是旧库的 WAL 副本，换整库快照时必须一并删除；
 # 标记也要清——手动还原＝人为终结升级链，不清则下次真升级会因「标记指向的旧快照仍在」被误判、跳过备份。
@@ -810,69 +1971,137 @@ $SUDO rm -f "$MARKER" || {
   echo "❌ 无法删除升级标记：${MARKER}；拒绝启动 app，保留 restore 状态供人工处理。" >&2
   exit "$_marker_rc"
 }
-mark_restore_phase "$RESTORE_UPGRADE_MARKER_CLEAN_MARKER" || {
+write_restore_state "$RESTORE_CONTROL_UPGRADE_MARKER_CLEAN_MARKER" "" || {
   _phase_rc=$?
-  echo "❌ 升级标记虽已删除，但无法记录 upgrade-marker-clean 阶段；拒绝启动 app。" >&2
+  echo "❌ 升级标记虽已删除，但无法记录 host-only upgrade-marker-clean 阶段；拒绝启动 app。" >&2
   exit "$_phase_rc"
 }
 
-# curl 的响应体必须保留原始字节（含潜在 NUL）供严格解析；shell 变量做不到。锁目录已是调用者
-# 私有 0700，这里再以 umask 077 创建固定文件，curl 后续只覆写内容、不改变权限。
-if ! (umask 077 && : > "$RESTORE_READY_BODY"); then
-  echo "❌ 无法创建 readiness 响应暂存文件；拒绝启动 app。" >&2
+# readiness 响应体必须保留原始字节（含潜在 NUL）供严格解析；shell 变量做不到。默认 sudo 路径的
+# host-only control 是 root-owned 0700，普通调用者 shell 不能直接 `> ready-body`。因此先写调用者自己
+# 0600 的 mktemp，再用提权 install 发布进 control；授权阶段 marker 仍全部保持 root-owned。
+READY_BODY_TMP=$(umask 077; mktemp "${TMPDIR:-/tmp}/xjm-restore-ready.XXXXXX") || {
+  echo "❌ 无法创建调用者侧 readiness 临时响应；拒绝启动 app。" >&2
   exit 1
-fi
-if ! chmod 600 "$RESTORE_READY_BODY"; then
-  echo "❌ 无法收紧 readiness 响应暂存文件权限；拒绝启动 app。" >&2
+}
+[ -n "$READY_BODY_TMP" ] || {
+  echo "❌ readiness 临时响应路径为空；拒绝启动 app。" >&2
   exit 1
-fi
+}
 
-echo "→ 起 app"
-docker compose start app
-mark_restore_phase "$RESTORE_APP_STARTED_MARKER" || {
+verify_restore_identity "流量隔离前" || exit 1
+verify_container_network_manifest "流量隔离前" || exit 1
+echo "→ 断开已捕获 app 容器的全部网络（未 accepted 前不可接流量）"
+disconnect_container_networks 0 || {
+  echo "❌ 无法隔离 app 容器网络；拒绝启动。" >&2
+  exit 1
+}
+verify_captured_container_stopped "网络隔离后" || exit 1
+verify_restore_identity "start 前" || exit 1
+# DATA_DIR 内 public 目录只承担停机期同文件系统 stage 与诊断镜像。app 重新运行前必须完整释放；
+# 之后所有权威阶段只写 host-only control，避免 app 可写父目录上的 privileged pathname race。
+release_public_restore_lock || {
+  echo "❌ 无法在 app 启动前释放 public restore stage；保持 app 停止。" >&2
+  exit 1
+}
+echo "→ 起已捕获 app 容器：$RESTORE_CONTAINER_ID"
+docker start "$RESTORE_CONTAINER_ID" >/dev/null
+write_restore_state "$RESTORE_CONTROL_APP_STARTED_MARKER" "" || {
   _phase_rc=$?
-  echo "❌ app 已尝试启动，但无法记录 app-started 阶段；将再次停机并保留 restore 锁。" >&2
+  echo "❌ app 已尝试启动，但无法记录 host-only app-started 阶段；将再次停机并保留 restore 锁。" >&2
   exit "$_phase_rc"
 }
+verify_restore_identity "start 后" || exit 1
+verify_captured_container_isolated "start 后" || exit 1
 
 # 校验：readiness 才是「恢复成功」的判据——它同时证明进程已能响应，并核对
 # 常驻连接、DB_PATH 文件身份、fresh 磁盘连接与两侧 schema。单独查 liveness 只能说明
 # 进程活着，不能证明常驻连接仍指向当前路径上的数据库，故不作为独立恢复门禁。
-echo "→ 校验 $APP_URL/api/ready（最多等 ${READY_TIMEOUT}s）"
-# 🔴 单次请求必须有界（R4-P2④，codex R6 指出）：APP_URL 能建连但**永不返回响应**时（进程卡在
-#    某个 await、反代挂起），无超时的 curl 会在一次迭代里无限阻塞——承诺的 60s 上限失效，
-#    EXIT trap 也进不去、app 停在停止态。--connect-timeout 3 + --max-time 5 ⇒ 单轮最多 5s。
+echo "→ 在网络隔离的已捕获容器内校验 /api/ready（最多等 ${READY_TIMEOUT}s）"
+# 🔴 单次请求必须有界（R4-P2④，codex R6 指出）：容器内应用能建连但**永不返回响应**时（进程卡在
+#    某个 await），无 AbortController 的 fetch 会在一次迭代里无限阻塞——承诺的 60s 上限失效。
+#    probe_captured_readiness 把每轮容器内 fetch 钳在最多 5s，且只探测已捕获容器的 loopback。
 #
 # 🔴 R7-P2⑥（codex R6 指出）：上限必须是**绝对 deadline**，不能靠「迭代次数 × 预估单轮耗时」。
 #    修复前是 `while [ i -lt 30 ]` + 单轮最多 5s + sleep 2：正常情况下（连接被拒、curl 立即返回）
 #    单轮≈2s、30 轮≈60s 与承诺相符；但**恰好在 readiness 卡住时**（接受连接却不响应，即最需要
 #    这个上限的场景）单轮变成 5+2=7s → 实际约 210s，是承诺的 3.5 倍。运维照文档等 60s 就会以为
 #    脚本挂了而手动打断，而打断点可能落在 trap 之外的任意位置。
-#    改法：开跑记 DEADLINE=now+60；每轮把 curl 与 sleep 都钳到剩余秒数，不能让最后一轮越界。
+#    改法：开跑记 DEADLINE=now+60；每轮把容器内 probe 与 sleep 都钳到剩余秒数，不能让最后一轮越界。
 #    上限可用 READY_TIMEOUT 覆盖（回归测试要跑「等满上限」这条路径，60s 会让整套测试慢一倍；
 #    运维侧偶尔也需要放宽——冷启动慢的大库首次加载可能超 60s）。默认值仍是文档承诺的 60。
 _deadline=$(( $(date +%s) + READY_TIMEOUT ))
 while :; do
+  verify_restore_identity "readiness probe 前" || exit 1
+  verify_captured_container_isolated "readiness probe 前" || exit 1
   _now=$(date +%s)
   _remaining=$((_deadline - _now))
   [ "$_remaining" -gt 0 ] || break
 
-  _curl_timeout=5
-  if [ "$_remaining" -lt "$_curl_timeout" ]; then
-    _curl_timeout="$_remaining"
+  _probe_timeout=5
+  if [ "$_remaining" -lt "$_probe_timeout" ]; then
+    _probe_timeout="$_remaining"
   fi
-  if _ready_status=$(curl -sS --connect-timeout 3 --max-time "$_curl_timeout" \
-    --output "$RESTORE_READY_BODY" --write-out '%{http_code}' "$APP_URL/api/ready" 2>/dev/null); then
-    if [ "$_ready_status" = "200" ] && ready_body_is_ok "$RESTORE_READY_BODY"; then
-      mark_restore_phase "$RESTORE_READY_ACCEPTED_MARKER" || {
+  if probe_captured_readiness "$_probe_timeout" > "$READY_BODY_TMP" 2>/dev/null; then
+    if ! $SUDO install -m 600 "$READY_BODY_TMP" "$RESTORE_CONTROL_READY_BODY"; then
+      echo "❌ 无法把 readiness 原始响应发布到 host-only control；拒绝接受。" >&2
+      exit 1
+    fi
+    if ready_body_is_ok "$RESTORE_CONTROL_READY_BODY"; then
+      verify_restore_identity "接受 readiness 前" || exit 1
+      verify_captured_container_isolated "接受 readiness 前" || exit 1
+      if ! rm -f -- "$READY_BODY_TMP"; then
+        echo "❌ 无法清理调用者侧 readiness 临时响应；拒绝进入 accepted 阶段。" >&2
+        exit 1
+      fi
+      READY_BODY_TMP=""
+      _accepted_value=$(accepted_state_value)
+      write_restore_state "$RESTORE_CONTROL_READY_ACCEPTED" "$_accepted_value" || {
         _phase_rc=$?
-        echo "❌ readiness 已返回 200 + ok=true，但无法记录 ready-accepted；将停机并保留锁。" >&2
+        echo "❌ readiness 已返回 200 + ok=true，但无法记录 host-only ready-accepted；将停机并保留锁。" >&2
         exit "$_phase_rc"
       }
-      READY_ACCEPTED=1
-      echo "✅ 恢复完成：/api/ready 严格返回 HTTP 200 + {\"ok\":true}"
-      release_restore_lock
-      trap - EXIT INT TERM  # 只有 accepted 且状态锁已释放后，才撤销收尾与信号 trap
+      write_restore_state "$RESTORE_CONTROL_NETWORKS_RECONNECTING_MARKER" "$_accepted_value" || {
+        echo "❌ readiness 已接受但无法记录 networks-reconnecting；将停机并保留 accepted 锁。" >&2
+        exit 1
+      }
+      echo "→ readiness 已接受；按已捕获 NetworkID + aliases 恢复精确容器网络"
+      if ! reconnect_container_networks; then
+        echo "❌ readiness 已接受但容器网络未能完整发布；将尝试全部撤回并保留 accepted 证据。" >&2
+        if disconnect_container_networks 1 && stop_and_isolate_container "$RESTORE_CONTAINER_ID"; then
+          write_restore_state "$RESTORE_CONTROL_PUBLICATION_FAILED" "$_accepted_value" || true
+        else
+          docker stop "$RESTORE_CONTAINER_ID" >/dev/null 2>&1 || true
+          write_restore_state "$RESTORE_CONTROL_AMBIGUOUS_PUBLICATION" "$_accepted_value" || true
+          echo "🛑 无法确认所有 endpoint 已撤回；实例内容已验收，但发布状态不明，必须人工处置。" >&2
+        fi
+        exit 1
+      fi
+      verify_restore_identity "网络恢复后" || exit 1
+      write_restore_state "$RESTORE_CONTROL_NETWORK_PUBLISHED" "$_accepted_value" || {
+        RELEASE_FAILED=1
+        echo "❌ 网络已生效且身份通过，但无法记录 network-published；accepted 证据与状态锁保留。" >&2
+        exit 1
+      }
+      verify_restore_identity "network-published 后" || exit 1
+      if ! $SUDO rm -f \
+        "$RESTORE_CONTROL_NETWORKS_RECONNECTING_MARKER" \
+        "$RESTORE_CONTROL_NETWORKS_ISOLATED_MARKER"; then
+        RELEASE_FAILED=1
+        echo "❌ network-published 已记录，但无法清理中间网络阶段；状态锁保留。" >&2
+        exit 1
+      fi
+      verify_restore_identity "控制锁释放前" || exit 1
+      if ! release_restore_control; then
+        RELEASE_FAILED=1
+        exit 1
+      fi
+      if ! clear_restore_control_handoff; then
+        RELEASE_FAILED=1
+        exit 1
+      fi
+      trap - EXIT INT TERM  # 只有 network-published 且两层状态锁已释放后才撤销收尾
+      echo "✅ 恢复完成：捕获容器 readiness 与身份通过，NetworkID/name/aliases 已复核并发布"
       exit 0
     fi
   fi
