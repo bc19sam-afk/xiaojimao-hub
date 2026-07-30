@@ -29,3 +29,5 @@ jobs:
         run: npx playwright install --with-deps chromium
       - name: Playwright UI tests
         run: npm run test:ui -- --project=chromium
+      - run: docker pull node:26-bookworm
+      - run: npm run test:restore-real

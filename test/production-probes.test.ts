@@ -187,6 +187,43 @@ test('production cold start keeps health live and returns sanitized ready 503 fo
   }
 })
 
+test('real HTTP readiness rejects an atomic same-schema replacement after opening the resident connection', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xjm-probe-replaced-inode-'))
+  const dbPath = path.join(dir, 'app.db')
+  const replacementPath = path.join(dir, 'replacement.db')
+  createDatabase(dbPath)
+  let server: Awaited<ReturnType<typeof spawnProbeServer>> | undefined
+  try {
+    server = await spawnProbeServer(dbPath)
+    const initial = await fetch(`${server.baseUrl}/api/ready`)
+    assert.equal(initial.status, 200)
+    assert.deepEqual(await initial.json(), { ok: true })
+
+    const source = new DatabaseSync(dbPath)
+    try {
+      source.prepare('VACUUM INTO ?').run(replacementPath)
+    } finally {
+      source.close()
+    }
+    fs.renameSync(replacementPath, dbPath)
+
+    const health = await fetch(`${server.baseUrl}/api/health`)
+    assert.equal(health.status, 200)
+    assert.deepEqual(await health.json(), { ok: true })
+
+    const ready = await fetch(`${server.baseUrl}/api/ready`)
+    assert.equal(ready.status, 503)
+    assert.deepEqual(await ready.json(), {
+      ok: false,
+      code: 'DATABASE_NOT_READY',
+      summary: '数据库尚未就绪',
+    })
+  } finally {
+    await server?.stop()
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('enabled worker retries readiness and starts a real collect tick after a broken database is repaired', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xjm-worker-recovery-'))
   const dbPath = path.join(dir, 'app.db')

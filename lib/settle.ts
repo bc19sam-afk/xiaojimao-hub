@@ -39,8 +39,17 @@ export async function settleDailyUsage(
   settled: number // 本轮新落库的结算笔数
   awarded: number // 本轮实际发分笔数（points>0 且首次入账）
   skipped?: boolean
+  // 🔴 本轮被 **running 锁** 挡住（P6-R2 复审三轮第 3 条）：**只是给调用方的健康信号**，
+  //    结算语义分毫未动。skipped 有三个来源，只有这一个代表「上一轮还卡在某个 await 没回来」：
+  //      ① running 锁       ＝真的卡住了     → lockHeld=true，worker 据此掐心跳
+  //      ② 日切 grace 窗内   ＝正常节流       → 只有 skipped，不掐
+  //      ③ 今天已结算过     ＝正常节流       → 只有 skipped，不掐
+  //    ⚠️ 绝不能把 ②③ 也并进健康判据：实测 8s tick、一天 10800 轮下 settleDailyUsage 因
+  //       grace 窗 + 日闸 skip 掉 99.99% 的轮次，并进去＝心跳一天最多 1 次，而外部 Period
+  //       建议 5 分钟 → 恒定误报。故必须用独立标志位区分，不能复用 skipped。
+  lockHeld?: boolean
 }> {
-  if (running) return { settled: 0, awarded: 0, skipped: true }
+  if (running) return { settled: 0, awarded: 0, skipped: true, lockHeld: true }
   // 日切延迟（结算时刻，§3.3）：过了午夜再等这么久才结「昨天」，吸收 cpamp 侧迟到落账——太早结、hasSettled
   // 闸会把迟到量永久排除（codex xhigh 于 PR #16 指出）。默认 10 分钟＝「每日 00:10 结算前一自然日」，
   // 后台可配（db.getSettleGraceMs，缺省仍 10min）；时区随服务器不可配。

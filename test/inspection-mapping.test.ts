@@ -236,3 +236,68 @@ test('端到端：keep+request_error 映射出的 retry → 留 first_check，�
   assert.equal(c.verifyStatus, 'first_check') // 未入池，下轮再查
   assert.equal(db.balance(uid), 0) // 未验证的号没有开始计量发分
 })
+
+// ============================================================================
+// P6-R2 复审三轮第 2 条：CPA 巡检整体故障 → 返回值带健康信号 inspectFailed
+//
+// 🔴 收号语义**一个字都不许改**：inspect() 抛错＝本轮不可观测，待检号原样跳过、绝不误退回
+//    （PR #15 定的纪律）。本条只要求「返回值把这件事说出来」，供 worker 的 pendingIsHealthy
+//    消费掐掉本轮 dead-man 心跳——否则 CPA 宕机时 processPending 一路返回
+//    {checked:n,activated:0,rejected:0} 且不抛，心跳照打＝docs §6 承诺的假绿。
+// ============================================================================
+
+// 桩掉 cpa.inspect 让它**抛错**（模拟 CPA 5xx / 网络不通），跑完必还原
+async function withInspectThrowing<T>(fn: () => Promise<T>): Promise<T> {
+  const orig = cpa.inspect
+  cpa.inspect = async () => {
+    throw new Error('CPA 5xx')
+  }
+  try {
+    return await fn()
+  } finally {
+    cpa.inspect = orig
+  }
+}
+
+test('复审三轮2：inspect 整体抛错 → inspectFailed=true，且待检号原样保留（收号语义不变）', async () => {
+  const uid = 6321
+  const id = 'inspect-failed-signal'
+  const accountId = 'inspect-failed-acc'
+  db.insertUnique(
+    makeContribution({ id, provider: 'codex', accountId, authFileName: `codex-${accountId}.json`, plan: 'plus', linuxdoId: uid }),
+  )
+  const r = await withInspectThrowing(() => collect.processPending())
+
+  assert.equal(
+    r.inspectFailed,
+    true,
+    '🔴 CPA 巡检整体故障必须回传健康信号，否则 worker 的 healthy 恒 true、dead-man 心跳假绿',
+  )
+  // 收号纪律：不可观测 ≠ 失败，号既不入池也不退回，原样留在 submitted 等下轮
+  const c = db.byUser(uid).find((x) => x.id === id)
+  assert.ok(c, '🔴 不可观测绝不能删行退回（PR #15 纪律）')
+  assert.equal(c.verifyStatus, 'submitted', '🔴 不可观测时状态原样不动')
+  assert.equal(r.activated, 0)
+  assert.equal(r.rejected, 0)
+  assert.equal(db.balance(uid), 0)
+})
+
+test('复审三轮2：inspect 正常（哪怕本轮一个号都没通过）→ inspectFailed 不为真，不误报不健康', async () => {
+  const uid = 6322
+  const id = 'inspect-ok-signal'
+  const accountId = 'inspect-ok-acc'
+  db.insertUnique(
+    makeContribution({ id, provider: 'codex', accountId, authFileName: `codex-${accountId}.json`, plan: 'plus', linuxdoId: uid }),
+  )
+  // 空 probes＝本轮巡检没覆盖到这个号（刚落号/掉队）：号照旧跳过，但这**不是** CPA 故障
+  const r = await withInspect([], () => collect.processPending())
+  assert.equal(r.activated, 0, '前置：本轮确实一个号都没入池')
+  assert.ok(!r.inspectFailed, '🔴 巡检本身正常时不得置故障信号，否则心跳恒不发')
+})
+
+test('复审三轮2：本轮压根没有 codex 待检号（没调 inspect）→ inspectFailed 不为真', async () => {
+  // 库里此刻没有 submitted/first_check 的 codex 号（上面两例已分别转态/保持，但会被本例的空池早返回覆盖）
+  // 直接断言「无待检号」这一路：processPending 空返回不带故障信号
+  const r = await collect.processPending()
+  assert.ok(!r.inspectFailed, '🔴 本轮没活干 ≠ CPA 故障，误报会让心跳永远发不出去')
+})
