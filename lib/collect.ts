@@ -201,6 +201,22 @@ export async function processPending(): Promise<{
   activated: number // 本轮入池数（对外仍叫 activated，保 worker/verify-now 调用方兼容）
   rejected: number // 本轮首检失败·退回数（删行释放唯一键）
   skipped?: boolean
+  // 🔴 本轮 cpa.inspect() 整体抛错（P6-R2 复审三轮第 2 条）：**只是给调用方的健康信号**，
+  //    不改收号语义（下面那处 catch 照旧把号跳过、绝不误退回——那是 PR #15 定的纪律）。
+  //    没有它的话，CPA 持续宕机时 processPending 一路返回 {checked:n,activated:0,rejected:0}
+  //    且不抛，worker 的 healthy 恒 true → dead-man 心跳照打，而收号链路实际是断的：
+  //    docs §6 承诺「心跳证明后台 worker 还在正常干活」，实测复现过这条假绿。
+  //    ⚠️ 只在**本轮真的需要 inspect**（有 codex 待首检号）且它抛了时才为 true；没有 codex 待检号
+  //    时压根不调 inspect，此时缺省 undefined ＝「本轮没有可观测到的 CPA 故障」，不能误报不健康。
+  inspectFailed?: boolean
+  // 🔴 本轮 CPA 写操作（setDisabled/deleteAuthFile/setPriority）失败（P6-R2 R6③，codex R5 指出）：
+  //    **只是给调用方的健康信号**，收号语义分毫未动（enterPool / rejectBack 的 catch 块原样保留号、
+  //    下轮重试）。与 inspectFailed 同根因：CPA 写端点 5xx/网络不通时 catch 块吞掉异常、保留行待重试，
+  //    **但不抛**。processPending 返回时只回传 activated/rejected 计数、无失败信号 → worker 的
+  //    healthy 恒 true → 心跳照打，而 CPA 写端点故障会阻塞所有激活/拒绝（待检号堆积在 first_check、
+  //    零号入池）。故额外传播此健康信号。
+  //    ⚠️ 缺省 undefined ＝本轮无待检号/所有写操作成功 → 按健康算，不能因「本轮没活干」就误报不健康。
+  writeFailed?: boolean
 }> {
   if (running) return { checked: 0, activated: 0, rejected: 0, skipped: true }
   running = true
@@ -213,6 +229,8 @@ export async function processPending(): Promise<{
     const poolPriority = db.getPoolPriority()
     let pooled = 0 // 本轮入池数
     let rejected = 0 // 本轮首检失败·退回数
+    let inspectFailed = false // 本轮 inspect 是否整体抛错（仅作健康信号，不改收号语义）
+    let writeFailed = false // 本轮 CPA 写操作（setDisabled/deleteAuthFile/setPriority）是否失败（P6-R2 R6③）
 
     // 首检通过 → 入池：启用（setDisabled false）+ 设高优先级（best-effort）+ transition → pooled，
     //   此刻占用唯一键（§3.2）。限额/额度暂满（decision=retry）不算失败 → 一并入池等恢复
@@ -225,11 +243,13 @@ export async function processPending(): Promise<{
       try {
         await cpa.setDisabled(c.authFileName, false) // 首检通过→启用
       } catch {
+        writeFailed = true // 仅置健康信号；重试语义原样不动
         return // 启用失败：不入池，保持原态下轮重试
       }
       try {
         await cpa.setPriority(c.authFileName, poolPriority) // 入池设高优先级（§2.5，缺省 10、后台可调）
       } catch {
+        writeFailed = true // 仅置健康信号（R6③）
         // best-effort：号已启用能计量，优先级设失败仅损号主上浮、不挡入池（挡入池=号主零收益、更糟）。
         // 号已 pooled 后 processPending 只扫 submitted/first_check → 本轮不重设、无自动补设。残余窄窗：
         // 管理员调高优先级后恰逢瞬时失败 → 该号停在缺省 10（=cpamp 上游默认，失败无害）无自动重试；
@@ -251,6 +271,7 @@ export async function processPending(): Promise<{
       try {
         await cpa.deleteAuthFile(c.authFileName)
       } catch {
+        writeFailed = true // 仅置健康信号（R6③）
         db.transition(c.id, ['submitted'], 'first_check') // 文件还在：保留行下轮重试，不释放唯一键
         return
       }
@@ -277,7 +298,16 @@ export async function processPending(): Promise<{
         probes = await cpa.inspect()
       } catch {
         probes = null
+        inspectFailed = true // 仅置健康信号；跳过语义原样不动（见返回类型上的说明）
       }
+      // 🔴 R7-P2③（codex R6 指出）的收口点**不在这里**，在 lib/cpa.ts 的 realClient.inspect()：
+      //    那里原先有两条「不抛的失败路径」（run.id 缺失 / 30 轮轮询后结果仍未就绪）都 `return []`。
+      //    收口按不变量做——「inspect() 只在**巡检确实跑完且零结果**时返回 []，其余一律抛」——
+      //    于是上面这个 catch 自动接住，本函数一个字都不用改。
+      //    ⚠️ 绝不能在这里按 `probes.length === 0` 判故障：那会把「跑完了、本来就没结果」
+      //       （号刚落、cpamp 侧还没登记）也误报成 CPA 故障 → 心跳恒不发。已有两条测试钉住这一点
+      //       （inspection-mapping「inspect 正常（哪怕本轮一个号都没通过）」、health-dashboard
+      //       「R4-P2③ 反向」）。空数组在本层是**三义**的，只有 cpa.ts 那层还分得清。
       if (probes !== null) {
         const byKey = new Map(probes.map((r) => [probeKey(r.provider, r.accountId), r]))
         for (const c of codexPending) {
@@ -312,7 +342,7 @@ export async function processPending(): Promise<{
       await enterPool(c, c.plan)
     }
 
-    return { checked: pending.length, activated: pooled, rejected }
+    return { checked: pending.length, activated: pooled, rejected, inspectFailed, writeFailed }
   } finally {
     running = false
   }
@@ -334,6 +364,13 @@ let healthRunning = false
 // 轮询达 30s）＝持续满负荷。巡检该分钟级、比结算勤即可；此处限至少隔 5 分钟跑一次（now/force 供测试）。
 const HEALTH_INTERVAL_MS = 5 * 60_000
 let lastHealthAt = 0
+// 🔴 R6-P1①（codex R5 终审）：持久化 CPA 巡检失败状态，跨节流窗传播到后续 throttled tick。
+//    修复前：lastHealthAt 在 try 开头推进 → 失败后的下一轮（8s 后）被节流 early return、只回
+//    { skipped:true }、缺 inspectFailed → worker 判健康 → 持续故障期每 5 分钟窗只有首 tick 抑制
+//    心跳、后续 ~36 tick 照打 → dead-man 假绿。
+//    修复后：本轮真跑时更新此标志（成功清零、失败保持），throttled skip 时从这里传播 → 故障期
+//    所有 tick 都判不健康，直到下次真跑成功才清零 → 心跳在整个故障窗持续抑制。
+let lastInspectFailed = false
 
 export async function checkPooledHealth(
   now: number = Date.now(),
@@ -342,10 +379,27 @@ export async function checkPooledHealth(
   checked: number // 本轮巡检的 pooled 号数
   stopped: number // 本轮判失效停用数
   skipped?: boolean
+  // 🔴 本轮被 **healthRunning 锁** 挡住（P6-R2 R4②）：**只是给调用方的健康信号**，存活巡检
+  //    语义分毫未动。与 settleDailyUsage 的 lockHeld 同根因：上一轮卡在 cpa.inspect() 或
+  //    listAuthFiles() 的无超时 fetch 里没回来 → 后续 tick 拿到 skipped=true 但 worker.ts
+  //    只看 stopped、healthy 保持 true → 心跳照打，而存活巡检实际已卡死。
+  //    ⚠️ 节流 skip（now - lastHealthAt < INTERVAL）是正常行为，不能并进健康判据，故单列标志。
+  lockHeld?: boolean
+  // 🔴 本轮 CPA 巡检接口（inspect / listAuthFiles）不可用（P6-R2 R6②，codex R5 指出）：
+  //    与 processPending 的 inspectFailed 同根因——CPA 5xx/网络不通时 catch 块吞掉异常、跳过
+  //    本轮所有号（存活巡检纪律：不可观测≠失效，绝不误停），**但不抛**。lastHealthAt 在
+  //    try 前已推进 → 后续 tick 被当正常节流 skip、继续发心跳，而存活巡检实际断了。
+  //    ⚠️ 缺省 undefined ＝本轮无 pooled 号/全是 codex 且 inspect 成功 → 按健康算，不能因
+  //       「本轮没活干」或「部分 provider 成功」就误报不健康。
+  inspectFailed?: boolean
 }> {
-  if (healthRunning) return { checked: 0, stopped: 0, skipped: true }
-  if (!opts.force && now - lastHealthAt < HEALTH_INTERVAL_MS) return { checked: 0, stopped: 0, skipped: true }
+  if (healthRunning) return { checked: 0, stopped: 0, skipped: true, lockHeld: true }
+  if (!opts.force && now - lastHealthAt < HEALTH_INTERVAL_MS) {
+    // 🔴 R6-P1①：节流 skip 时也传播上次真跑的巡检失败状态，防故障期每窗只有首 tick 抑心跳、其余照打
+    return { checked: 0, stopped: 0, skipped: true, inspectFailed: lastInspectFailed }
+  }
   healthRunning = true
+  let inspectFailed = false // 本轮 CPA 巡检接口是否不可用（仅作健康信号，不改存活巡检语义）
   try {
     lastHealthAt = now
     const pooled = db.byVerifyStatus(['pooled'])
@@ -360,7 +414,11 @@ export async function checkPooledHealth(
         probes = await cpa.inspect()
       } catch {
         probes = null // 不可观测：本轮跳过所有 codex，绝不误判死
+        inspectFailed = true // 仅置健康信号；跳过语义原样不动
       }
+      // 🔴 R7-P2③ 的收口点在 lib/cpa.ts 的 realClient.inspect()（理由同 processPending 那处注释）：
+      //    「巡检没跑成」改为抛错、由上面的 catch 接住；「跑完了但零结果」仍返回 [] 且**不算故障**。
+      //    在本层按 `probes.length === 0` 判故障是错的——分不清这两者，会把正常空结果误报成 CPA 挂了。
       if (probes !== null) {
         const byKey = new Map(probes.map((r) => [probeKey(r.provider, r.accountId), r]))
         for (const c of codexPooled) {
@@ -386,11 +444,20 @@ export async function checkPooledHealth(
         files = await cpa.listAuthFiles()
       } catch {
         files = null // 拉不到号池清单：本轮跳过，绝不误判死
+        inspectFailed = true // 仅置健康信号；跳过语义原样不动
       }
       // ⚠️ 空清单保护（codex xhigh 于 PR #18 指出）：real client 把缺失 files 字段归一为 []，一次 200
       // 空响应（如 {}）会让下面把**整个** claude/grok 池判失效停用（stopped 无恢复路径 + 锁唯一键）。
       // 空清单更可能是 cpamp glitch（正巡检的这些号至少该在池里）→ 视为不可观测、本轮跳过、不停用。
       // 真「号池全空」极罕见，宁可漏停也不错停整池。（连续多轮确认缺失可留后续单细化。）
+      // 🔴 R4-P2③（codex R6 指出）：这条空清单分支与上面的 catch **同属「本轮不可观测」**，健康信号
+      //    必须一并置位。此前 inspectFailed 只在 catch 里置 → 200 空响应这条路径上，存活巡检实际
+      //    全跳过、却一路报健康 → dead-man 心跳照打，运维看不见「巡检已瘫」。
+      //    ⚠️ 只在**有 pooled claude/grok 号**时才算异常（本分支已在 otherPooled.length > 0 内）；
+      //       池里压根没这类号时不会走到这里，不会误报。
+      if (files !== null && files.length === 0) {
+        inspectFailed = true // 仅置健康信号；跳过语义原样不动（绝不误停整池）
+      }
       if (files !== null && files.length > 0) {
         // 现存号身份集（provider+accountId）：只认能识别 provider 且有稳定 id 的文件。'\0' 作分隔符
         // （不会出现在 provider/id 里），与 settle.ts 同款按 (provider, accountId) 划界。
@@ -407,8 +474,36 @@ export async function checkPooledHealth(
       }
     }
 
-    return { checked: pooled.length, stopped }
+    return { checked: pooled.length, stopped, inspectFailed }
+  } catch (e) {
+    // 🔴 R7-P2④（codex R6 指出）：**任何抛错的轮次都算「没能完成有效巡检」**（不变量 A）。
+    //
+    //    上面 try 里除了两个 CPA 调用（各自已 catch），还有 db.byVerifyStatus / db.transition ——
+    //    库损坏、磁盘满、SQLITE_BUSY 等都会从这里抛出。修复前没有这个 catch：
+    //      · lastHealthAt 在 try 开头就推进了 → 后续 5 分钟节流窗全部 early return；
+    //      · inspectFailed 还是 false → finally 把 **false** 存进 lastInspectFailed；
+    //    结果 worker 只压掉当前这一次心跳（异常冒泡到 tick 的 catch），之后整个节流窗都报健康
+    //    ——故障还在，dead-man 却恢复沉默。
+    //
+    //    为什么选 (a)「抛错记为失败」而不是总指挥倾向的 (b)「只在扫描成功后才推进 lastHealthAt」：
+    //    (b) 会让**持续**故障（库损坏这类不会自愈的）每个 tick（8s）都重跑整段巡检 ——
+    //    含两次全量 CPA 调用（codex inspect 轮询可达 30s）。节流的存在本就是为了防这个（PR #18）。
+    //    崩溃循环下更糟：这正是项目一路在防的 churn。(a) 保留节流、同时让健康信号在整个窗内
+    //    持续为真，dead-man 该报的警一条不少，代价只是「故障恢复后最多晚 5 分钟才恢复心跳」——
+    //    而外部监视周期本就是 5 分钟量级，无实质差异。故取 (a)。
+    inspectFailed = true
+    throw e // 原样上抛：tick 的 catch 记日志 + healthy=false，抛错语义分毫不改
   } finally {
+    // 🔴 R6-P1①：本轮真跑完成 → 更新持久化的失败标志（成功清零/失败保持），供后续 throttled tick 传播。
+    //    放 finally 而非 return 前：`pooled.length === 0` 那条 early return 也要清零，否则「故障期间
+    //    池子恰好清空」会把 true 永久钉住、心跳再也不发（真跑成功却报不健康）。
+    lastInspectFailed = inspectFailed
     healthRunning = false
   }
+}
+
+// 测试用：清空存活巡检的时刻缓存与持久化失败标志（生产无调用方）
+export function __resetHealthThrottle(): void {
+  lastHealthAt = 0
+  lastInspectFailed = false
 }

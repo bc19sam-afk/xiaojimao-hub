@@ -30,12 +30,14 @@ DB="${DB_PATH:-/app/data/app.db}"
 # 为何需要：migrate() 逐迁移独立提交，一次多迁移的升级若后段失败，库会停在「中间版本」；
 #   restart:unless-stopped 每次重启 schema-check 都判「落后」，没有去重就每次都备份，且备的是
 #   中间态——BACKUP_KEEP 轮转很快把唯一那份「升级前」快照挤掉，恰在最需要回滚时丢掉回滚点。
-# 语义：标记记录升级前快照的绝对路径；跳过备份前先验证该快照文件仍在（fail-closed）。仍在 → 沿用它作
+# 语义：标记记录升级前快照的绝对路径；跳过备份前先验证该快照与 manifest 仍是完整 pair（fail-closed）。
+#   完整 pair 仍在 → 沿用它作
 #   回滚点、跳过备份；未完结的升级链哪怕中途换了目标版本（原目标 v12 卡住、又部署 v13 的新镜像），也共享
 #   这同一份「原始升级前」快照——直到迁移成功 rm 标记才闭环。
-#   为何验证存在而非「存在即跳过」：若 BACKUP_DIR 被改到非持久路径（重建即蒸发）或快照被人删，标记却还在，
-#   裸「存在即跳过」会没回滚点就跑剩余迁移，违背 fail-closed。快照丢了就按当前状态重备一份（可能已是中间
-#   版本，有回滚点总比没有强）。旧格式标记（内容是版本号、非路径）天然走「快照已丢」分支重新备份，兼容无需特判。
+#   为何验证存在而非「存在即跳过」：若 BACKUP_DIR 被改到非持久路径（重建即蒸发）或 pair 被人删，
+#   裸「存在即跳过」会没回滚点就跑剩余迁移，违背 fail-closed。只有 payload 与 manifest 都不存在时才按当前
+#   状态重备一份；任一成员残留或校验失败都中止启动。旧格式标记（内容是版本号、非路径）
+#   在对应路径不存在时走「pair 完全缺失」分支重新备份，兼容无需特判。
 MARKER="$(dirname "$DB")/.upgrade-in-progress"
 BK_DIR="${BACKUP_DIR:-/app/data/backups}"   # 与 scripts/backup.ts 默认解析一致（cwd=/app 的 data/backups）
 LATEST=$(node -e "import('./lib/migrate.ts').then((m) => console.log(m.LATEST_VERSION))")   # 仅供日志
@@ -53,12 +55,17 @@ node -e "import('./lib/env.ts').then(() => {}, (e) => { console.error(String(e &
 if [ -f "$DB" ] && ! node scripts/schema-check.ts; then
   # SNAP：标记里记的快照绝对路径（无标记则空）。`|| true` 保证 set -e 下 cat 缺失不中止。
   SNAP="$([ -f "$MARKER" ] && cat "$MARKER" || true)"
-  if [ -n "$SNAP" ] && [ -f "$SNAP" ]; then
-    echo "[entrypoint] 上次升级（快照 $SNAP）未完结，本次目标 v$LATEST，沿用原升级前快照，跳过备份"
+  SNAP_MANIFEST="${SNAP}.manifest.json"
+  if [ -n "$SNAP" ] && { [ -e "$SNAP" ] || [ -L "$SNAP" ] || [ -e "$SNAP_MANIFEST" ] || [ -L "$SNAP_MANIFEST" ]; }; then
+    if ! node scripts/backup-manifest.ts verify "$SNAP" "$SNAP_MANIFEST" "$(basename "$SNAP")" >/dev/null; then
+      echo "🛑 [entrypoint] 升级标记指向的快照 pair 不完整或已漂移：$SNAP" >&2
+      exit 1
+    fi
+    echo "[entrypoint] 上次升级（快照 pair $SNAP）未完结，本次目标 v$LATEST，沿用原升级前快照，跳过备份"
   else
-    # 标记在但快照已丢：告警后重新备份（echo 包进 if 块，避免 `&& echo` 在 set -e 下假失败中止启动）。
+    # 标记在但 pair 两个成员都缺失：告警后重新备份。部分残留已在上面 fail-closed。
     if [ -n "$SNAP" ]; then
-      echo "⚠️ [entrypoint] 标记在但快照已丢（$SNAP）——重新备份当前状态（可能已是中间版本，有回滚点总比没有强）"
+      echo "⚠️ [entrypoint] 标记在但快照 pair 已完全缺失（$SNAP）——重新备份当前状态（可能已是中间版本）"
     fi
     # 顺序铁律：先备份成功、再写标记。反过来会在备份失败后把下次备份也一起跳掉。
     # 备份 fail-closed：不 || 兜底，靠 set -e——失败即中止启动，绝不带着丢失的回滚点去迁移。
@@ -67,17 +74,44 @@ if [ -f "$DB" ] && ! node scripts/schema-check.ts; then
     echo "[entrypoint] 检测到待迁移，先备份（备份失败即中止，保回滚点）"
     node scripts/backup.ts
     NEW_SNAP=""
+    NEW_COUNT=0
     for f in "$BK_DIR"/backup-*.db; do
-      case "$PRE_LIST" in
-        *"$f"*) ;;           # 备份前就有，跳过
-        *) NEW_SNAP="$f" ;;  # 新增即本次快照（文件名定长同构，无子串误匹配）
-      esac
+      [ -e "$f" ] || [ -L "$f" ] || continue
+      if printf '%s\n' "$PRE_LIST" | grep -Fqx -- "$f"; then
+        continue
+      fi
+      if ! node scripts/backup-manifest.ts verify "$f" "${f}.manifest.json" "$(basename "$f")" >/dev/null; then
+        echo "🛑 [entrypoint] 备份命令发布了不完整或无效的新 pair：$f" >&2
+        exit 1
+      fi
+      NEW_SNAP="$f"
+      NEW_COUNT=$((NEW_COUNT + 1))
     done
+    if [ "$NEW_COUNT" -ne 1 ]; then
+      echo "🛑 [entrypoint] 备份后必须恰好发布 1 个新的有效 pair，实际：$NEW_COUNT" >&2
+      exit 1
+    fi
     # 钉住升级前快照：lib/backup.ts 轮转只认 ^backup-.*\.db$，改名 preupgrade.db 即豁免轮转——
-    #   防「升级卡住期间手动备份 + 低 BACKUP_KEEP」把唯一升级前回滚点转掉。至多一份，下次升级 mv 覆盖。
+    #   防「升级卡住期间手动备份 + 低 BACKUP_KEEP」把唯一升级前回滚点转掉。至多一份，下次升级成对替换。
     PIN="$BK_DIR/preupgrade.db"
-    mv "$NEW_SNAP" "$PIN"
-    echo "$PIN" > "$MARKER"
+    PIN_MANIFEST="${PIN}.manifest.json"
+    if [ -e "$PIN" ] || [ -L "$PIN" ] || [ -e "$PIN_MANIFEST" ] || [ -L "$PIN_MANIFEST" ]; then
+      if ! node scripts/backup-manifest.ts verify "$PIN" "$PIN_MANIFEST" "preupgrade.db" >/dev/null; then
+        echo "🛑 [entrypoint] 旧 preupgrade pair 不完整或已漂移，拒绝覆盖：$PIN" >&2
+        exit 1
+      fi
+      # 删除顺序与发布相反：先撤掉 manifest 提交标志，再删 payload。
+      rm -f "$PIN_MANIFEST"
+      rm -f "$PIN"
+    fi
+    # pin helper 在共享发布锁内先 rename payload，再以新名生成 manifest，
+    # 最后复核 digest/size；不再存在裸 mv 后的无 manifest 安全缺口。
+    node scripts/backup-manifest.ts pin "$NEW_SNAP" "$PIN"
+    node scripts/backup-manifest.ts verify "$PIN" "$PIN_MANIFEST" "preupgrade.db" >/dev/null
+    MARKER_TMP="${MARKER}.tmp.$$"
+    printf '%s\n' "$PIN" > "$MARKER_TMP"
+    chmod 600 "$MARKER_TMP"
+    mv "$MARKER_TMP" "$MARKER"
   fi
 fi
 

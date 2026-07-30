@@ -372,3 +372,56 @@ test('入池当日不结、次日起结：pooled_at 当天 u.date 被下界挡�
   assert.equal(db.balance(uid), 3) // 只发次日 3 次 × 1，入池当日 5 次不算
   assert.equal(db.settlementsFor(id).length, 1)
 })
+
+// ============================================================================
+// P6-R2 复审三轮第 3 条：结算锁 lockHeld 信号（区别于节流 skipped）
+//
+// 🔴 settleDailyUsage 有**三个** `skipped: true` 返回点：① running 锁持有、② grace 窗、
+//    ③ 日闸。只有①是「可能卡死」，②③是正常节流——实测 8s tick、10800 轮/天下，②③ 合计
+//    skip 率 99.99%，若一并并进 healthy 会让心跳一天最多 1 次、而外部 Period 建议 5 分钟
+//    → 恒定误报。故锁语义必须**单列**标志位 `lockHeld`，worker 的 settleIsHealthy 只看它。
+// ============================================================================
+
+test('复审三轮3：结算锁持有 → lockHeld=true + skipped=true', async () => {
+  // 模块级 running 锁：settle 唯一的 await 在锁内，是 `await cpa.getDailyUsage()`——桩掉它、
+  // 让第一次调用「进锁后挂起」，并发第二次调用会被锁挡住。
+  const orig = cpa.getDailyUsage
+  let firstCallResolve: (() => void) | null = null
+  let callCount = 0
+  cpa.getDailyUsage = async () => {
+    callCount++
+    if (callCount === 1) {
+      await new Promise<void>((res) => {
+        firstCallResolve = res
+      })
+    }
+    return []
+  }
+  try {
+    const now = noonToday()
+    const p1 = settle.settleDailyUsage(now, { force: true }) // force 绕过日闸（否则被⑩留的 lastRunDay 挡住）
+    await new Promise((res) => setTimeout(res, 50)) // 确保 p1 已进锁
+    const r2 = await settle.settleDailyUsage(now, { force: true }) // 第二次调用被锁挡住
+    assert.equal(r2.skipped, true, '被锁挡住必须 skip 本轮')
+    assert.equal(r2.lockHeld, true, '🔴 锁语义必须单列标志位，否则节流 skip 会误并进去、心跳假绿')
+    firstCallResolve!() // 放行第一次调用
+    await p1 // 清理
+  } finally {
+    cpa.getDailyUsage = orig
+  }
+})
+
+test('复审三轮3：节流 skip（grace 窗/日闸）→ lockHeld 不为真', async () => {
+  // grace 窗 skip：00:05 早于默认 00:10 闸
+  const base = new Date()
+  const early = new Date(base.getFullYear(), base.getMonth(), base.getDate(), 0, 5).getTime()
+  const r1 = await withUsage([], () => settle.settleDailyUsage(early))
+  assert.equal(r1.skipped, true, '前置：grace 窗确实 skip')
+  assert.ok(!r1.lockHeld, '🔴 节流 skip ≠ 锁卡死，误报会让心跳一天最多 1 次')
+  // 日闸 skip：同日第二次调用
+  const now = noonToday()
+  await withUsage([], () => settle.settleDailyUsage(now)) // 第一次真跑
+  const r2 = await withUsage([], () => settle.settleDailyUsage(now)) // 第二次 skip
+  assert.equal(r2.skipped, true, '前置：日闸确实 skip')
+  assert.ok(!r2.lockHeld, '🔴 日闸 skip ≠ 锁卡死')
+})

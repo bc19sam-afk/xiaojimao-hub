@@ -448,15 +448,47 @@ const realClient: CpaClient = {
   async deleteAuthFile(name) {
     await req('DELETE', `/v0/management/auth-files?name=${encodeURIComponent(name)}`)
   },
+  // 🔴 不变量（P6-R2 R7-P2③ + 对接-R3b）：**本函数只在 run.status === 'completed' 时正常返回**，
+  //    没到可验证成功终态一律抛错。results 只是载荷：字段存在、空数组或非空数组都不能单独证明 run
+  //    已完成。返回 [] 因此单义地表示「completed 且本轮零结果」（号刚落、cpamp 侧还没登记），
+  //    那是正常情况、不是故障。
+  //
+  //    修复前有两条**不抛的失败路径**都 `return []`：
+  //      ① POST run 返回 200 但体里没有 run.id（cpamp 侧建不起巡检任务）；
+  //      ② 轮询 30 轮（约 30s）后 run 仍未 completed、results 仍未出现 → `detail.results ?? []`。
+  //    对接-R3b 又证实：真实首次 GET 可为 running + results: []。旧条件把 [] 的 truthy 当完成，
+  //    会在最终 completed 结果到达前提前返回；running + 非空 partial results 同样不能视为最终集合。
+  //    调用方（collect.ts 的 processPending / checkPooledHealth）看到空数组就一个号都不处理，
+  //    却留 inspectFailed=false ⇒ dead-man 心跳照报健康，而首检/存活巡检链路实际已不可用
+  //    （codex 号一个也进不了池、失效号一个也停不掉），且**完全静默**。
+  //
+  //    ⚠️ 为什么收在这一层而不是 collect.ts：空数组在调用方那里是**三义**的——「没跑成」「跑完
+  //       零结果」「跑完但没覆盖到目标号」。按 `probes.length === 0` 判故障会把后两者一起误报，
+  //       心跳恒不发（已有测试钉住：inspection-mapping「inspect 正常（哪怕本轮一个号都没通过）」、
+  //       health-dashboard「R4-P2③ 反向」）。只有这里还分得清，故在这里把「没跑成」转成异常，
+  //       让调用方现成的 catch（不可观测 → 本轮跳过、置健康信号、绝不误停/误退回）自动接住。
+  //    ⚠️ 抛的是 CPA_UNAVAILABLE：与 req() 失败同一对外文案（§8：绝不透传 cpamp 内部细节），
+  //       调用方只 catch 不看 message，语义一致。
   async inspect() {
     const run = (await req('POST', '/v0/management/codex-inspection/run', {})) as { run?: { id?: number } }
     const id = run.run?.id
-    if (!id) return []
+    if (!id) {
+      console.error('[cpa] codex-inspection/run 未返回 run.id，本轮巡检未能发起') // 原文只进服务端日志
+      throw new Error(CPA_UNAVAILABLE)
+    }
     let detail: { run?: { status?: string }; results?: RawInspectionResult[] } = {}
+    let done = false
     for (let i = 0; i < 30; i++) {
       detail = (await req('GET', `/v0/management/codex-inspection/runs/${id}`)) as typeof detail
-      if (detail.run?.status === 'completed' || detail.results) break
+      if (detail.run?.status === 'completed') {
+        done = true
+        break
+      }
       await sleep(1000)
+    }
+    if (!done) {
+      console.error(`[cpa] codex-inspection run ${id} 轮询 30 次仍未就绪，本轮巡检结果不可观测`)
+      throw new Error(CPA_UNAVAILABLE)
     }
     return (detail.results ?? []).map(mapInspection)
   },
