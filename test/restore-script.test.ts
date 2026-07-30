@@ -1985,10 +1985,11 @@ function runRestore(
   backupsDir: string,
   snapshot: string,
   envOverrides: NodeJS.ProcessEnv = {},
+  shell = 'sh',
 ): { status: number; stdout: string; stderr: string; log: string } {
   const logFile = path.join(path.dirname(dataDir), 'stub.log')
   fs.writeFileSync(logFile, '')
-  const r = spawnSync('sh', [RESTORE_SH, snapshot], {
+  const r = spawnSync(shell, [RESTORE_SH, snapshot], {
     cwd: REPO, // 脚本要求在 compose 所在目录（仓库根）跑
     env: {
       ...process.env,
@@ -6161,7 +6162,7 @@ test('P6-R2 readiness 严格接受：仅 200 + {"ok":true} 释放锁并宣告成
   const r = runRestore(dataDir, backupsDir, snap, {
     TEST_READY_STATUS: '200',
     TEST_READY_BODY: ' { "ok" : true } ',
-  })
+  }, 'dash')
   const calls = r.log.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line) as string[])
   assert.equal(r.status, 0, `合法 readiness 应通过：\n${r.stdout}\n${r.stderr}`)
   assert.match(r.stdout, /恢复完成/)

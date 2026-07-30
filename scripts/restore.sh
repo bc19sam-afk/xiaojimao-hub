@@ -1789,7 +1789,9 @@ control_member_io() {
   _control_io_op="$1"
   _control_io_member="${2:-}"
   _control_io_value="${3:-}"
-  shift 3 || true
+  if [ "$#" -gt 0 ]; then shift; fi
+  if [ "$#" -gt 0 ]; then shift; fi
+  if [ "$#" -gt 0 ]; then shift; fi
   $SUDO node - "$RESTORE_STATE_ROOT" "$RESTORE_CONTROL_LOCK" "$RESTORE_CONTROL_GUARD" \
     "$RESTORE_CONTROL_OWNERSHIP_FILE" "$RESTORE_STATE_KEY" "$DATA_DIR" "$RESTORE_DATA_IDENTITY" \
     "${RESTORE_RUN_GENERATION:-}" \
