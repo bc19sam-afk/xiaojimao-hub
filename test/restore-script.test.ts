@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { createHash } from 'node:crypto'
 import { spawn, spawnSync } from 'node:child_process'
 import { setTimeout as delay } from 'node:timers/promises'
 import { DatabaseSync } from 'node:sqlite'
@@ -12,19 +13,81 @@ import { writeBackupManifestFixture } from './backup-manifest-fixture.ts'
 // ============================================================================
 // scripts/restore.sh 回归（P6-R2 复审必修 1 / 建议 3）
 //
-// 用**桩 docker** 跑真实脚本：桩把 `docker compose run ... -v H:C ... -e <JS>` 里的容器路径按挂载
-// 规格换回宿主路径，然后用真 node 跑那段 JS——于是 VACUUM INTO 是真的在跑、真的读写真 SQLite 库，
-// 只有「起容器」这一层被替换掉。stop/start 默认是空操作，readiness 由 docker exec 桩返回。
+// 用**桩 docker** 跑真实脚本：桩保留 exact-image validator 的 create/inspect/start/rm 合同，
+// 并把唯一只读 snapshot bind 换回宿主路径后用真 Node/SQLite 执行校验。VACUUM INTO、manifest digest、
+// quick_check 与 DB replace 都是真的；只有 Docker daemon 与容器生命周期这一层被可观测桩替代。
 //
 // ⚠️ 测试库隔离（红线）：全程临时目录，DATA_DIR/BACKUP_DIR 都指向 tmp，绝不碰真实 data/。
 // ============================================================================
 
 const REPO = path.resolve(import.meta.dirname, '..')
-const RESTORE_SH = path.join(REPO, 'scripts', 'restore.sh')
+const RESTORE_SH = process.env.RESTORE_SCRIPT ?? path.join(REPO, 'scripts', 'restore.sh')
 
 let tmpDir: string
 let binDir: string
 let originalTmpDir: string | undefined
+let originalRestoreStateDir: string | undefined
+
+function restoreStateRoot(): string {
+  if (process.env.RESTORE_STATE_DIR) {
+    return path.join(
+      fs.realpathSync(path.dirname(process.env.RESTORE_STATE_DIR)),
+      path.basename(process.env.RESTORE_STATE_DIR),
+    )
+  }
+  const parent = fs.realpathSync(process.env.TMPDIR ?? os.tmpdir())
+  return path.join(parent, 'xiaojimao-restore-state')
+}
+
+function restoreStateKey(dataDir: string): string {
+  return createHash('sha256').update(fs.realpathSync(dataDir)).digest('hex')
+}
+
+function restoreControlPath(dataDir: string): string {
+  return path.join(restoreStateRoot(), `${restoreStateKey(dataDir)}.control`)
+}
+
+function restoreHandoffPath(dataDir: string): string {
+  return path.join(restoreStateRoot(), `${restoreStateKey(dataDir)}.published`)
+}
+
+function restoreGuardPath(dataDir: string): string {
+  return path.join(restoreStateRoot(), `${restoreStateKey(dataDir)}.guard`)
+}
+
+function restoreGuardCandidatePath(dataDir: string, suffix = 'fixture'): string {
+  return path.join(restoreStateRoot(), `${restoreStateKey(dataDir)}.guard.candidate.${suffix}`)
+}
+
+function fileIdentity(target: string): string {
+  const stat = fs.lstatSync(target, { bigint: true })
+  return `${stat.dev}:${stat.ino}`
+}
+
+function writePublishedFixture(
+  dataDir: string,
+  containerId = CONTAINER_A,
+  composeProject = 'xiaojimao-hub',
+  composeService = 'app',
+  generation = 'd'.repeat(64),
+): string {
+  ensureRestoreStateRoot()
+  const handoff = restoreHandoffPath(dataDir)
+  fs.writeFileSync(
+    handoff,
+    `v3 ${generation} ${restoreStateKey(dataDir)} ${fileIdentity(dataDir)} ${containerId} ${composeProject} ${composeService} network-published\n`,
+    { mode: 0o600 },
+  )
+  fs.chmodSync(handoff, 0o600)
+  return handoff
+}
+
+function ensureRestoreStateRoot(): string {
+  const root = restoreStateRoot()
+  fs.mkdirSync(root, { recursive: true, mode: 0o700 })
+  fs.chmodSync(root, 0o700)
+  return root
+}
 
 // 桩 docker 的真身：解析 -v/-e，把容器内路径换成宿主路径，再用真 node 跑那段 JS。
 // 顺带充当**断言点**：挂载源必须是存在的绝对路径——相对路径会被真 docker 当成「命名卷」
@@ -58,6 +121,7 @@ if (args[0] === 'image' && args[1] === 'inspect') {
 
 if (args[0] === 'create') {
   if (process.env.TEST_VALIDATOR_CREATE_FAIL === '1') process.exit(78)
+  const nameAt = args.indexOf('--name')
   const mountAt = args.indexOf('--mount')
   const commandAt = args.indexOf('-e')
   const mount = mountAt >= 0 ? args[mountAt + 1] : ''
@@ -66,20 +130,54 @@ if (args[0] === 'create') {
   const js = commandAt >= 0 ? args[commandAt + 1] : ''
   const userAt = args.indexOf('--user')
   const user = userAt >= 0 ? args[userAt + 1] : ''
-  if (!source || !js || !fs.existsSync(source)) process.exit(80)
-  fs.writeFileSync(validatorStatePath, JSON.stringify({ source, js, user }))
+  const name = nameAt >= 0 ? args[nameAt + 1] : ''
+  const image = commandAt > 0 ? args[commandAt - 1] : ''
+  const labels = {}
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] !== '--label' || !args[i + 1]) continue
+    const split = args[i + 1].indexOf('=')
+    if (split > 0) labels[args[i + 1].slice(0, split)] = args[i + 1].slice(split + 1)
+  }
+  if (!source || !js || !name || !fs.existsSync(source)) process.exit(80)
+  if (process.env.TEST_VALIDATOR_FOREIGN_COLLISION === '1') {
+    labels['com.xiaojimao.restore.validator.token'] = 'foreign-token'
+    fs.writeFileSync(validatorStatePath, JSON.stringify({
+      id: 'f'.repeat(64), source, js, user, name, image, labels,
+    }))
+    process.exit(125)
+  }
+  fs.writeFileSync(validatorStatePath, JSON.stringify({
+    id: validatorId, source, js, user, name, image, labels,
+  }))
+  if (process.env.TEST_VALIDATOR_CREATE_LOST_RESPONSE === '1') process.exit(97)
+  if (process.env.TEST_VALIDATOR_CREATE_INVALID_STDOUT === '1') {
+    console.log('not-a-container-id')
+    process.exit(0)
+  }
   console.log(validatorId)
   process.exit(0)
 }
 
-if (args[0] === 'inspect' && args.at(-1) === validatorId) {
+if (args[0] === 'inspect' && fs.existsSync(validatorStatePath)) {
+  const validator = JSON.parse(fs.readFileSync(validatorStatePath, 'utf8'))
+  const ref = args.at(-1)
+  if (ref !== validator.id && ref !== validator.name) process.exit(1)
   if (process.env.TEST_VALIDATOR_INSPECT_FAIL === '1') process.exit(78)
   const formatAt = args.indexOf('--format')
   const format = formatAt >= 0 ? args[formatAt + 1] : ''
-  const validator = JSON.parse(fs.readFileSync(validatorStatePath, 'utf8'))
   if (format.includes('XJM_VALIDATOR_MOUNT')) {
     console.log(['XJM_VALIDATOR_MOUNT', 'bind', validator.source, '/snap.db', 'false'].join('\\t'))
-  } else if (format.includes('.Image')) console.log(validatorImage)
+  } else if (format.includes('.Id')) console.log(validator.id)
+  else if (format.includes('.Name')) console.log('/' + validator.name)
+  else if (format.includes('com.xiaojimao.restore.validator.token')) {
+    console.log(validator.labels['com.xiaojimao.restore.validator.token'] || '')
+  } else if (format.includes('com.xiaojimao.restore.validator.image')) {
+    console.log(validator.labels['com.xiaojimao.restore.validator.image'] || '')
+  } else if (format.includes('com.xiaojimao.restore.validator.snapshot')) {
+    console.log(validator.labels['com.xiaojimao.restore.validator.snapshot'] || '')
+  } else if (format.includes('com.xiaojimao.restore.validator')) {
+    console.log(validator.labels['com.xiaojimao.restore.validator'] || '')
+  } else if (format.includes('.Image')) console.log(validator.image || validatorImage)
   else if (format.includes('.HostConfig.NetworkMode')) console.log('none')
   else if (format.includes('.HostConfig.ReadonlyRootfs')) console.log('true')
   else if (format.includes('.HostConfig.CapDrop')) console.log('["ALL"]')
@@ -93,9 +191,14 @@ if (args[0] === 'inspect' && args.at(-1) === validatorId) {
   process.exit(0)
 }
 
-if (args[0] === 'start' && args.at(-1) === validatorId) {
-  if (process.env.TEST_VALIDATOR_START_FAIL === '1') process.exit(78)
+if (args[0] === 'inspect' && String(args.at(-1) || '').startsWith('xjm-restore-validator-')) {
+  process.exit(1)
+}
+
+if (args[0] === 'start' && fs.existsSync(validatorStatePath)) {
   const validator = JSON.parse(fs.readFileSync(validatorStatePath, 'utf8'))
+  if (args.at(-1) !== validator.id) process.exit(1)
+  if (process.env.TEST_VALIDATOR_START_FAIL === '1') process.exit(78)
   const jail = fs.mkdtempSync(path.join(os.tmpdir(), 'xjm-validator-ro-'))
   const inner = path.join(jail, 'snap.db')
   fs.copyFileSync(validator.source, inner)
@@ -108,10 +211,13 @@ if (args[0] === 'start' && args.at(-1) === validatorId) {
   process.exit(result.status ?? 1)
 }
 
-if (args[0] === 'rm' && args.at(-1) === validatorId) {
+if (args[0] === 'rm' && fs.existsSync(validatorStatePath)) {
+  const validator = JSON.parse(fs.readFileSync(validatorStatePath, 'utf8'))
+  if (args.at(-1) !== validator.id) process.exit(1)
   if (process.env.TEST_VALIDATOR_RM_FAIL === '1') process.exit(78)
   fs.rmSync(validatorStatePath, { force: true })
-  console.log(validatorId)
+  if (process.env.TEST_VALIDATOR_RM_LOST_RESPONSE === '1') process.exit(97)
+  console.log(validator.id)
   process.exit(0)
 }
 
@@ -222,6 +328,13 @@ if (args[0] === 'exec') {
   const status = process.env.TEST_READY_STATUS || '200'
   process.stdout.write(body)
   process.exit(Number(process.env.TEST_READY_EXIT || (status === '200' ? 0 : 8)))
+}
+if (args[0] === 'ps' && args.some((arg) => arg.startsWith('label=com.xiaojimao.restore.validator.token='))) {
+  if (fs.existsSync(validatorStatePath)) {
+    const validator = JSON.parse(fs.readFileSync(validatorStatePath, 'utf8'))
+    console.log(validator.id)
+  }
+  process.exit(0)
 }
 if (args[0] !== 'compose') process.exit(0)
 if (args[1] === 'ps') {
@@ -358,6 +471,7 @@ exit 97
 // 旧的轻量桩继续服务既有用例；新增的身份漂移、网络隔离与 SIGKILL 测试使用本桩。
 const STATEFUL_DOCKER_STUB = `import fs from 'node:fs'
 import path from 'node:path'
+import { createHash } from 'node:crypto'
 import { spawnSync } from 'node:child_process'
 
 const args = process.argv.slice(2)
@@ -381,6 +495,10 @@ if (
 }
 
 function save() { fs.writeFileSync(stateFile, JSON.stringify(state)) }
+function restoreControl(dataSource) {
+  const key = createHash('sha256').update(fs.realpathSync(dataSource)).digest('hex')
+  return path.join(process.env.RESTORE_STATE_DIR, key + '.control')
+}
 function resolveId(ref) {
   if (state.containers[ref]) return ref
   const matches = Object.keys(state.containers).filter((id) => id.startsWith(ref))
@@ -613,7 +731,7 @@ if (args[0] === 'network') {
       }
       while (true) spawnSync('sleep', ['1'])
     }
-    const accepted = fs.existsSync(path.join(container.dataSource + '.restore-control', 'ready-accepted'))
+    const accepted = fs.existsSync(path.join(restoreControl(container.dataSource), 'ready-accepted'))
     state.events.push([
       'network-connect',
       networkName,
@@ -711,7 +829,7 @@ if (args[1] === 'start') {
   process.exit(0)
 }
 if (args[1] === 'config') {
-  const control = state.composeSource + '.restore-control'
+  const control = restoreControl(state.composeSource)
   if (fs.existsSync(path.join(control, 'network-published'))) {
     materializeExtra('after-published')
     save()
@@ -1080,7 +1198,8 @@ function ownerResidualCase(
   makeDb(path.join(dataDir, 'app.db'), 'CURRENT')
   const snap = path.join(backupsDir, 'backup-owner-probe.db')
   makeSnapshot(snap, 'UNUSED')
-  const control = `${fs.realpathSync(dataDir)}.restore-control`
+  const control = restoreControlPath(dataDir)
+  ensureRestoreStateRoot()
   fs.mkdirSync(control, { mode: 0o700 })
   fs.writeFileSync(path.join(control, 'app-started'), '', { mode: 0o600 })
   fs.writeFileSync(path.join(control, 'container-id'), CONTAINER_A + '\n', { mode: 0o600 })
@@ -1088,12 +1207,49 @@ function ownerResidualCase(
   fs.writeFileSync(path.join(control, 'compose-service'), 'app\n', { mode: 0o600 })
   fs.writeFileSync(path.join(control, 'owner-pid'), ownerPid + '\n', { mode: 0o600 })
   fs.writeFileSync(path.join(control, 'owner-start-fingerprint'), ownerFingerprint + '\n', { mode: 0o600 })
+  ensureControlIdentityFixture(control, dataDir)
   const { dir: dockerBin, stateFile } = installStatefulDockerBin(root)
   fs.writeFileSync(stateFile, JSON.stringify(makeDockerState(dataDir)))
   return { dataDir, backupsDir, snap, control, dockerBin, stateFile }
 }
 
-function writeDefinitelyStaleOwnerEvidence(control: string): void {
+function ensureControlIdentityFixture(control: string, dataDir: string): void {
+  const owner = path.join(control, 'control-owner')
+  if (fs.existsSync(owner)) return
+  ensureRestoreStateRoot()
+  const guard = restoreGuardPath(dataDir)
+  const candidate = restoreGuardCandidatePath(dataDir)
+  const generation = createHash('sha256').update(`${control}:fixture-generation`).digest('hex')
+  const guardValue = `v2 ${generation}`
+  fs.writeFileSync(candidate, guardValue + '\n', { mode: 0o600 })
+  fs.chmodSync(candidate, 0o600)
+  fs.linkSync(candidate, guard)
+  const rootStat = fs.lstatSync(restoreStateRoot(), { bigint: true })
+  const dirStat = fs.lstatSync(control, { bigint: true })
+  const fd = fs.openSync(owner, 'wx', 0o600)
+  try {
+    const ownerStat = fs.fstatSync(fd, { bigint: true })
+    fs.writeFileSync(
+      fd,
+      JSON.stringify({
+        version: 3,
+        generation,
+        guard: guardValue,
+        root: `${rootStat.dev}:${rootStat.ino}`,
+        directory: `${dirStat.dev}:${dirStat.ino}`,
+        owner: `${ownerStat.dev}:${ownerStat.ino}`,
+        stateKey: restoreStateKey(dataDir),
+        dataPath: fs.realpathSync(dataDir),
+        dataIdentity: fileIdentity(dataDir),
+      }) + '\n',
+    )
+    fs.fchmodSync(fd, 0o600)
+  } finally {
+    fs.closeSync(fd)
+  }
+}
+
+function writeDefinitelyStaleOwnerEvidence(control: string, dataDir: string): void {
   const ownerPid = String(process.pid)
   let fingerprint: string
   if (process.platform === 'linux') {
@@ -1109,6 +1265,7 @@ function writeDefinitelyStaleOwnerEvidence(control: string): void {
   }
   fs.writeFileSync(path.join(control, 'owner-pid'), ownerPid + '\n', { mode: 0o600 })
   fs.writeFileSync(path.join(control, 'owner-start-fingerprint'), fingerprint + '\n', { mode: 0o600 })
+  ensureControlIdentityFixture(control, dataDir)
 }
 
 before(() => {
@@ -1117,6 +1274,8 @@ before(() => {
   // restore 的 SIGKILL 回归会故意阻止 shell cleanup；把子进程 mktemp 也收进本测试沙箱，
   // 由 after() 连同其余 fixture 一次清理，避免在宿主 TMPDIR 遗留 0600 readiness body。
   process.env.TMPDIR = tmpDir
+  originalRestoreStateDir = process.env.RESTORE_STATE_DIR
+  process.env.RESTORE_STATE_DIR = path.join(tmpDir, 'xiaojimao-restore-state')
   binDir = path.join(tmpDir, 'bin')
   fs.mkdirSync(binDir, { recursive: true })
 
@@ -1138,6 +1297,8 @@ after(() => {
   } finally {
     if (originalTmpDir === undefined) delete process.env.TMPDIR
     else process.env.TMPDIR = originalTmpDir
+    if (originalRestoreStateDir === undefined) delete process.env.RESTORE_STATE_DIR
+    else process.env.RESTORE_STATE_DIR = originalRestoreStateDir
   }
 })
 
@@ -1200,6 +1361,591 @@ function rewriteManifest(p: string, mutate: (value: Record<string, unknown>) => 
   fs.chmodSync(manifestPath, 0o600)
 }
 
+type IngestMutation = 'symlink-swap' | 'rename-replacement' | 'hardlink-alias' | 'inode-rewrite'
+type ControlIdentityMutation = 'directory-replacement' | 'owner-replacement'
+
+function installIngestMutationPreload(
+  root: string,
+  mode: IngestMutation,
+  selected: string,
+  replacement: string,
+): { preload: string; triggered: string } {
+  const preload = path.join(root, 'ingest-' + mode + '.cjs')
+  const triggered = path.join(root, 'ingest-' + mode + '.triggered')
+  const source = [
+    "const fs = require('node:fs')",
+    'const selected = process.env.TEST_INGEST_SELECTED',
+    'const replacement = process.env.TEST_INGEST_REPLACEMENT',
+    "const selectedManifest = selected + '.manifest.json'",
+    "const replacementManifest = replacement + '.manifest.json'",
+    'const trigger = process.env.TEST_INGEST_TRIGGERED',
+    'const mode = process.env.TEST_INGEST_MUTATION',
+    'const originalOpenSync = fs.openSync',
+    'const originalReadSync = fs.readSync',
+    'let payloadFd = -1',
+    '',
+    'function replacePath(source, target, kind) {',
+    '  fs.rmSync(source, { force: true })',
+    "  if (kind === 'symlink-swap') fs.symlinkSync(target, source)",
+    "  else if (kind === 'hardlink-alias') fs.linkSync(target, source)",
+    '  else fs.renameSync(target, source)',
+    '}',
+    '',
+    'function mutatePaths() {',
+    "  if (mode === 'inode-rewrite') {",
+    '    const payload = fs.readFileSync(replacement)',
+    "    const writer = originalOpenSync(selected, 'r+')",
+    '    try {',
+    '      fs.ftruncateSync(writer, 0)',
+    '      let offset = 0',
+    '      while (offset < payload.length) {',
+    '        offset += fs.writeSync(writer, payload, offset, payload.length - offset, offset)',
+    '      }',
+    '      fs.ftruncateSync(writer, payload.length)',
+    '    } finally {',
+    '      fs.closeSync(writer)',
+    '    }',
+    '    fs.writeFileSync(selectedManifest, fs.readFileSync(replacementManifest), { mode: 0o600 })',
+    '    fs.chmodSync(selectedManifest, 0o600)',
+    '    return',
+    '  }',
+    '  replacePath(selected, replacement, mode)',
+    '  replacePath(selectedManifest, replacementManifest, mode)',
+    '}',
+    '',
+    'fs.openSync = function patchedOpenSync(file, ...args) {',
+    '  const fd = originalOpenSync.call(this, file, ...args)',
+    '  if (String(file) === selected && !fs.existsSync(trigger)) {',
+    '    payloadFd = fd',
+    "    if (mode !== 'inode-rewrite') {",
+    "      fs.writeFileSync(trigger, '')",
+    '      mutatePaths()',
+    '    }',
+    '  }',
+    '  return fd',
+    '}',
+    '',
+    'fs.readSync = function patchedReadSync(fd, ...args) {',
+    '  const read = originalReadSync.call(this, fd, ...args)',
+    "  if (mode === 'inode-rewrite' && fd === payloadFd && read === 0 && !fs.existsSync(trigger)) {",
+    "    fs.writeFileSync(trigger, '')",
+    '    mutatePaths()',
+    '  }',
+    '  return read',
+    '}',
+    '',
+  ].join('\n')
+  fs.writeFileSync(preload, source, { mode: 0o600 })
+  return { preload, triggered }
+}
+
+function installVerifierPathSwapPreload(root: string): { preload: string; triggered: string } {
+  const preload = path.join(root, 'verify-path-swap.cjs')
+  const triggered = path.join(root, 'verify-path-swap.triggered')
+  const source = [
+    "const fs = require('node:fs')",
+    'const manifestPath = process.env.TEST_VERIFY_MANIFEST',
+    'const stagePath = process.env.TEST_VERIFY_STAGE',
+    'const replacementStage = process.env.TEST_VERIFY_REPLACEMENT_STAGE',
+    'const replacementManifest = process.env.TEST_VERIFY_REPLACEMENT_MANIFEST',
+    'const trigger = process.env.TEST_VERIFY_TRIGGERED',
+    'const originalOpenSync = fs.openSync',
+    'const originalReadFileSync = fs.readFileSync',
+    'let swapped = false',
+    'function swapPair() {',
+    '  if (swapped || fs.existsSync(trigger)) return',
+    '  swapped = true',
+    "  fs.writeFileSync(trigger, '')",
+    "  fs.renameSync(stagePath, replacementStage + '.selected')",
+    '  fs.renameSync(replacementStage, stagePath)',
+    "  fs.renameSync(manifestPath, replacementManifest + '.selected')",
+    '  fs.renameSync(replacementManifest, manifestPath)',
+    '}',
+    'fs.readFileSync = function patchedReadFileSync(file, ...args) {',
+    '  if (String(file) === manifestPath) swapPair()',
+    '  return originalReadFileSync.call(this, file, ...args)',
+    '}',
+    'fs.openSync = function patchedOpenSync(file, flags, ...args) {',
+    '  const fd = originalOpenSync.call(this, file, flags, ...args)',
+    '  const readOnly = typeof flags === \'number\' &&',
+    '    (flags & fs.constants.O_CREAT) === 0 && (flags & fs.constants.O_WRONLY) === 0 &&',
+    '    (flags & fs.constants.O_RDWR) === 0',
+    '  if (String(file) === manifestPath && readOnly) swapPair()',
+    '  return fd',
+    '}',
+    '',
+  ].join('\n')
+  fs.writeFileSync(preload, source, { mode: 0o600 })
+  return { preload, triggered }
+}
+
+function installControlIdentityMutationPreload(
+  root: string,
+  mode: ControlIdentityMutation,
+  control: string,
+): { preload: string; triggered: string; original: string } {
+  const preload = path.join(root, 'control-' + mode + '.cjs')
+  const triggered = path.join(root, 'control-' + mode + '.triggered')
+  const original = control + '.original'
+  const source = [
+    "const fs = require('node:fs')",
+    "const path = require('node:path')",
+    'const control = process.env.TEST_CONTROL_IDENTITY_PATH',
+    'const trigger = process.env.TEST_CONTROL_IDENTITY_TRIGGERED',
+    'const original = process.env.TEST_CONTROL_IDENTITY_ORIGINAL',
+    'const mode = process.env.TEST_CONTROL_IDENTITY_MUTATION',
+    "const ingestTarget = path.join(control, 'snapshot.db')",
+    'if (process.argv.includes(ingestTarget) && !fs.existsSync(trigger)) {',
+    "  fs.writeFileSync(trigger, '')",
+    "  if (mode === 'owner-replacement') {",
+    "    const owner = path.join(control, 'control-owner')",
+    '    const body = fs.readFileSync(owner)',
+    '    fs.rmSync(owner)',
+    '    fs.writeFileSync(owner, body, { mode: 0o600 })',
+    '    fs.chmodSync(owner, 0o600)',
+    '  } else {',
+    '    fs.renameSync(control, original)',
+    '    fs.mkdirSync(control, { mode: 0o700 })',
+    '    for (const entry of fs.readdirSync(original)) {',
+    '      const sourcePath = path.join(original, entry)',
+    '      const targetPath = path.join(control, entry)',
+    '      const stat = fs.lstatSync(sourcePath)',
+    '      if (!stat.isFile()) throw new Error("unexpected control fixture entry: " + entry)',
+    '      fs.copyFileSync(sourcePath, targetPath)',
+    '      fs.chmodSync(targetPath, stat.mode & 0o777)',
+    '    }',
+    '  }',
+    '}',
+    '',
+  ].join('\n')
+  fs.writeFileSync(preload, source, { mode: 0o600 })
+  return { preload, triggered, original }
+}
+
+function installControlMutationCommand(
+  root: string,
+  control: string,
+  mode: ControlIdentityMutation,
+  label: string,
+): { command: string; triggered: string; original: string } {
+  const command = path.join(root, `mutate-control-${label}.cjs`)
+  const triggered = path.join(root, `mutate-control-${label}.triggered`)
+  const original = `${control}.original-${label}`
+  const source = [
+    "const fs = require('node:fs')",
+    "const path = require('node:path')",
+    'const [control, trigger, original, mode] = process.argv.slice(2)',
+    'if (fs.existsSync(trigger)) process.exit(0)',
+    "fs.writeFileSync(trigger, '')",
+    "if (mode === 'owner-replacement') {",
+    "  const owner = path.join(control, 'control-owner')",
+    '  const body = fs.readFileSync(owner)',
+    '  fs.rmSync(owner)',
+    '  fs.writeFileSync(owner, body, { mode: 0o600 })',
+    '  fs.chmodSync(owner, 0o600)',
+    '} else {',
+    '  fs.renameSync(control, original)',
+    '  fs.mkdirSync(control, { mode: 0o700 })',
+    '  for (const entry of fs.readdirSync(original)) {',
+    '    const sourcePath = path.join(original, entry)',
+    '    const targetPath = path.join(control, entry)',
+    '    const stat = fs.lstatSync(sourcePath)',
+    '    if (!stat.isFile()) throw new Error("unexpected control fixture entry: " + entry)',
+    '    fs.copyFileSync(sourcePath, targetPath)',
+    '    fs.chmodSync(targetPath, stat.mode & 0o777)',
+    '  }',
+    '}',
+    '',
+  ].join('\n')
+  fs.writeFileSync(command, source, { mode: 0o600 })
+  return { command, triggered, original }
+}
+
+function installControlSwapBackRace(
+  root: string,
+  control: string,
+): { dir: string; command: string; state: string; original: string; replacement: string; preload: string } {
+  const dir = path.join(root, 'control-swap-back-bin')
+  const command = path.join(root, 'control-swap-back.cjs')
+  const state = path.join(root, 'control-swap-back.state')
+  const original = `${control}.swap-back-original`
+  const replacement = `${control}.swap-back-replacement`
+  const preload = path.join(root, 'control-swap-back-preload.cjs')
+  fs.mkdirSync(dir, { recursive: true })
+  fs.writeFileSync(
+    command,
+    [
+      "const fs = require('node:fs')",
+      "const path = require('node:path')",
+      'const [mode, control, original, replacement, state] = process.argv.slice(2)',
+      "if (mode === 'swap') {",
+      '  fs.renameSync(control, original)',
+      '  fs.mkdirSync(control, { mode: 0o700 })',
+      '  for (const entry of fs.readdirSync(original)) {',
+      '    const source = path.join(original, entry)',
+      '    const target = path.join(control, entry)',
+      '    const st = fs.lstatSync(source)',
+      '    if (!st.isFile()) throw new Error("unexpected control entry: " + entry)',
+      '    fs.copyFileSync(source, target)',
+      '    fs.chmodSync(target, st.mode & 0o777)',
+      '  }',
+      "  fs.writeFileSync(state, 'swapped\\n')",
+      "} else if (mode === 'restore') {",
+      '  fs.renameSync(control, replacement)',
+      '  fs.renameSync(original, control)',
+      "  fs.writeFileSync(state, 'restored\\n')",
+      '} else {',
+      "  throw new Error('unknown mode')",
+      '}',
+      '',
+    ].join('\n'),
+    { mode: 0o600 },
+  )
+  fs.writeFileSync(
+    path.join(dir, 'node'),
+    `#!/bin/sh
+"${process.execPath}" "$@"
+rc=$?
+if [ "$rc" -eq 0 ] && [ "$2" = "$TEST_CONTROL_SWAP_PATH" ] && \
+   [ ! -e "$TEST_CONTROL_SWAP_STATE" ] && \
+   [ -f "$TEST_PRE_RESTORE_MANIFEST" ] && [ -f "$TEST_PUBLIC_STAGE" ] && \
+   [ ! -e "$TEST_CONTROL_SWAP_PATH/replace-armed" ]; then
+  "${process.execPath}" "$TEST_CONTROL_SWAP_COMMAND" swap \
+    "$TEST_CONTROL_SWAP_PATH" "$TEST_CONTROL_SWAP_ORIGINAL" \
+    "$TEST_CONTROL_SWAP_REPLACEMENT" "$TEST_CONTROL_SWAP_STATE"
+fi
+exit "$rc"
+`,
+    { mode: 0o755 },
+  )
+  fs.writeFileSync(
+    path.join(dir, 'mv'),
+    `#!/bin/sh
+/bin/mv "$@"
+rc=$?
+target=
+for arg in "$@"; do target=$arg; done
+if [ "$rc" -eq 0 ] && [ "$target" = "$TEST_CONTROL_SWAP_PATH/replace-armed" ] && \
+   [ "$(/bin/cat "$TEST_CONTROL_SWAP_STATE" 2>/dev/null)" = swapped ]; then
+  "${process.execPath}" "$TEST_CONTROL_SWAP_COMMAND" restore \
+    "$TEST_CONTROL_SWAP_PATH" "$TEST_CONTROL_SWAP_ORIGINAL" \
+    "$TEST_CONTROL_SWAP_REPLACEMENT" "$TEST_CONTROL_SWAP_STATE"
+fi
+exit "$rc"
+`,
+    { mode: 0o755 },
+  )
+  fs.writeFileSync(
+    path.join(dir, 'chmod'),
+    `#!/bin/sh
+/bin/chmod "$@" || exit $?
+target=
+for arg in "$@"; do target=$arg; done
+if [ "$target" = "$TEST_CONTROL_SWAP_DB" ] && \
+   [ "$(/bin/cat "$TEST_CONTROL_SWAP_STATE" 2>/dev/null)" = restored ]; then
+  exit 73
+fi
+`,
+    { mode: 0o755 },
+  )
+  fs.writeFileSync(
+    preload,
+    [
+      "const fs = require('node:fs')",
+      "const path = require('node:path')",
+      'const control = process.env.TEST_CONTROL_SWAP_PATH',
+      'const original = process.env.TEST_CONTROL_SWAP_ORIGINAL',
+      'const replacement = process.env.TEST_CONTROL_SWAP_REPLACEMENT',
+      'const command = process.env.TEST_CONTROL_SWAP_COMMAND',
+      'const state = process.env.TEST_CONTROL_SWAP_STATE',
+      'const originalRename = fs.renameSync',
+      'let armed = false',
+      'function copyControl() {',
+      '  fs.renameSync(control, original)',
+      '  fs.mkdirSync(control, { mode: 0o700 })',
+      '  for (const entry of fs.readdirSync(original)) {',
+      '    const source = path.join(original, entry)',
+      '    const target = path.join(control, entry)',
+      '    const st = fs.lstatSync(source)',
+      '    if (!st.isFile()) throw new Error("unexpected control entry: " + entry)',
+      '    fs.copyFileSync(source, target)',
+      '    fs.chmodSync(target, st.mode & 0o777)',
+      '  }',
+      "  fs.writeFileSync(state, 'swapped\\n')",
+      '}',
+      'fs.renameSync = function patchedRename(source, target, ...args) {',
+      "  if (!armed && String(target) === 'replace-armed') {",
+      '    armed = true',
+      '    copyControl()',
+      '    const result = originalRename.call(this, source, target, ...args)',
+      '    originalRename.call(this, control, replacement)',
+      '    originalRename.call(this, original, control)',
+      "    fs.writeFileSync(state, 'restored\\n')",
+      '    return result',
+      '  }',
+      '  return originalRename.call(this, source, target, ...args)',
+      '}',
+      '',
+    ].join('\n'),
+    { mode: 0o600 },
+  )
+  return { dir, command, state, original, replacement, preload }
+}
+
+function installRmdirFailurePreload(root: string): { preload: string; triggered: string } {
+  const preload = path.join(root, 'fail-control-rmdir.cjs')
+  const triggered = path.join(root, 'rmdir-failed-once')
+  const source = [
+    "const fs = require('node:fs')",
+    "const path = require('node:path')",
+    'const target = process.env.TEST_FAIL_RMDIR_TARGET',
+    'const marker = process.env.TEST_FAIL_ONCE_MARKER',
+    'const originalRmdirSync = fs.rmdirSync',
+    'fs.rmdirSync = function patchedRmdirSync(file, ...args) {',
+    '  if ((String(file) === target || path.basename(String(file)) === path.basename(target)) && !fs.existsSync(marker)) {',
+    "    fs.writeFileSync(marker, '')",
+    "    const error = new Error('injected control rmdir failure')",
+    "    error.code = 'EIO'",
+    '    throw error',
+    '  }',
+    '  return originalRmdirSync.call(this, file, ...args)',
+    '}',
+    '',
+  ].join('\n')
+  fs.writeFileSync(preload, source, { mode: 0o600 })
+  return { preload, triggered }
+}
+
+type StateFsFailureKind = 'rename' | 'unlink'
+
+function installStateFsFailurePreload(
+  root: string,
+  kind: StateFsFailureKind,
+  target: string,
+): { preload: string; triggered: string } {
+  const preload = path.join(root, `fail-state-${kind}-${path.basename(target)}.cjs`)
+  const triggered = path.join(root, `fail-state-${kind}-${path.basename(target)}.triggered`)
+  const method = kind === 'rename' ? 'renameSync' : 'unlinkSync'
+  const targetArg = kind === 'rename' ? 'destination' : 'file'
+  const source = [
+    "const fs = require('node:fs')",
+    "const path = require('node:path')",
+    `const target = ${JSON.stringify(path.basename(target))}`,
+    `const marker = ${JSON.stringify(triggered)}`,
+    `const original = fs.${method}`,
+    `fs.${method} = function patched(${kind === 'rename' ? 'source, destination' : 'file'}, ...args) {`,
+    `  if (path.basename(String(${targetArg})) === target && !fs.existsSync(marker)) {`,
+    "    fs.writeFileSync(marker, '')",
+    `    const error = new Error('injected state ${kind} failure: ' + target)`,
+    "    error.code = 'EIO'",
+    '    throw error',
+    '  }',
+    `  return original.call(this, ${kind === 'rename' ? 'source, destination' : 'file'}, ...args)`,
+    '}',
+    '',
+  ].join('\n')
+  fs.writeFileSync(preload, source, { mode: 0o600 })
+  return { preload, triggered }
+}
+
+function installStateRootDisappearanceSudoShim(
+  root: string,
+): { shim: string; triggered: string; original: string; log: string } {
+  const shim = path.join(path.dirname(root), 'state-root-disappearance-sudo.sh')
+  const triggered = path.join(path.dirname(root), 'state-root-disappearance.triggered')
+  const original = `${root}.disappeared`
+  const log = path.join(path.dirname(root), 'state-root-disappearance.sudo.log')
+  fs.writeFileSync(
+    shim,
+    `#!/bin/sh
+printf '%s\n' "$*" >> "$TEST_STATE_ROOT_SUDO_LOG"
+if [ "$1" = "node" ] && [ "$2" = "-" ] && \
+   [ "$3" = "$TEST_STATE_ROOT_PATH" ] && [ "$4" = "exists" ] && \
+   [ ! -e "$TEST_STATE_ROOT_TRIGGERED" ]; then
+  /bin/mv "$TEST_STATE_ROOT_PATH" "$TEST_STATE_ROOT_ORIGINAL" || exit $?
+  : > "$TEST_STATE_ROOT_TRIGGERED"
+fi
+exec "$@"
+`,
+    { mode: 0o755 },
+  )
+  fs.writeFileSync(log, '')
+  return { shim, triggered, original, log }
+}
+
+type ControlProbeFailureMode = 'release-verify' | 'cleanup-marker'
+
+function installControlProbeFailurePreload(
+  root: string,
+  control: string,
+  mode: ControlProbeFailureMode,
+  preRestoreTmp = '',
+): { preload: string; triggered: string } {
+  const preload = path.join(root, `control-probe-${mode}.cjs`)
+  const triggered = path.join(root, `control-probe-${mode}.triggered`)
+  const source = [
+    "const fs = require('node:fs')",
+    "const path = require('node:path')",
+    `const control = ${JSON.stringify(control)}`,
+    `const mode = ${JSON.stringify(mode)}`,
+    `const marker = ${JSON.stringify(triggered)}`,
+    `const preRestoreTmp = ${JSON.stringify(preRestoreTmp)}`,
+    'const originalLstatSync = fs.lstatSync',
+    'const originalOpenSync = fs.openSync',
+    'function failOnce(label) {',
+    '  if (fs.existsSync(marker)) return false',
+    "  fs.writeFileSync(marker, label + '\\n')",
+    "  const error = new Error('injected unobservable control probe: ' + label)",
+    "  error.code = 'EIO'",
+    '  throw error',
+    '}',
+    'fs.lstatSync = function patchedLstatSync(file, ...args) {',
+    "  if (mode === 'release-verify' && path.basename(String(file)) === path.basename(control) &&",
+    "      process.argv.includes('verify') &&",
+    "      fs.existsSync(path.join(control, 'network-published')) &&",
+    "      !fs.existsSync(path.join(control, 'networks-reconnecting'))) {",
+    "    failOnce('release-verify')",
+    '  }',
+    '  return originalLstatSync.call(this, file, ...args)',
+    '}',
+    'fs.openSync = function patchedOpenSync(file, ...args) {',
+    "  if (mode === 'cleanup-marker' && path.basename(String(file)) === 'sidecars-clean' &&",
+    "      process.argv.includes('exists') && preRestoreTmp &&",
+    '      fs.existsSync(preRestoreTmp) && fs.statSync(preRestoreTmp).isDirectory()) {',
+    "    failOnce('cleanup-marker')",
+    '  }',
+    '  return originalOpenSync.call(this, file, ...args)',
+    '}',
+    '',
+  ].join('\n')
+  fs.writeFileSync(preload, source, { mode: 0o600 })
+  return { preload, triggered }
+}
+
+type PublicLockProbeFailureMode = 'pre-start' | 'cleanup-unreplaced' | 'cleanup-release'
+
+function installPublicLockProbeFailureSudoShim(
+  root: string,
+  lock: string,
+  mode: PublicLockProbeFailureMode,
+): { shim: string; triggered: string } {
+  const shim = path.join(root, `public-lock-probe-${mode}.sh`)
+  const triggered = path.join(root, `public-lock-probe-${mode}.triggered`)
+  fs.writeFileSync(
+    shim,
+    `#!/bin/sh
+is_probe=0
+node_op=
+if [ "$1" = test ] && [ "$2" = -d ] && [ "$3" = "$TEST_PUBLIC_LOCK" ] && \
+   [ "$TEST_PUBLIC_LOCK_PROBE_MODE" != cleanup-release ]; then
+  is_probe=1
+elif [ "$1" = node ]; then
+  for arg in "$@"; do
+    case "$arg" in
+      public-lock-status|release-lock) node_op="$arg" ;;
+    esac
+  done
+  if [ "$TEST_PUBLIC_LOCK_PROBE_MODE" = cleanup-release ]; then
+    [ "$node_op" = release-lock ] && is_probe=1
+  else
+    [ "$node_op" = public-lock-status ] && is_probe=1
+  fi
+fi
+if [ "$is_probe" -eq 1 ] && [ ! -e "$TEST_PUBLIC_LOCK_PROBE_TRIGGERED" ]; then
+  if { [ "$TEST_PUBLIC_LOCK_PROBE_MODE" = pre-start ] && [ ! -e "$TEST_PUBLIC_LOCK/snapshot.db" ]; } || \
+     { [ "$TEST_PUBLIC_LOCK_PROBE_MODE" = cleanup-unreplaced ] && [ -e "$TEST_PUBLIC_LOCK/snapshot.db" ]; } || \
+     { [ "$TEST_PUBLIC_LOCK_PROBE_MODE" = cleanup-release ] && [ -e "$TEST_PUBLIC_LOCK/snapshot.db" ]; }; then
+    : > "$TEST_PUBLIC_LOCK_PROBE_TRIGGERED"
+    exit 74
+  fi
+fi
+if [ "$1" = chown ]; then exit 0; fi
+if [ "$1" = install ]; then
+  shift
+  set -- "$@"
+  filtered=
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      -o|-g) shift 2 ;;
+      *) filtered="$filtered
+$1"; shift ;;
+    esac
+  done
+  set --
+  old_ifs=$IFS
+  IFS='
+'
+  for arg in $filtered; do set -- "$@" "$arg"; done
+  IFS=$old_ifs
+  exec install "$@"
+fi
+exec "$@"
+`,
+    { mode: 0o755 },
+  )
+  return { shim, triggered }
+}
+
+function installPublicStageRenameMvShim(
+  binDir: string,
+  lock: string,
+): { triggered: string; displaced: string } {
+  const triggered = path.join(path.dirname(lock), 'public-stage-rename.triggered')
+  const displaced = `${lock}.displaced`
+  fs.writeFileSync(
+    path.join(binDir, 'mv'),
+    `#!/bin/sh
+source_path=
+target_path=
+for arg in "$@"; do
+  if [ "$arg" = -- ]; then continue; fi
+  if [ -z "$source_path" ]; then source_path=$arg; else target_path=$arg; fi
+done
+if [ "$source_path" = "$TEST_PUBLIC_STAGE" ] && \
+   [ -e "$TEST_CONTROL_PATH/replace-armed" ] && \
+   [ ! -e "$TEST_PUBLIC_STAGE_RENAME_TRIGGERED" ]; then
+  printf '%s' 'COMMITTED-FRAMES-STAGE-RENAME' > "$TEST_WAL_PATH"
+  printf '%s' 'SHM-STAGE-RENAME' > "$TEST_SHM_PATH"
+  /bin/mv -- "$TEST_PUBLIC_LOCK" "$TEST_PUBLIC_LOCK_DISPLACED" || exit $?
+  : > "$TEST_PUBLIC_STAGE_RENAME_TRIGGERED"
+  exit 75
+fi
+exec /bin/mv "$@"
+`,
+    { mode: 0o755 },
+  )
+  return { triggered, displaced }
+}
+
+function installForeignControlRacePreload(
+  root: string,
+  control: string,
+): { preload: string; triggered: string } {
+  const preload = path.join(root, 'foreign-control-race.cjs')
+  const triggered = path.join(root, 'foreign-control-race.triggered')
+  const source = [
+    "const fs = require('node:fs')",
+    "const path = require('node:path')",
+    `const target = ${JSON.stringify(path.basename(control))}`,
+    `const marker = ${JSON.stringify(triggered)}`,
+    'const original = fs.mkdirSync',
+    'fs.mkdirSync = function patched(file, ...args) {',
+    '  if (path.basename(String(file)) === target && !fs.existsSync(marker)) {',
+    '    original.call(this, file, ...args)',
+    "    fs.writeFileSync(path.join(String(file), 'foreign-note'), 'FOREIGN-CONTROL\\n', { mode: 0o600 })",
+    "    fs.writeFileSync(marker, '')",
+    "    const error = new Error('injected foreign control race')",
+    "    error.code = 'EEXIST'",
+    '    throw error',
+    '  }',
+    '  return original.call(this, file, ...args)',
+    '}',
+    '',
+  ].join('\n')
+  fs.writeFileSync(preload, source, { mode: 0o600 })
+  return { preload, triggered }
+}
+
 function readMarker(p: string): string {
   const d = new DatabaseSync(p, { readOnly: true })
   try {
@@ -1207,6 +1953,21 @@ function readMarker(p: string): string {
   } finally {
     d.close()
   }
+}
+
+function fileSha256(p: string): string {
+  return createHash('sha256').update(fs.readFileSync(p)).digest('hex')
+}
+
+function assertNoDockerMutation(log: string): void {
+  const calls = log.trim()
+    ? log.trim().split('\n').map((line) => JSON.parse(line) as string[])
+    : []
+  const mutations = calls.filter((args) =>
+    ['create', 'rm', 'run', 'start', 'stop', 'network'].includes(args[0] ?? '') ||
+    (args[0] === 'compose' && ['create', 'run', 'start', 'stop', 'up'].includes(args[1] ?? '')),
+  )
+  assert.deepEqual(mutations, [], `state-root 拒绝前不得产生 Docker mutation：${JSON.stringify(mutations)}`)
 }
 
 // 建一套沙箱场景：<case>/data/app.db + <case>/data/backups/
@@ -1474,6 +2235,19 @@ test('P6-R2 validator：不继承 Compose service，使用 exact image + 最小�
     (args) => args[0] === 'create' && args.some((arg) => arg.includes('dst=/snap.db')),
   )
   assert.ok(validatorCreate, '快照校验必须走 docker create，而不是 docker compose run')
+  const nameAt = validatorCreate.indexOf('--name')
+  assert.match(
+    validatorCreate[nameAt + 1] || '',
+    /^xjm-restore-validator-[0-9a-f]{32,}$/,
+    'validator name 必须含每次调用新生成的高熵 ownership token',
+  )
+  const labels = validatorCreate
+    .map((arg, index) => validatorCreate[index - 1] === '--label' ? arg : '')
+    .filter(Boolean)
+  assert.ok(labels.includes('com.xiaojimao.restore.validator=v1'))
+  assert.ok(labels.some((label) => /^com\.xiaojimao\.restore\.validator\.token=[0-9a-f]{32,}$/.test(label)))
+  assert.ok(labels.includes(`com.xiaojimao.restore.validator.image=sha256:${'1'.repeat(64)}`))
+  assert.ok(labels.some((label) => /^com\.xiaojimao\.restore\.validator\.snapshot=[0-9a-f]{64}$/.test(label)))
   assert.ok(validatorCreate.includes('--network') && validatorCreate.includes('none'))
   assert.ok(validatorCreate.includes('--read-only'))
   assert.ok(validatorCreate.includes('--cap-drop') && validatorCreate.includes('ALL'))
@@ -1496,12 +2270,12 @@ test('P6-R2 validator：不继承 Compose service，使用 exact image + 最小�
 })
 
 for (const validatorFailure of [
-  { label: 'image inspect 失败', env: { TEST_VALIDATOR_IMAGE_INSPECT_FAIL: '1' }, created: false },
-  { label: 'create 失败', env: { TEST_VALIDATOR_CREATE_FAIL: '1' }, created: false },
-  { label: 'inspect 失败', env: { TEST_VALIDATOR_INSPECT_FAIL: '1' }, created: true },
-  { label: 'service Env 漂入', env: { TEST_VALIDATOR_ENV_DRIFT: '1' }, created: true },
-  { label: '执行失败', env: { TEST_VALIDATOR_START_FAIL: '1' }, created: true },
-  { label: 'cleanup 失败', env: { TEST_VALIDATOR_RM_FAIL: '1' }, created: true },
+  { label: 'image inspect 失败', env: { TEST_VALIDATOR_IMAGE_INSPECT_FAIL: '1' }, cleanup: false },
+  { label: 'create 失败', env: { TEST_VALIDATOR_CREATE_FAIL: '1' }, cleanup: false },
+  { label: 'inspect 失败', env: { TEST_VALIDATOR_INSPECT_FAIL: '1' }, cleanup: false },
+  { label: 'service Env 漂入', env: { TEST_VALIDATOR_ENV_DRIFT: '1' }, cleanup: true },
+  { label: '执行失败', env: { TEST_VALIDATOR_START_FAIL: '1' }, cleanup: true },
+  { label: 'cleanup 失败', env: { TEST_VALIDATOR_RM_FAIL: '1' }, cleanup: true },
 ] as const) {
   test(`P6-R2 validator fail-closed：${validatorFailure.label} 不得停 app 或改活库`, () => {
     const { dataDir, backupsDir } = scene(`validator-fail-${validatorFailure.label}`, 'CURRENT')
@@ -1513,9 +2287,59 @@ for (const validatorFailure of [
     assert.equal(r.status, 1, `${validatorFailure.label} 必须 fail-closed：\n${r.stdout}\n${r.stderr}`)
     assert.doesNotMatch(r.log, /"stop"/, 'validator 失败必须发生在停 app 前')
     assert.deepEqual(fs.readFileSync(path.join(dataDir, 'app.db')), liveBefore)
-    if (validatorFailure.created) assert.match(r.log, /\["rm","-f"/, '已 create 的 validator 必须尝试清理')
+    if (validatorFailure.cleanup) assert.match(r.log, /\["rm","-f"/, '已核验 ownership 的 validator 必须尝试清理')
   })
 }
+
+for (const ambiguousCreate of [
+  { label: 'create succeeded + lost response', env: { TEST_VALIDATOR_CREATE_LOST_RESPONSE: '1' } },
+  { label: 'create succeeded + invalid stdout', env: { TEST_VALIDATOR_CREATE_INVALID_STDOUT: '1' } },
+] as const) {
+  test(`P6-R2 validator ambiguous create：${ambiguousCreate.label} 必须按 ownership 清理且不停 app`, () => {
+    const { dataDir, backupsDir } = scene(
+      `validator-ambiguous-${ambiguousCreate.label.replaceAll(' ', '-')}`,
+      'CURRENT',
+    )
+    const snap = path.join(backupsDir, 'backup-validator-ambiguous.db')
+    makeSnapshot(snap, 'VALIDATOR-SNAPSHOT')
+    const liveBefore = fs.readFileSync(path.join(dataDir, 'app.db'))
+    const statePath = path.join(path.dirname(dataDir), 'stub.log.validator.json')
+
+    const r = runRestore(dataDir, backupsDir, snap, ambiguousCreate.env)
+    assert.equal(r.status, 1, `ambiguous create 必须拒绝本次恢复：\n${r.stdout}\n${r.stderr}`)
+    assert.doesNotMatch(r.log, /"stop"/)
+    assert.match(r.log, /\["inspect"/)
+    assert.match(r.log, /\["rm","-f","[0-9a-f]{64}"\]/, '只能按 inspect 后的 full ID 清理')
+    assert.equal(fs.existsSync(statePath), false, 'ownership 匹配的 ambiguous create 不得遗留 validator')
+    assert.deepEqual(fs.readFileSync(path.join(dataDir, 'app.db')), liveBefore)
+  })
+}
+
+test('P6-R2 validator ambiguous create：foreign name collision 不得删除未知容器', () => {
+  const { dataDir, backupsDir } = scene('validator-foreign-name-collision', 'CURRENT')
+  const snap = path.join(backupsDir, 'backup-validator-foreign.db')
+  makeSnapshot(snap, 'VALIDATOR-SNAPSHOT')
+  const statePath = path.join(path.dirname(dataDir), 'stub.log.validator.json')
+
+  const r = runRestore(dataDir, backupsDir, snap, { TEST_VALIDATOR_FOREIGN_COLLISION: '1' })
+  assert.equal(r.status, 1)
+  assert.doesNotMatch(r.log, /\["rm","-f"/, 'ownership label 不匹配时绝不能 rm')
+  assert.ok(fs.existsSync(statePath), 'foreign collision 证据必须保留供人工处置')
+  assert.equal(readMarker(path.join(dataDir, 'app.db')), 'CURRENT')
+  fs.rmSync(statePath, { force: true })
+})
+
+test('P6-R2 validator cleanup：rm 已生效但响应丢失时以 label 枚举证明无残留', () => {
+  const { dataDir, backupsDir } = scene('validator-rm-lost-response', 'CURRENT')
+  const snap = path.join(backupsDir, 'backup-validator-rm-lost.db')
+  makeSnapshot(snap, 'VALIDATOR-SNAPSHOT')
+  const statePath = path.join(path.dirname(dataDir), 'stub.log.validator.json')
+
+  const r = runRestore(dataDir, backupsDir, snap, { TEST_VALIDATOR_RM_LOST_RESPONSE: '1' })
+  assert.equal(r.status, 0, `rm 响应丢失但已证明 absent 时应完成恢复：\n${r.stdout}\n${r.stderr}`)
+  assert.equal(fs.existsSync(statePath), false)
+  assert.equal(readMarker(path.join(dataDir, 'app.db')), 'VALIDATOR-SNAPSHOT')
+})
 
 test('P6-R2-R8 provenance：hot rollback-journal 裸拷即使 1/1 + quick_check=ok 也因无 manifest 被拒', () => {
   const { dataDir, backupsDir } = scene('hot-rollback-bare-copy', 'CURRENT')
@@ -1585,6 +2409,79 @@ for (const manifestCase of [
     assert.equal(readMarker(path.join(dataDir, 'app.db')), 'CURRENT')
   })
 }
+
+for (const mutation of [
+  { mode: 'symlink-swap', label: 'verify 后 payload/manifest symlink swap' },
+  { mode: 'rename-replacement', label: 'verify 后 payload/manifest rename replacement' },
+  { mode: 'hardlink-alias', label: 'verify 后 payload/manifest hardlink alias' },
+  { mode: 'inode-rewrite', label: 'opened inode 在 digest 后被改写/截断' },
+] as const) {
+  test(`P6-R2-R8 fd ingest：${mutation.label} 必须在停机前拒绝`, () => {
+    const { dataDir, backupsDir } = scene(`fd-ingest-${mutation.mode}`, 'CURRENT')
+    const selectedDir = path.join(backupsDir, 'selected')
+    const replacementDir = path.join(backupsDir, 'replacement')
+    fs.mkdirSync(selectedDir)
+    fs.mkdirSync(replacementDir)
+    const selected = path.join(selectedDir, 'backup-same-name.db')
+    const replacement = path.join(replacementDir, 'backup-same-name.db')
+    makeSnapshot(selected, 'SELECTED-A')
+    makeSnapshot(replacement, 'REPLACEMENT-B')
+    const selectedAbs = fs.realpathSync(selected)
+    const replacementAbs = fs.realpathSync(replacement)
+    const liveBefore = fs.readFileSync(path.join(dataDir, 'app.db'))
+    const { preload, triggered } = installIngestMutationPreload(
+      path.dirname(dataDir),
+      mutation.mode,
+      selectedAbs,
+      replacementAbs,
+    )
+
+    const r = runRestore(dataDir, backupsDir, selected, {
+      TEST_INGEST_SELECTED: selectedAbs,
+      TEST_INGEST_REPLACEMENT: replacementAbs,
+      TEST_INGEST_TRIGGERED: triggered,
+      TEST_INGEST_MUTATION: mutation.mode,
+      NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --require=${preload}`.trim(),
+    })
+
+    assert.ok(fs.existsSync(triggered), '确定性 preload 必须命中来源 FD 窗口')
+    assert.equal(r.status, 1, `${mutation.label} 必须 fail closed：\n${r.stdout}\n${r.stderr}`)
+    assert.match(r.stderr, /来源|source|identity|metadata|manifest|并发|漂移/i)
+    assert.doesNotMatch(r.log, /"stop"/, '来源身份漂移必须在停机前拒绝')
+    assert.deepEqual(fs.readFileSync(path.join(dataDir, 'app.db')), liveBefore)
+    assert.equal(readMarker(path.join(dataDir, 'app.db')), 'CURRENT')
+  })
+}
+
+test('P6-R2-R8 verifier：manifest FD 建立后 stage pair 被替换必须拒绝且不改库', () => {
+  const { dataDir, backupsDir } = scene('verifier-path-swap', 'CURRENT')
+  const selectedDir = path.join(backupsDir, 'selected')
+  const replacementDir = path.join(backupsDir, 'replacement')
+  fs.mkdirSync(selectedDir)
+  fs.mkdirSync(replacementDir)
+  const selected = path.join(selectedDir, 'backup-verifier-same-name.db')
+  const replacement = path.join(replacementDir, 'backup-verifier-same-name.db')
+  makeSnapshot(selected, 'SELECTED-A')
+  makeSnapshot(replacement, 'REPLACEMENT-B')
+  const control = restoreControlPath(dataDir)
+  const stage = path.join(fs.realpathSync(dataDir), '.restore-in-progress', 'snapshot.db')
+  const controlManifest = path.join(control, 'snapshot.manifest.json')
+  const { preload, triggered } = installVerifierPathSwapPreload(path.dirname(dataDir))
+
+  const r = runRestore(dataDir, backupsDir, selected, {
+    TEST_VERIFY_MANIFEST: controlManifest,
+    TEST_VERIFY_STAGE: stage,
+    TEST_VERIFY_REPLACEMENT_STAGE: replacement,
+    TEST_VERIFY_REPLACEMENT_MANIFEST: backupManifestPath(replacement),
+    TEST_VERIFY_TRIGGERED: triggered,
+    NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --require=${preload}`.trim(),
+  })
+
+  assert.ok(fs.existsSync(triggered), 'verifier path-swap preload 必须命中 manifest FD 窗口')
+  assert.equal(r.status, 1, `stage pair 替换必须 fail closed：\n${r.stdout}\n${r.stderr}`)
+  assert.match(r.stderr, /SHA-256|digest|manifest|不匹配|漂移/i)
+  assert.equal(readMarker(path.join(dataDir, 'app.db')), 'CURRENT')
+})
 
 test('P6-R2-R8 manifest digest：合法 pair 的 snapshot 同大小字节翻转必须在停机前拒绝', () => {
   const { dataDir, backupsDir } = scene('manifest-snapshot-byte-flip', 'CURRENT')
@@ -1678,6 +2575,9 @@ test('P6-R2-R8 manifest fail-closed：snapshot symlink 即使目标 pair 合法�
   makeSnapshot(target, 'REAL')
   const snap = path.join(backupsDir, 'backup-link.db')
   fs.symlinkSync(path.basename(target), snap)
+  const targetManifest = JSON.parse(fs.readFileSync(backupManifestPath(target), 'utf8')) as Record<string, unknown>
+  targetManifest.name = path.basename(snap)
+  fs.writeFileSync(backupManifestPath(snap), JSON.stringify(targetManifest) + '\n', { mode: 0o600 })
   const r = runRestore(dataDir, backupsDir, snap)
   assert.equal(r.status, 1)
   assert.match(r.stderr, /符号链接/)
@@ -2039,7 +2939,7 @@ for (const driftAt of ['after-stop', 'before-start', 'after-start'] as const) {
       TEST_READY_BODY: '{"ok":true}',
     })
     const afterState = readDockerState(stateFile)
-    const control = `${fs.realpathSync(dataA)}.restore-control`
+    const control = restoreControlPath(dataA)
 
     assert.notEqual(r.status, 0, `🔴 容器身份漂移必须 fail-closed：\n${r.stdout}\n${r.stderr}`)
     assert.doesNotMatch(r.stdout, /恢复完成/, '不得把 B 的 readiness 宣告为 A 恢复成功')
@@ -2081,7 +2981,7 @@ test('P6-R2 容器身份：初始即存在额外同 project/service 容器时在
   assert.equal(readMarker(path.join(dataB, 'app.db')), 'B-CURRENT')
   assert.ok(!afterState.events.some((event) => event[0] === 'stop'), '初始身份不唯一时不得先停任一实例')
   assert.ok(!fs.existsSync(path.join(dataA, '.restore-in-progress')))
-  assert.ok(!fs.existsSync(`${fs.realpathSync(dataA)}.restore-control`))
+  assert.ok(!fs.existsSync(restoreControlPath(dataA)))
 })
 
 test('P6-R2 容器身份：Compose ps 返回非完整 64hex ID 时在建锁/停机/写库前拒绝', () => {
@@ -2098,7 +2998,7 @@ test('P6-R2 容器身份：Compose ps 返回非完整 64hex ID 时在建锁/停�
   assert.equal(readMarker(path.join(dataDir, 'app.db')), 'CURRENT')
   assert.doesNotMatch(r.log, /"run"|"stop"|"start"/)
   assert.ok(!fs.existsSync(path.join(dataDir, '.restore-in-progress')))
-  assert.ok(!fs.existsSync(`${fs.realpathSync(dataDir)}.restore-control`))
+  assert.ok(!fs.existsSync(restoreControlPath(dataDir)))
 })
 
 test('P6-R2 容器身份：docker inspect .Id 不等于 Compose 捕获值时在建锁/停机/写库前拒绝', () => {
@@ -2114,7 +3014,7 @@ test('P6-R2 容器身份：docker inspect .Id 不等于 Compose 捕获值时在�
   assert.equal(readMarker(path.join(dataDir, 'app.db')), 'CURRENT')
   assert.ok(!afterState.events.some((event) => event[0] === 'stop'))
   assert.ok(!fs.existsSync(path.join(dataDir, '.restore-in-progress')))
-  assert.ok(!fs.existsSync(`${fs.realpathSync(dataDir)}.restore-control`))
+  assert.ok(!fs.existsSync(restoreControlPath(dataDir)))
 })
 
 test('P6-R2 容器身份：start 后出现额外同 service 容器时拒绝 accepted 并收口所有未验收实例', () => {
@@ -2135,7 +3035,7 @@ test('P6-R2 容器身份：start 后出现额外同 service 容器时拒绝 acce
 
   const r = runStatefulRestore(dataA, backupsDir, snap, dockerBin, stateFile)
   const afterState = readDockerState(stateFile)
-  const control = `${fs.realpathSync(dataA)}.restore-control`
+  const control = restoreControlPath(dataA)
 
   assert.notEqual(r.status, 0, `🔴 start 后 service 身份不再唯一时不得成功：\n${r.stdout}\n${r.stderr}`)
   assert.doesNotMatch(r.stdout, /恢复完成/)
@@ -2168,7 +3068,7 @@ test('P6-R2 cleanup：service 标签枚举失败时不得把未知额外 B 当�
     TEST_FAIL_SERVICE_PS_WHEN_EXTRA: '1',
   })
   const afterState = readDockerState(stateFile)
-  const control = `${fs.realpathSync(dataA)}.restore-control`
+  const control = restoreControlPath(dataA)
 
   assert.notEqual(r.status, 0)
   assert.equal(afterState.containers[CONTAINER_A].running, false, '即使枚举失败也必须先停止已捕获 A')
@@ -2204,7 +3104,7 @@ test('P6-R2 cleanup：Compose ps 枚举失败也必须保留未发布状态不�
     TEST_FAIL_COMPOSE_PS_WHEN_EXTRA: '1',
   })
   const afterState = readDockerState(stateFile)
-  const control = `${fs.realpathSync(dataA)}.restore-control`
+  const control = restoreControlPath(dataA)
 
   assert.notEqual(r.status, 0)
   assert.equal(afterState.containers[CONTAINER_A].running, false, '已捕获 A 必须先停止')
@@ -2234,7 +3134,7 @@ test('P6-R2 cleanup：network-published 后枚举失败时保留 A 并记录发�
     TEST_FAIL_SERVICE_PS_WHEN_EXTRA: '1',
   })
   const afterState = readDockerState(stateFile)
-  const control = `${fs.realpathSync(dataA)}.restore-control`
+  const control = restoreControlPath(dataA)
 
   assert.notEqual(r.status, 0)
   assert.equal(afterState.containers[CONTAINER_A].running, true, 'network-published 后 trusted A 不得反向停机')
@@ -2268,7 +3168,7 @@ test('P6-R2 cleanup：network-published 后 Compose ps 失败也不得释放 acc
     TEST_FAIL_COMPOSE_PS_WHEN_EXTRA: '1',
   })
   const afterState = readDockerState(stateFile)
-  const control = `${fs.realpathSync(dataA)}.restore-control`
+  const control = restoreControlPath(dataA)
 
   assert.notEqual(r.status, 0)
   assert.equal(afterState.containers[CONTAINER_A].running, true, 'published A 必须保留运行')
@@ -2300,7 +3200,7 @@ test('P6-R2 cleanup：network-published 后短 ID 不得把 trusted A 当作额�
     TEST_TRUNCATE_SERVICE_IDS_WHEN_EXTRA: '1',
   })
   const afterState = readDockerState(stateFile)
-  const control = `${fs.realpathSync(dataA)}.restore-control`
+  const control = restoreControlPath(dataA)
 
   assert.notEqual(r.status, 0, '额外 B 出现后必须 fail-closed')
   assert.equal(afterState.containers[CONTAINER_A].running, true, '🔴 trusted published A 不得因短 ID 比较被误停')
@@ -2356,7 +3256,7 @@ test('P6-R2 容器身份：Docker 默认短 ID 时必须显式 no-trunc 后正�
 
 test('P6-R2 方案A SIGKILL：app-started / ready 前实例保持断网，重试先停精确 ID 再 exit 4', async () => {
   const { root, dataDir, backupsDir, snap, dockerBin, stateFile } = publicationCase('sigkill-pre-ready')
-  const control = `${fs.realpathSync(dataDir)}.restore-control`
+  const control = restoreControlPath(dataDir)
   const entered = path.join(root, 'ready-entered')
   const { child, exited } = spawnStatefulRestore(dataDir, backupsDir, snap, dockerBin, stateFile, {
     TEST_READY_ENTERED: entered,
@@ -2399,7 +3299,7 @@ test('P6-R2 方案A SIGKILL：app-started / ready 前实例保持断网，重试
 
 test('P6-R2 方案A SIGKILL：ready-accepted / reconnect 前可验收但仍断网，重试收口后 exit 4', async () => {
   const { root, dataDir, backupsDir, snap, dockerBin, stateFile } = publicationCase('sigkill-pre-reconnect')
-  const control = `${fs.realpathSync(dataDir)}.restore-control`
+  const control = restoreControlPath(dataDir)
   const entered = path.join(root, 'connect-before-effect')
   const { child, exited } = spawnStatefulRestore(dataDir, backupsDir, snap, dockerBin, stateFile, {
     TEST_BLOCK_NETWORK_CONNECT_BEFORE_EFFECT: 'stub-network',
@@ -2432,7 +3332,7 @@ test('P6-R2 方案A SIGKILL：ready-accepted / reconnect 前可验收但仍断�
 
 test('P6-R2 方案A SIGKILL：connect 已生效 / network-published 前，重试撤回 endpoint 并停机', async () => {
   const { root, dataDir, backupsDir, snap, dockerBin, stateFile } = publicationCase('sigkill-post-connect')
-  const control = `${fs.realpathSync(dataDir)}.restore-control`
+  const control = restoreControlPath(dataDir)
   const entered = path.join(root, 'connect-after-effect')
   const { child, exited } = spawnStatefulRestore(dataDir, backupsDir, snap, dockerBin, stateFile, {
     TEST_BLOCK_NETWORK_CONNECT_AFTER_EFFECT: 'stub-network',
@@ -2463,7 +3363,7 @@ test('P6-R2 方案A SIGKILL：connect 已生效 / network-published 前，重试
 
 test('P6-R2 方案A SIGKILL：network-published / lock release 前属于已验收实例，重试不得反向停 A', async () => {
   const { root, dataDir, backupsDir, snap, dockerBin, stateFile } = publicationCase('sigkill-post-published')
-  const control = `${fs.realpathSync(dataDir)}.restore-control`
+  const control = restoreControlPath(dataDir)
   const entered = path.join(root, 'network-published-entered')
   const { child, exited } = spawnStatefulRestore(dataDir, backupsDir, snap, dockerBin, stateFile, {
     TEST_BLOCK_AFTER_NETWORK_PUBLISHED: '1',
@@ -2497,7 +3397,7 @@ test('P6-R2 隔离不变量：start 后被外部接入网络时，probe/accepted
   const state = readDockerState(stateFile)
   state.externalNetworkAt = 'before-ready'
   fs.writeFileSync(stateFile, JSON.stringify(state))
-  const control = `${fs.realpathSync(dataDir)}.restore-control`
+  const control = restoreControlPath(dataDir)
 
   const r = runStatefulRestore(dataDir, backupsDir, snap, dockerBin, stateFile)
   const afterState = readDockerState(stateFile)
@@ -2535,10 +3435,123 @@ test('P6-R2 host-only stage：app 在 stop 前看不到也不能篡改已校验 
     '🔴 stop 前不得创建 app 可换 entry 的 public lock/stage；唯一状态必须在 host-only control',
   )
   assert.equal(readMarker(path.join(dataDir, 'app.db')), 'HOST-ONLY-STAGE-RESTORED')
-  assert.ok(!fs.existsSync(`${fs.realpathSync(dataDir)}.restore-control`), '成功后 host-only 控制锁必须清理')
+  assert.ok(!fs.existsSync(restoreControlPath(dataDir)), '成功后 host-only 控制锁必须清理')
 })
 
-test('P6-R2 host-only 控制面：Compose 额外 bind 覆盖 DATA_DIR 父目录时必须在建锁/停机前拒绝', () => {
+test('P6-R2 private state root：symlink 在 validator/停机/改库前 fail-closed', () => {
+  const { dataDir, backupsDir } = scene('state-root-symlink', 'CURRENT-STATE-SYMLINK')
+  const snap = path.join(backupsDir, 'backup-state-root-symlink.db')
+  makeSnapshot(snap, 'RESTORED-STATE-SYMLINK')
+  const root = path.dirname(dataDir)
+  const target = path.join(root, 'operator-state-target')
+  const stateDir = path.join(root, 'operator-state-link')
+  fs.mkdirSync(target, { mode: 0o700 })
+  fs.chmodSync(target, 0o700)
+  fs.symlinkSync(target, stateDir)
+  const db = path.join(dataDir, 'app.db')
+  const before = fileSha256(db)
+
+  const r = runRestore(dataDir, backupsDir, snap, { RESTORE_STATE_DIR: stateDir })
+
+  assert.equal(r.status, 4)
+  assert.match(r.stderr, /state root.*符号链接|symbolic link/i)
+  assertNoDockerMutation(r.log)
+  assert.equal(fileSha256(db), before)
+  assert.equal(readMarker(db), 'CURRENT-STATE-SYMLINK')
+})
+
+test('P6-R2 private state root：错误 mode 在 validator/停机/改库前 fail-closed', () => {
+  const { dataDir, backupsDir } = scene('state-root-mode', 'CURRENT-STATE-MODE')
+  const snap = path.join(backupsDir, 'backup-state-root-mode.db')
+  makeSnapshot(snap, 'RESTORED-STATE-MODE')
+  const stateDir = path.join(path.dirname(dataDir), 'operator-state')
+  fs.mkdirSync(stateDir, { mode: 0o755 })
+  fs.chmodSync(stateDir, 0o755)
+  const db = path.join(dataDir, 'app.db')
+  const before = fileSha256(db)
+
+  const r = runRestore(dataDir, backupsDir, snap, { RESTORE_STATE_DIR: stateDir })
+
+  assert.equal(r.status, 4)
+  assert.match(r.stderr, /state root.*owner\/mode\/parent|0700/i)
+  assertNoDockerMutation(r.log)
+  assert.equal(fileSha256(db), before)
+  assert.equal(readMarker(db), 'CURRENT-STATE-MODE')
+})
+
+test('P6-R2 private state root：非目录对象在 validator/停机/改库前 fail-closed', () => {
+  const { dataDir, backupsDir } = scene('state-root-file', 'CURRENT-STATE-FILE')
+  const snap = path.join(backupsDir, 'backup-state-root-file.db')
+  makeSnapshot(snap, 'RESTORED-STATE-FILE')
+  const stateDir = path.join(path.dirname(dataDir), 'operator-state')
+  fs.writeFileSync(stateDir, 'not-a-directory\n', { mode: 0o600 })
+  const db = path.join(dataDir, 'app.db')
+  const before = fileSha256(db)
+
+  const r = runRestore(dataDir, backupsDir, snap, { RESTORE_STATE_DIR: stateDir })
+
+  assert.equal(r.status, 4)
+  assert.match(r.stderr, /state root.*非目录|非目录对象/i)
+  assertNoDockerMutation(r.log)
+  assert.equal(fileSha256(db), before)
+  assert.equal(readMarker(db), 'CURRENT-STATE-FILE')
+})
+
+test('P6-R2 private state root：可写 parent 在 validator/停机/改库前 fail-closed', () => {
+  const { dataDir, backupsDir } = scene('state-root-writable-parent', 'CURRENT-STATE-PARENT')
+  const snap = path.join(backupsDir, 'backup-state-root-writable-parent.db')
+  makeSnapshot(snap, 'RESTORED-STATE-PARENT')
+  const stateParent = path.join(path.dirname(dataDir), 'operator-parent')
+  const stateDir = path.join(stateParent, 'state')
+  fs.mkdirSync(stateParent, { mode: 0o777 })
+  fs.chmodSync(stateParent, 0o777)
+  const db = path.join(dataDir, 'app.db')
+  const before = fileSha256(db)
+
+  const r = runRestore(dataDir, backupsDir, snap, { RESTORE_STATE_DIR: stateDir })
+
+  assert.notEqual(r.status, 0)
+  assert.match(r.stderr, /state parent|parent boundary|父目录/i)
+  assertNoDockerMutation(r.log)
+  assert.equal(fs.existsSync(stateDir), false, '不可信 parent 下不得创建 state root')
+  assert.equal(fileSha256(db), before)
+  assert.equal(readMarker(db), 'CURRENT-STATE-PARENT')
+})
+
+test('P6-R2 private state root：初次核验后 root 消失不得被当作 confirmed absent', () => {
+  const { dataDir, backupsDir } = scene('state-root-disappears-after-verify', 'CURRENT-STATE-ROOT')
+  const snap = path.join(backupsDir, 'backup-state-root-disappears.db')
+  makeSnapshot(snap, 'MUST-NOT-INSTALL')
+  const stateRoot = ensureRestoreStateRoot()
+  const failure = installStateRootDisappearanceSudoShim(stateRoot)
+  const db = path.join(dataDir, 'app.db')
+  const before = fileSha256(db)
+
+  try {
+    const r = runRestore(dataDir, backupsDir, snap, {
+      SUDO: failure.shim,
+      TEST_STATE_ROOT_PATH: stateRoot,
+      TEST_STATE_ROOT_TRIGGERED: failure.triggered,
+      TEST_STATE_ROOT_ORIGINAL: failure.original,
+      TEST_STATE_ROOT_SUDO_LOG: failure.log,
+    })
+
+    assert.ok(fs.existsSync(failure.triggered), '前置：必须在 root member exists 之前命中 rename 握手')
+    assert.match(
+      fs.readFileSync(failure.log, 'utf8'),
+      new RegExp(`node - ${stateRoot.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} exists`),
+      '测试必须真正命中 node ... root exists，而不是只走 shell test',
+    )
+    assert.equal(r.status, 4, `root disappearance 必须是不可观测失败：\n${r.stdout}\n${r.stderr}`)
+    assertNoDockerMutation(r.log)
+    assert.equal(fileSha256(db), before, 'root disappearance 前不得修改活库')
+  } finally {
+    fs.rmSync(stateRoot, { recursive: true, force: true })
+    if (fs.existsSync(failure.original)) fs.renameSync(failure.original, stateRoot)
+  }
+})
+
+test('P6-R2 host-only 控制面：Compose 额外 bind 覆盖 private state root 时必须在建锁/停机前拒绝', () => {
   const root = fs.mkdtempSync(path.join(tmpDir, 'control-overlap-compose-'))
   const dataDir = path.join(root, 'data')
   const backupsDir = path.join(dataDir, 'backups')
@@ -2546,21 +3559,24 @@ test('P6-R2 host-only 控制面：Compose 额外 bind 覆盖 DATA_DIR 父目录�
   makeDb(path.join(dataDir, 'app.db'), 'CURRENT')
   const snap = path.join(backupsDir, 'backup-overlap-compose.db')
   makeSnapshot(snap, 'SHOULD-NOT-INSTALL')
+  const privateStateDir = path.join(root, 'operator-state')
   const { dir: dockerBin, stateFile } = installStatefulDockerBin(root)
   const state = makeDockerState(dataDir)
   state.composeExtraBinds = [{ source: root, target: '/app/repo' }]
   state.containers[CONTAINER_A].extraBinds = [{ source: root, target: '/app/repo' }]
   fs.writeFileSync(stateFile, JSON.stringify(state))
 
-  const r = runStatefulRestore(dataDir, backupsDir, snap, dockerBin, stateFile)
+  const r = runStatefulRestore(dataDir, backupsDir, snap, dockerBin, stateFile, {
+    RESTORE_STATE_DIR: privateStateDir,
+  })
   const afterState = readDockerState(stateFile)
 
-  assert.notEqual(r.status, 0, '🔴 app 能经父目录 bind 看见 data.restore-control 时必须 fail-closed')
+  assert.notEqual(r.status, 0, '🔴 app 能经父目录 bind 看见 private state root 时必须 fail-closed')
   assert.match(r.stderr, /host-only|control|bind|挂载.*重叠|祖先/i)
   assert.equal(readMarker(path.join(dataDir, 'app.db')), 'CURRENT')
   assert.ok(!afterState.events.some((event) => event[0] === 'stop'))
   assert.ok(!fs.existsSync(path.join(dataDir, '.restore-in-progress')))
-  assert.ok(!fs.existsSync(`${fs.realpathSync(dataDir)}.restore-control`))
+  assert.ok(!fs.existsSync(privateStateDir))
 })
 
 test('P6-R2 host-only 控制面：现有容器额外 ancestor bind 即使 Compose 未声明也必须拒绝', () => {
@@ -2571,15 +3587,18 @@ test('P6-R2 host-only 控制面：现有容器额外 ancestor bind 即使 Compos
   makeDb(path.join(dataDir, 'app.db'), 'CURRENT')
   const snap = path.join(backupsDir, 'backup-overlap-container.db')
   makeSnapshot(snap, 'SHOULD-NOT-INSTALL')
+  const privateStateDir = path.join(root, 'operator-state')
   const { dir: dockerBin, stateFile } = installStatefulDockerBin(root)
   const state = makeDockerState(dataDir)
   state.containers[CONTAINER_A].extraBinds = [{ source: root, target: '/ops' }]
   fs.writeFileSync(stateFile, JSON.stringify(state))
 
-  const r = runStatefulRestore(dataDir, backupsDir, snap, dockerBin, stateFile)
+  const r = runStatefulRestore(dataDir, backupsDir, snap, dockerBin, stateFile, {
+    RESTORE_STATE_DIR: privateStateDir,
+  })
   const afterState = readDockerState(stateFile)
 
-  assert.notEqual(r.status, 0, '🔴 stale/手工容器的额外 bind 也不得暴露 trusted control sibling')
+  assert.notEqual(r.status, 0, '🔴 stale/手工容器的额外 bind 也不得暴露 private state root')
   assert.match(r.stderr, /host-only|control|bind|实际挂载|祖先/i)
   assert.equal(readMarker(path.join(dataDir, 'app.db')), 'CURRENT')
   assert.ok(!afterState.events.some((event) => event[0] === 'stop'))
@@ -2718,7 +3737,7 @@ test('P6-R2 容器身份：停止态旧容器 config hash 陈旧时仍必须 fai
   assert.equal(readMarker(path.join(dataDir, 'app.db')), 'CURRENT')
   assert.ok(!afterState.events.some((event) => event[0] === 'stop'), 'config hash 门禁必须发生在停机前')
   assert.ok(!fs.existsSync(path.join(dataDir, '.restore-in-progress')))
-  assert.ok(!fs.existsSync(`${fs.realpathSync(dataDir)}.restore-control`))
+  assert.ok(!fs.existsSync(restoreControlPath(dataDir)))
 })
 
 test('P6-R2 网络身份：Compose 显式 mac_address 必须在停机/断网前 fail-closed', () => {
@@ -2742,7 +3761,7 @@ test('P6-R2 网络身份：Compose 显式 mac_address 必须在停机/断网前 
   assert.equal(readMarker(path.join(dataDir, 'app.db')), 'CURRENT')
   assert.ok(!afterState.events.some((event) => event[0] === 'stop'))
   assert.ok(!afterState.events.some((event) => event[0] === 'network-disconnect'))
-  assert.ok(!fs.existsSync(`${fs.realpathSync(dataDir)}.restore-control`))
+  assert.ok(!fs.existsSync(restoreControlPath(dataDir)))
 })
 
 // ============================================================================
@@ -2986,6 +4005,7 @@ test('R3-新② trap 陷阱：stop 后 armed 状态原子写入失败，app 仍�
   makeSnapshot(snapshotPath, 'SNAPSHOT-NOT-APPLIED')
 
   const failBin = path.join(path.dirname(dataDir), 'install-fail-bin')
+  const failure = installStateFsFailurePreload(path.dirname(dataDir), 'rename', 'replace-armed')
   fs.mkdirSync(failBin, { recursive: true })
   fs.writeFileSync(
     path.join(failBin, 'docker'),
@@ -3030,16 +4050,13 @@ fi
       DATA_DIR: dataDir,
       BACKUP_DIR: backupsDir,
       APP_URL: 'http://stub',
-      TEST_FAIL_INSTALL_TARGET: path.join(`${fs.realpathSync(dataDir)}.restore-control`, 'replace-armed'),
-      TEST_FAIL_MKTEMP_TEMPLATE: path.join(
-        `${fs.realpathSync(dataDir)}.restore-control`,
-        '.replace-armed.tmp.XXXXXX',
-      ),
+      NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --require=${failure.preload}`.trim(),
     },
     encoding: 'utf8',
   })
 
-  assert.equal(r.status, 73, `armed 标记写入失败应保留原退出码：\n${r.stdout}\n${r.stderr}`)
+  assert.equal(r.status, 1, `armed 标记写入失败应 fail closed：\n${r.stdout}\n${r.stderr}`)
+  assert.ok(fs.existsSync(failure.triggered), '行为级 preload 必须命中 replace-armed 原子发布')
   const calls = fs.readFileSync(logFile, 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse)
   const startCalls = calls.filter((c) => c[0] === 'start' && c[1] === CONTAINER_A)
   assert.ok(startCalls.length >= 1, `trap 应调用 start app（实际 start 调用 ${startCalls.length} 次）`)
@@ -3053,12 +4070,13 @@ test('P6-R2 未运行容器：换库前失败不得把原本停止的 app 启起
   makeSnapshot(snapshotPath, 'SNAPSHOT-NOT-APPLIED')
 
   const failBin = installArmedMarkerFailureBin(path.dirname(dataDir))
+  const failure = installStateFsFailurePreload(path.dirname(dataDir), 'rename', 'replace-armed')
 
   const logFile = path.join(path.dirname(dataDir), 'stub.log')
   fs.writeFileSync(logFile, '')
   // docker stub 的 .stopped 文件模拟 restore 开始前容器本来就是停止态。
   fs.writeFileSync(logFile + '.stopped', '')
-  const control = `${fs.realpathSync(dataDir)}.restore-control`
+  const control = restoreControlPath(dataDir)
   const r = spawnSync('sh', [RESTORE_SH, snapshotPath], {
     cwd: REPO,
     env: {
@@ -3068,13 +4086,13 @@ test('P6-R2 未运行容器：换库前失败不得把原本停止的 app 启起
       SUDO: '',
       DATA_DIR: dataDir,
       BACKUP_DIR: backupsDir,
-      TEST_FAIL_INSTALL_TARGET: path.join(control, 'replace-armed'),
-      TEST_FAIL_MKTEMP_TEMPLATE: path.join(control, '.replace-armed.tmp.XXXXXX'),
+      NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --require=${failure.preload}`.trim(),
     },
     encoding: 'utf8',
   })
 
-  assert.equal(r.status, 73, `换库前阶段失败应保留注入退出码：\n${r.stdout}\n${r.stderr}`)
+  assert.equal(r.status, 1, `换库前阶段失败应 fail closed：\n${r.stdout}\n${r.stderr}`)
+  assert.ok(fs.existsSync(failure.triggered))
   const calls = fs.readFileSync(logFile, 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse)
   assert.equal(
     calls.filter((call) => call[0] === 'start' && call[1] === CONTAINER_A).length,
@@ -3091,9 +4109,10 @@ test('P6-R2 新建容器：Compose create 的停止态实例在换库前失败�
   const snapshotPath = path.join(backupsDir, 'backup-created-stopped.db')
   makeSnapshot(snapshotPath, 'SNAPSHOT-NOT-APPLIED')
   const failBin = installArmedMarkerFailureBin(path.dirname(dataDir))
+  const failure = installStateFsFailurePreload(path.dirname(dataDir), 'rename', 'replace-armed')
   const logFile = path.join(path.dirname(dataDir), 'stub.log')
   fs.writeFileSync(logFile, '')
-  const control = `${fs.realpathSync(dataDir)}.restore-control`
+  const control = restoreControlPath(dataDir)
 
   const r = spawnSync('sh', [RESTORE_SH, snapshotPath], {
     cwd: REPO,
@@ -3105,14 +4124,14 @@ test('P6-R2 新建容器：Compose create 的停止态实例在换库前失败�
       DATA_DIR: dataDir,
       BACKUP_DIR: backupsDir,
       TEST_CONTAINER_MOUNT_MODE: 'container-missing',
-      TEST_FAIL_INSTALL_TARGET: path.join(control, 'replace-armed'),
-      TEST_FAIL_MKTEMP_TEMPLATE: path.join(control, '.replace-armed.tmp.XXXXXX'),
+      NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --require=${failure.preload}`.trim(),
     },
     encoding: 'utf8',
   })
 
   const calls = fs.readFileSync(logFile, 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse)
-  assert.equal(r.status, 73, `create 后换库前失败应保留注入退出码：\n${r.stdout}\n${r.stderr}`)
+  assert.equal(r.status, 1, `create 后换库前失败应 fail closed：\n${r.stdout}\n${r.stderr}`)
+  assert.ok(fs.existsSync(failure.triggered))
   assert.ok(calls.some((call) => call[0] === 'compose' && call[1] === 'create'), '前置：确实 create 了停止态容器')
   assert.equal(
     calls.filter((call) => call[0] === 'start' && call[1] === CONTAINER_A).length,
@@ -3129,10 +4148,11 @@ test('P6-R2 镜像回滚：--after-image-rollback 的停止态旧容器在 DB �
   makeSnapshot(snapshotPath, 'ROLLBACK-SNAPSHOT-NOT-APPLIED')
   fs.writeFileSync(path.join(dataDir, '.upgrade-in-progress'), snapshotPath + '\n')
   const failBin = installArmedMarkerFailureBin(path.dirname(dataDir))
+  const failure = installStateFsFailurePreload(path.dirname(dataDir), 'rename', 'replace-armed')
   const logFile = path.join(path.dirname(dataDir), 'stub.log')
   fs.writeFileSync(logFile, '')
   fs.writeFileSync(logFile + '.stopped', '')
-  const control = `${fs.realpathSync(dataDir)}.restore-control`
+  const control = restoreControlPath(dataDir)
 
   const r = spawnSync('sh', [RESTORE_SH, '--after-image-rollback', snapshotPath], {
     cwd: REPO,
@@ -3143,14 +4163,14 @@ test('P6-R2 镜像回滚：--after-image-rollback 的停止态旧容器在 DB �
       SUDO: '',
       DATA_DIR: dataDir,
       BACKUP_DIR: backupsDir,
-      TEST_FAIL_INSTALL_TARGET: path.join(control, 'replace-armed'),
-      TEST_FAIL_MKTEMP_TEMPLATE: path.join(control, '.replace-armed.tmp.XXXXXX'),
+      NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --require=${failure.preload}`.trim(),
     },
     encoding: 'utf8',
   })
 
   const calls = fs.readFileSync(logFile, 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse)
-  assert.equal(r.status, 73, `rollback DB 替换前失败应保留注入退出码：\n${r.stdout}\n${r.stderr}`)
+  assert.equal(r.status, 1, `rollback DB 替换前失败应 fail closed：\n${r.stdout}\n${r.stderr}`)
+  assert.ok(fs.existsSync(failure.triggered))
   assert.equal(
     calls.filter((call) => call[0] === 'start' && call[1] === CONTAINER_A).length,
     0,
@@ -3591,7 +4611,7 @@ exec /usr/bin/head "$@"
     TEST_SUDO_LOG: sudoLog,
     TEST_CHOWN_LOG: sudoLog,
     TEST_HEAD_LOG: headLog,
-    TEST_ROOT_READY_BODY: path.join(`${fs.realpathSync(dataDir)}.restore-control`, 'ready-body'),
+    TEST_ROOT_READY_BODY: path.join(restoreControlPath(dataDir), 'ready-body'),
   }
   delete env.SUDO
   const r = spawnSync('sh', [RESTORE_SH, snap], {
@@ -3609,12 +4629,17 @@ exec /usr/bin/head "$@"
     '🔴 两层锁不得 chown 给可能与 app 相同的 caller UID',
   )
   assert.match(sudoCalls, /chmod 700 .*\.restore-in-progress/, 'public evidence 锁应以 root 权限收紧')
-  assert.match(sudoCalls, /chmod 700 .*\.restore-control/, 'host-only 控制锁应以 root 权限收紧')
-  const headCalls = fs.readFileSync(headLog, 'utf8').trim().split('\n').filter(Boolean)
-  assert.ok(headCalls.length >= 1, '前置：必须实际执行过私有 stage 的文件头读取')
-  assert.ok(
-    headCalls.every((line) => line.startsWith('elevated=1 ')),
-    `🔴 私有 stage 的宿主文件头读取不得绕过 sudo：\n${headCalls.join('\n')}`,
+  assert.match(sudoCalls, /node - .*xiaojimao-restore-state create/, 'private state root 必须经提权创建/核验')
+  assert.match(
+    sudoCalls,
+    /copy-out snapshot\.db .*\.restore-in-progress\/snapshot\.db/,
+    'host-only snapshot 必须通过已绑定 control inode 的 copy-out 写入 replace stage',
+  )
+  assert.match(sudoCalls, /copy-in ready-body /, 'readiness body 必须通过 control member copy-in 发布')
+  assert.doesNotMatch(
+    sudoCalls,
+    /install .*xiaojimao-restore-state.*snapshot\.db .*\.restore-in-progress/,
+    '🔴 不得重新按 private snapshot pathname 打开后 install',
   )
 })
 
@@ -3638,7 +4663,7 @@ test('P6-R2 host-only control 预存目录：guard acquisition 前 fail-closed �
   const { dataDir, backupsDir } = scene('restore-control-preexisting', 'CURRENT-CONTROL-PREEXISTING')
   const snap = path.join(backupsDir, 'backup-control-preexisting.db')
   makeSnapshot(snap, 'SNAPSHOT-CONTROL-PREEXISTING')
-  const control = `${fs.realpathSync(dataDir)}.restore-control`
+  const control = restoreControlPath(dataDir)
   fs.mkdirSync(control, { mode: 0o700 })
   const marker = path.join(control, 'foreign-note')
   fs.writeFileSync(marker, 'leave me alone\n', { mode: 0o600 })
@@ -3652,11 +4677,40 @@ test('P6-R2 host-only control 预存目录：guard acquisition 前 fail-closed �
   assert.equal(readMarker(path.join(dataDir, 'app.db')), 'CURRENT-CONTROL-PREEXISTING')
 })
 
+test('P6-R2 stale control identity：伪造 owner/container 状态但无 v3 control-owner 时不得 containment', () => {
+  const { dataDir, backupsDir, snap, dockerBin, stateFile } = publicationCase('forged-stale-control')
+  const control = restoreControlPath(dataDir)
+  fs.mkdirSync(control, { mode: 0o700 })
+  fs.writeFileSync(path.join(control, 'app-started'), '\n', { mode: 0o600 })
+  fs.writeFileSync(path.join(control, 'container-id'), `${CONTAINER_A}\n`, { mode: 0o600 })
+  fs.writeFileSync(path.join(control, 'compose-project'), 'xiaojimao-hub\n', { mode: 0o600 })
+  fs.writeFileSync(path.join(control, 'compose-service'), 'app\n', { mode: 0o600 })
+  fs.writeFileSync(path.join(control, 'owner-pid'), '999999\n', { mode: 0o600 })
+  const forgedStaleFingerprint = process.platform === 'linux'
+    ? linuxOwnerFingerprint('1', '00000000-0000-4000-8000-000000000000')
+    : `v2 darwin-ps ${process.getuid?.() ?? 0} 0:0`
+  fs.writeFileSync(
+    path.join(control, 'owner-start-fingerprint'),
+    forgedStaleFingerprint + '\n',
+    { mode: 0o600 },
+  )
+
+  const r = runStatefulRestore(dataDir, backupsDir, snap, dockerBin, stateFile)
+  const afterState = readDockerState(stateFile)
+
+  assert.equal(r.status, 4)
+  assert.match(r.stderr, /v2|control-owner|guard|identity|身份/i)
+  assert.equal(afterState.containers[CONTAINER_A].running, true, 'foreign control 不得授权停止 exact ID')
+  assert.equal(afterState.containers[CONTAINER_A].networks.length, 1, 'foreign control 不得授权断开网络')
+  assert.ok(!afterState.events.some((event) => event[0] === 'stop' || event[0] === 'network-disconnect'))
+  assert.ok(fs.existsSync(control), 'forged control 必须原样保留供人工审计')
+})
+
 test('P6-R2 control ownership：本进程取得 guard 后他人抢先创建 control 也不得被 cleanup 删除', () => {
   const { dataDir, backupsDir } = scene('restore-control-foreign-after-guard', 'CURRENT-FOREIGN-RACE')
   const snap = path.join(backupsDir, 'backup-control-foreign-race.db')
   makeSnapshot(snap, 'SNAPSHOT-FOREIGN-RACE')
-  const control = `${fs.realpathSync(dataDir)}.restore-control`
+  const control = restoreControlPath(dataDir)
   const raceBin = path.join(path.dirname(dataDir), 'control-foreign-race-bin')
   const foreignNote = path.join(control, 'foreign-note')
   fs.mkdirSync(raceBin, { recursive: true })
@@ -3668,29 +4722,210 @@ test('P6-R2 control ownership：本进程取得 guard 后他人抢先创建 cont
   installReadyCurlStub(raceBin)
   fs.writeFileSync(
     path.join(raceBin, 'node'),
+    `#!/bin/sh\nexec "${process.execPath}" "$@"\n`,
+    { mode: 0o755 },
+  )
+  const race = installForeignControlRacePreload(path.dirname(dataDir), control)
+
+  const r = runRestore(dataDir, backupsDir, snap, {
+    PATH: `${raceBin}:${process.env.PATH}`,
+    NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --require=${race.preload}`.trim(),
+  })
+  assert.equal(r.status, 4, `抢先出现的 foreign control 必须 fail-closed：\n${r.stdout}\n${r.stderr}`)
+  assert.equal(fs.readFileSync(foreignNote, 'utf8'), 'FOREIGN-CONTROL\n')
+  assert.ok(fs.existsSync(race.triggered), '确定性 preload 必须命中 guard 后/control mkdir 前竞态')
+  assert.ok(fs.existsSync(control), '本进程只有 guard，没有 control ownership token，不得删 foreign control')
+  assert.equal(fs.existsSync(restoreGuardPath(dataDir)), false, '本进程的 guard 应自行释放')
+  assert.equal(readMarker(path.join(dataDir, 'app.db')), 'CURRENT-FOREIGN-RACE')
+  assert.doesNotMatch(r.log, /"stop"/)
+})
+
+for (const mutation of [
+  { mode: 'directory-replacement', label: 'control directory dev/inode 被替换' },
+  { mode: 'owner-replacement', label: 'control-owner inode 被替换但内容相同' },
+] as const) {
+  test(`P6-R2 control identity：${mutation.label} 时 active cleanup 必须保留现场`, () => {
+    const { dataDir, backupsDir } = scene(`control-identity-${mutation.mode}`, 'CURRENT')
+    const snap = path.join(backupsDir, 'backup-control-identity.db')
+    makeSnapshot(snap, 'SNAPSHOT')
+    const control = restoreControlPath(dataDir)
+    const { preload, triggered, original } = installControlIdentityMutationPreload(
+      path.dirname(dataDir),
+      mutation.mode,
+      control,
+    )
+
+    const r = runRestore(dataDir, backupsDir, snap, {
+      TEST_VALIDATOR_CREATE_FAIL: '1',
+      TEST_CONTROL_IDENTITY_PATH: control,
+      TEST_CONTROL_IDENTITY_TRIGGERED: triggered,
+      TEST_CONTROL_IDENTITY_ORIGINAL: original,
+      TEST_CONTROL_IDENTITY_MUTATION: mutation.mode,
+      NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --require=${preload}`.trim(),
+    })
+
+    assert.equal(r.status, 1, `identity 漂移必须 fail closed：\n${r.stdout}\n${r.stderr}`)
+    assert.ok(fs.existsSync(triggered), '确定性 preload 必须命中 active control 窗口')
+    assert.ok(fs.existsSync(control), 'identity 漂移后 replacement control 必须保留')
+    assert.ok(fs.existsSync(path.join(control, 'control-owner')), 'replacement control-owner 不得被删除')
+    if (mutation.mode === 'directory-replacement') {
+      assert.ok(fs.existsSync(original), '原 control 也应保留为审计证据')
+    }
+    assert.match(r.stderr, /control.*(identity|所有权|漂移)|dev\/inode/i)
+    assert.doesNotMatch(r.log, /"stop"/)
+    assert.equal(readMarker(path.join(dataDir, 'app.db')), 'CURRENT')
+  })
+}
+
+test('P6-R2 control identity：replace 后 directory 漂移必须先收口 exact app 再保留现场', () => {
+  const { root, dataDir, backupsDir, snap, dockerBin, stateFile } = publicationCase('control-drift-post-replace')
+  const control = restoreControlPath(dataDir)
+  const mutation = installControlMutationCommand(root, control, 'directory-replacement', 'post-replace')
+  fs.writeFileSync(
+    path.join(dockerBin, 'chmod'),
     `#!/bin/sh
-if [ -f "$TEST_CONTROL_GUARD" ] && [ ! -e "$TEST_CONTROL_LOCK" ]; then
-  /bin/mkdir "$TEST_CONTROL_LOCK" || exit $?
-  printf '%s\n' FOREIGN-CONTROL > "$TEST_CONTROL_LOCK/foreign-note"
-  /bin/chmod 600 "$TEST_CONTROL_LOCK/foreign-note"
-  exit 73
+target=
+for arg in "$@"; do target="$arg"; done
+/bin/chmod "$@" || exit $?
+if [ "$target" = "$TEST_CONTROL_MUTATE_DB" ] && [ ! -e "$TEST_CONTROL_MUTATE_TRIGGER" ]; then
+  "${process.execPath}" "$TEST_CONTROL_MUTATE_COMMAND" "$TEST_CONTROL_MUTATE_PATH" \
+    "$TEST_CONTROL_MUTATE_TRIGGER" "$TEST_CONTROL_MUTATE_ORIGINAL" "$TEST_CONTROL_MUTATE_MODE"
 fi
-exec "${process.execPath}" "$@"
 `,
     { mode: 0o755 },
   )
 
-  const r = runRestore(dataDir, backupsDir, snap, {
-    PATH: `${raceBin}:${process.env.PATH}`,
-    TEST_CONTROL_LOCK: control,
-    TEST_CONTROL_GUARD: `${control}.guard`,
+  const r = runStatefulRestore(dataDir, backupsDir, snap, dockerBin, stateFile, {
+    TEST_CONTROL_MUTATE_DB: path.join(fs.realpathSync(dataDir), 'app.db'),
+    TEST_CONTROL_MUTATE_COMMAND: mutation.command,
+    TEST_CONTROL_MUTATE_PATH: control,
+    TEST_CONTROL_MUTATE_TRIGGER: mutation.triggered,
+    TEST_CONTROL_MUTATE_ORIGINAL: mutation.original,
+    TEST_CONTROL_MUTATE_MODE: 'directory-replacement',
   })
-  assert.equal(r.status, 4, `抢先出现的 foreign control 必须 fail-closed：\n${r.stdout}\n${r.stderr}`)
-  assert.equal(fs.readFileSync(foreignNote, 'utf8'), 'FOREIGN-CONTROL\n')
-  assert.ok(fs.existsSync(control), '本进程只有 guard，没有 control ownership token，不得删 foreign control')
-  assert.equal(fs.existsSync(`${control}.guard`), false, '本进程的 guard 应自行释放')
-  assert.equal(readMarker(path.join(dataDir, 'app.db')), 'CURRENT-FOREIGN-RACE')
-  assert.doesNotMatch(r.log, /"stop"/)
+  const afterState = readDockerState(stateFile)
+
+  assert.notEqual(r.status, 0)
+  assert.ok(fs.existsSync(mutation.triggered), '确定性 mutation 必须发生在 app.db replace 后')
+  assert.equal(readMarker(path.join(dataDir, 'app.db')), 'ACCEPTED-SNAPSHOT')
+  assert.equal(afterState.containers[CONTAINER_A].running, false)
+  assert.deepEqual(afterState.containers[CONTAINER_A].networks, [], 'identity 漂移后未发布实例必须撤回 endpoint')
+  assert.ok(fs.existsSync(control), 'replacement control 不得删除')
+  assert.ok(fs.existsSync(mutation.original), '原 control 必须保留为审计证据')
+  assert.match(r.stderr, /control.*identity|所有权|漂移|收口/i)
+  assert.doesNotMatch(r.stdout, /恢复完成/)
+})
+
+test('P6-R2 control identity：docker start 生效后 owner 漂移必须停止并隔离 exact app', () => {
+  const { root, dataDir, backupsDir, snap, dockerBin, stateFile } = publicationCase('control-drift-post-start')
+  const control = restoreControlPath(dataDir)
+  const mutation = installControlMutationCommand(root, control, 'owner-replacement', 'post-start')
+  fs.writeFileSync(
+    path.join(dockerBin, 'docker'),
+    `#!/bin/sh
+"${process.execPath}" "${path.join(dockerBin, 'docker-stateful.mjs')}" "$@"
+rc=$?
+if [ "$rc" -eq 0 ] && [ "$1" = "start" ] && [ "$2" = "${CONTAINER_A}" ] && \
+   [ ! -e "$TEST_CONTROL_MUTATE_TRIGGER" ]; then
+  "${process.execPath}" "$TEST_CONTROL_MUTATE_COMMAND" "$TEST_CONTROL_MUTATE_PATH" \
+    "$TEST_CONTROL_MUTATE_TRIGGER" "$TEST_CONTROL_MUTATE_ORIGINAL" "$TEST_CONTROL_MUTATE_MODE"
+fi
+exit "$rc"
+`,
+    { mode: 0o755 },
+  )
+
+  const r = runStatefulRestore(dataDir, backupsDir, snap, dockerBin, stateFile, {
+    TEST_CONTROL_MUTATE_COMMAND: mutation.command,
+    TEST_CONTROL_MUTATE_PATH: control,
+    TEST_CONTROL_MUTATE_TRIGGER: mutation.triggered,
+    TEST_CONTROL_MUTATE_ORIGINAL: mutation.original,
+    TEST_CONTROL_MUTATE_MODE: 'owner-replacement',
+  })
+  const afterState = readDockerState(stateFile)
+
+  assert.notEqual(r.status, 0)
+  assert.ok(fs.existsSync(mutation.triggered), 'mutation 必须发生在 exact app start 已生效后')
+  assert.ok(afterState.events.some((event) => event[0] === 'start' && event[1] === CONTAINER_A))
+  assert.equal(afterState.containers[CONTAINER_A].running, false, 'start 后 owner 漂移不得留下活实例')
+  assert.deepEqual(afterState.containers[CONTAINER_A].networks, [])
+  assert.ok(fs.existsSync(path.join(control, 'control-owner')), 'replacement owner 不得被 cleanup 删除')
+  assert.match(r.stderr, /control.*identity|所有权|漂移|收口/i)
+})
+
+test('P6-R2 control identity：network connect 生效后 directory 漂移必须撤回 endpoint', () => {
+  const { root, dataDir, backupsDir, snap, dockerBin, stateFile } = publicationCase('control-drift-reconnect')
+  const control = restoreControlPath(dataDir)
+  const mutation = installControlMutationCommand(root, control, 'directory-replacement', 'reconnect')
+  fs.writeFileSync(
+    path.join(dockerBin, 'docker'),
+    `#!/bin/sh
+"${process.execPath}" "${path.join(dockerBin, 'docker-stateful.mjs')}" "$@"
+rc=$?
+if [ "$rc" -eq 0 ] && [ "$1" = "network" ] && [ "$2" = "connect" ] && \
+   [ ! -e "$TEST_CONTROL_MUTATE_TRIGGER" ]; then
+  "${process.execPath}" "$TEST_CONTROL_MUTATE_COMMAND" "$TEST_CONTROL_MUTATE_PATH" \
+    "$TEST_CONTROL_MUTATE_TRIGGER" "$TEST_CONTROL_MUTATE_ORIGINAL" "$TEST_CONTROL_MUTATE_MODE"
+fi
+exit "$rc"
+`,
+    { mode: 0o755 },
+  )
+
+  const r = runStatefulRestore(dataDir, backupsDir, snap, dockerBin, stateFile, {
+    TEST_CONTROL_MUTATE_COMMAND: mutation.command,
+    TEST_CONTROL_MUTATE_PATH: control,
+    TEST_CONTROL_MUTATE_TRIGGER: mutation.triggered,
+    TEST_CONTROL_MUTATE_ORIGINAL: mutation.original,
+    TEST_CONTROL_MUTATE_MODE: 'directory-replacement',
+  })
+  const afterState = readDockerState(stateFile)
+
+  assert.notEqual(r.status, 0)
+  assert.ok(fs.existsSync(mutation.triggered), 'mutation 必须发生在 network connect 已生效后')
+  assert.ok(afterState.events.some((event) => event[0] === 'network-connect' && event[3] === CONTAINER_A))
+  assert.equal(afterState.containers[CONTAINER_A].running, false)
+  assert.deepEqual(afterState.containers[CONTAINER_A].networks, [], '未提交 network-published 时必须撤回 endpoint')
+  assert.ok(fs.existsSync(control))
+  assert.ok(fs.existsSync(mutation.original))
+  assert.match(r.stderr, /control.*identity|所有权|漂移|收口/i)
+})
+
+test('P6-R2 control I/O：replace-armed 写入期间 transient swap-back 不得误判未换库并重启 app', () => {
+  const { dataDir, backupsDir } = scene('control-transient-swap-back', 'CURRENT')
+  const snap = path.join(backupsDir, 'backup-control-transient-swap-back.db')
+  makeSnapshot(snap, 'SNAPSHOT')
+  const wal = path.join(dataDir, 'app.db-wal')
+  const shm = path.join(dataDir, 'app.db-shm')
+  fs.writeFileSync(wal, 'OLD-WAL')
+  fs.writeFileSync(shm, 'OLD-SHM')
+  const control = restoreControlPath(dataDir)
+  const race = installControlSwapBackRace(path.dirname(dataDir), control)
+
+  const r = runRestore(dataDir, backupsDir, snap, {
+    PATH: `${race.dir}:${binDir}:${process.env.PATH}`,
+    NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --require=${race.preload}`.trim(),
+    TEST_CONTROL_SWAP_COMMAND: race.command,
+    TEST_CONTROL_SWAP_STATE: race.state,
+    TEST_CONTROL_SWAP_PATH: control,
+    TEST_CONTROL_SWAP_ORIGINAL: race.original,
+    TEST_CONTROL_SWAP_REPLACEMENT: race.replacement,
+    TEST_CONTROL_SWAP_DB: path.join(fs.realpathSync(dataDir), 'app.db'),
+    TEST_PRE_RESTORE_MANIFEST: path.join(backupsDir, 'pre-restore.db.manifest.json'),
+    TEST_PUBLIC_STAGE: path.join(fs.realpathSync(dataDir), '.restore-in-progress', 'snapshot.db'),
+  })
+
+  assert.notEqual(r.status, 0)
+  assert.equal(
+    fs.readFileSync(race.state, 'utf8'),
+    'restored\n',
+    `确定性握手必须完成 swap → 写 marker → swap-back：\n${r.stdout}\n${r.stderr}\n${r.log}`,
+  )
+  assert.equal(readMarker(path.join(dataDir, 'app.db')), 'SNAPSHOT', '前置：数据库 rename 已经提交')
+  assert.doesNotMatch(r.log, new RegExp(`\\["start","${CONTAINER_A}"\\]`), '换库后失败不得按未换库路径重启 app')
+  assert.equal(fs.existsSync(wal), false, '旧 WAL 必须按已换库路径清理')
+  assert.equal(fs.existsSync(shm), false, '旧 SHM 必须按已换库路径清理')
+  assert.match(r.stderr, /数据库已替换|sidecar|保持停止|control/i)
 })
 
 // ============================================================================
@@ -3703,10 +4938,10 @@ for (const { mode, signal, exitCode } of [
     const { dataDir, backupsDir } = scene(`control-lock-signal-${mode}-${signal}`, 'CURRENT')
     const snap = path.join(backupsDir, 'backup-control-lock-signal.db')
     makeSnapshot(snap, 'SNAPSHOT')
-    const control = `${fs.realpathSync(dataDir)}.restore-control`
+    const control = restoreControlPath(dataDir)
     const signalBin = path.join(path.dirname(dataDir), 'control-lock-signal-bin')
     const entered = path.join(path.dirname(dataDir), 'control-lock-mkdir-entered')
-    const controlGuard = `${control}.guard`
+    const controlGuard = restoreGuardPath(dataDir)
     const ownershipFile = path.join(control, 'control-owner')
     fs.mkdirSync(signalBin, { recursive: true })
     fs.writeFileSync(
@@ -3756,19 +4991,35 @@ exec /bin/chmod "$@"
     fs.writeFileSync(
       preload,
       `const fs = require('node:fs')
+const path = require('node:path')
 const originalOpenSync = fs.openSync
+const originalLinkSync = fs.linkSync
 fs.openSync = function patchedOpenSync(file, ...args) {
   const target = String(file)
   if (
     process.env.TEST_CONTROL_LOCK_MODE === 'owned' &&
-    target === process.env.TEST_CONTROL_OWNERSHIP_FILE &&
+    path.basename(target) === path.basename(process.env.TEST_CONTROL_OWNERSHIP_FILE) &&
+    path.basename(process.cwd()) === path.basename(process.env.TEST_CONTROL_LOCK) &&
     fs.existsSync(process.env.TEST_CONTROL_LOCK) &&
-    !fs.existsSync(target)
+    !fs.existsSync(path.join(process.cwd(), path.basename(target)))
   ) {
     fs.writeFileSync(process.env.TEST_CONTROL_MKDIR_ENTERED, '')
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1500)
   }
   return originalOpenSync.call(this, file, ...args)
+}
+fs.linkSync = function patchedLinkSync(source, target, ...args) {
+  if (
+    process.env.TEST_CONTROL_LOCK_MODE === 'foreign' &&
+    path.basename(String(target)) === path.basename(process.env.TEST_CONTROL_GUARD) &&
+    !fs.existsSync(process.env.TEST_CONTROL_MKDIR_ENTERED)
+  ) {
+    fs.writeFileSync(process.env.TEST_CONTROL_GUARD, 'FOREIGN-GUARD\\n', { mode: 0o600 })
+    fs.chmodSync(process.env.TEST_CONTROL_GUARD, 0o600)
+    fs.writeFileSync(process.env.TEST_CONTROL_MKDIR_ENTERED, '')
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1500)
+  }
+  return originalLinkSync.call(this, source, target, ...args)
 }
 `,
       { mode: 0o600 },
@@ -3812,8 +5063,7 @@ fs.openSync = function patchedOpenSync(file, ...args) {
       assert.ok(!fs.existsSync(control), '本进程已创建但尚未写状态的 control lock 必须被事务式 acquisition 清理')
       assert.ok(!fs.existsSync(controlGuard), 'owned guard 必须与 control 一起清理')
     } else {
-      assert.ok(fs.existsSync(control), 'guard 不匹配时即使 foreign control 为空也不得 rmdir')
-      assert.deepEqual(fs.readdirSync(control), [])
+      assert.ok(!fs.existsSync(control), '未取得 guard 时不得创建或删除任何 control directory')
       assert.equal(fs.readFileSync(controlGuard, 'utf8'), 'FOREIGN-GUARD\n', '未取得 guard 时绝不能删除他人 guard')
     }
     assert.equal(readMarker(path.join(dataDir, 'app.db')), 'CURRENT')
@@ -3935,7 +5185,7 @@ fi
   assert.ok(shmGone, '🔴 trap 必须清掉旧库 -shm')
   assert.equal(startStates.length, 0, '库已替换但尚未 ready/accepted，信号收尾不得 start')
   const lock = path.join(dataDir, '.restore-in-progress')
-  const control = `${fs.realpathSync(dataDir)}.restore-control`
+  const control = restoreControlPath(dataDir)
   assert.ok(fs.existsSync(lock), '库已替换的信号退出必须保留状态锁')
   assert.ok(fs.existsSync(control), '库已替换的信号退出必须保留 host-only control')
   assert.ok(fs.existsSync(path.join(control, 'sidecars-clean')), '应留下旧 sidecar 已清理证据')
@@ -4005,13 +5255,21 @@ fi
   const killed = await exited
 
   const lock = path.join(dataDir, '.restore-in-progress')
-  const control = `${fs.realpathSync(dataDir)}.restore-control`
+  const control = restoreControlPath(dataDir)
   assert.equal(killed.code, null)
   assert.equal(killed.signal, 'SIGKILL', `应由不可捕获 SIGKILL 终止：\n${killed.stdout}\n${killed.stderr}`)
   assert.equal(fs.readFileSync(startStateFile, 'utf8'), '', 'SIGKILL 无 trap，不能假装已安全 start')
   assert.ok(fs.existsSync(path.join(control, 'replace-armed')), '进程级 SIGKILL 后 host-only armed 状态必须保留')
   assert.ok(!fs.existsSync(path.join(lock, 'snapshot.db')), 'stage 已被 mv，当前文件系统状态可判定数据库已替换')
   assert.ok(fs.existsSync(wal) && fs.existsSync(shm), '不可捕获信号下旧 sidecar 仍在，必须靠锁阻止误启动/再还原')
+
+  const displacedLock = `${lock}.displaced-after-sigkill`
+  fs.renameSync(lock, displacedLock)
+  fs.mkdirSync(lock, { mode: 0o700 })
+  fs.chmodSync(lock, 0o700)
+  const foreignStage = path.join(lock, 'snapshot.db')
+  fs.writeFileSync(foreignStage, 'FOREIGN-STAGE-MUST-NOT-AUTHORIZE\n', { mode: 0o600 })
+  fs.chmodSync(foreignStage, 0o600)
 
   const retry = runRestore(
     dataDir,
@@ -4024,6 +5282,37 @@ fi
   assert.match(retry.log, /"stop"/, '下一次 restore 必须先按残锁 exact ID 尝试停机')
   assert.doesNotMatch(retry.log, /"start"/, '未验收残锁绝不能重启 app')
   assert.equal(readMarker(path.join(dataDir, 'app.db')), 'SNAPSHOT-SIGKILL', '数据库本体确实已完成原子替换')
+  assert.equal(
+    fs.readFileSync(foreignStage, 'utf8'),
+    'FOREIGN-STAGE-MUST-NOT-AUTHORIZE\n',
+    'stale recovery 不得把原 pathname 上的 foreign stage 当作本次 restore 证据或删除它',
+  )
+  assert.ok(fs.existsSync(displacedLock), '原 exact public lock 的 displaced 目录必须保留为现场证据')
+
+  const stageIdentityFile = path.join(control, 'public-stage-identity')
+  const exactStageIdentity = fs.readFileSync(stageIdentityFile, 'utf8')
+  const assertIdentityUnknown = (label: string): void => {
+    const unknown = runRestore(
+      dataDir,
+      backupsDir,
+      snap,
+      verifiedDeadOwnerRetryEnv(path.dirname(dataDir), control),
+    )
+    assert.equal(unknown.status, 4, `${label} 必须 fail-closed：\n${unknown.stdout}\n${unknown.stderr}`)
+    assert.doesNotMatch(unknown.log, /"stop"|"network"/, `${label} 不得获得 stale containment 授权`)
+    assert.match(unknown.stderr, /identity.*不可观测|replace-armed.*不可观测/i)
+  }
+
+  fs.rmSync(stageIdentityFile)
+  assertIdentityUnknown('public-stage-identity 缺失')
+  fs.writeFileSync(stageIdentityFile, 'not-an-identity\n', { mode: 0o600 })
+  fs.chmodSync(stageIdentityFile, 0o600)
+  assertIdentityUnknown('public-stage-identity 格式错误')
+  fs.writeFileSync(stageIdentityFile, `${fileIdentity(foreignStage)}\n`, { mode: 0o600 })
+  fs.chmodSync(stageIdentityFile, 0o600)
+  assertIdentityUnknown('public-stage-identity 漂移到 foreign stage')
+  fs.writeFileSync(stageIdentityFile, exactStageIdentity, { mode: 0o600 })
+  fs.chmodSync(stageIdentityFile, 0o600)
 })
 
 test('P6-R2 残锁自愈：app-started 但未 accepted 时下一次 restore 必须先停精确容器再 exit 4', () => {
@@ -4034,7 +5323,7 @@ test('P6-R2 残锁自愈：app-started 但未 accepted 时下一次 restore 必�
   makeDb(path.join(dataDir, 'app.db'), 'CURRENT')
   const snap = path.join(backupsDir, 'backup-stale-lock.db')
   makeSnapshot(snap, 'UNUSED')
-  const control = `${fs.realpathSync(dataDir)}.restore-control`
+  const control = restoreControlPath(dataDir)
   fs.mkdirSync(control, { mode: 0o700 })
   fs.writeFileSync(path.join(control, 'app-started'), '', { mode: 0o600 })
   fs.writeFileSync(path.join(control, 'container-id'), CONTAINER_A + '\n', { mode: 0o600 })
@@ -4045,7 +5334,7 @@ test('P6-R2 残锁自愈：app-started 但未 accepted 时下一次 restore 必�
   )
   fs.writeFileSync(path.join(control, 'compose-project'), 'xiaojimao-hub\n', { mode: 0o600 })
   fs.writeFileSync(path.join(control, 'compose-service'), 'app\n', { mode: 0o600 })
-  writeDefinitelyStaleOwnerEvidence(control)
+  writeDefinitelyStaleOwnerEvidence(control, dataDir)
   const { dir: dockerBin, stateFile } = installStatefulDockerBin(root)
   fs.writeFileSync(stateFile, JSON.stringify(makeDockerState(dataDir)))
 
@@ -4309,7 +5598,7 @@ test('P6-R2 hidepid：非 root 且 SUDO= 时，目标 stat 不可读必须保持
 
 test('P6-R2 残锁自愈：replace 已完成且 sidecar/marker 已清但未启动时也先停并隔离 exact ID', () => {
   const { root, dataDir, backupsDir, snap, dockerBin, stateFile } = publicationCase('stale-post-replace-lock')
-  const control = `${fs.realpathSync(dataDir)}.restore-control`
+  const control = restoreControlPath(dataDir)
   const publicLock = path.join(dataDir, '.restore-in-progress')
   fs.mkdirSync(control, { mode: 0o700 })
   fs.mkdirSync(publicLock, { mode: 0o700 })
@@ -4319,7 +5608,7 @@ test('P6-R2 残锁自愈：replace 已完成且 sidecar/marker 已清但未启�
   fs.writeFileSync(path.join(control, 'container-id'), `${CONTAINER_A}\n`, { mode: 0o600 })
   fs.writeFileSync(path.join(control, 'compose-project'), 'xiaojimao-hub\n', { mode: 0o600 })
   fs.writeFileSync(path.join(control, 'compose-service'), 'app\n', { mode: 0o600 })
-  writeDefinitelyStaleOwnerEvidence(control)
+  writeDefinitelyStaleOwnerEvidence(control, dataDir)
 
   const r = runStatefulRestore(dataDir, backupsDir, snap, dockerBin, stateFile)
   const afterState = readDockerState(stateFile)
@@ -4333,13 +5622,13 @@ test('P6-R2 残锁自愈：replace 已完成且 sidecar/marker 已清但未启�
 
 test('P6-R2 残锁自愈：docker inspect 故障不得伪装成 exact 容器不存在/已安全停止', () => {
   const { root, dataDir, backupsDir, snap, dockerBin, stateFile } = publicationCase('stale-inspect-failure')
-  const control = `${fs.realpathSync(dataDir)}.restore-control`
+  const control = restoreControlPath(dataDir)
   fs.mkdirSync(control, { mode: 0o700 })
   fs.writeFileSync(path.join(control, 'app-started'), '\n', { mode: 0o600 })
   fs.writeFileSync(path.join(control, 'container-id'), `${CONTAINER_A}\n`, { mode: 0o600 })
   fs.writeFileSync(path.join(control, 'compose-project'), 'xiaojimao-hub\n', { mode: 0o600 })
   fs.writeFileSync(path.join(control, 'compose-service'), 'app\n', { mode: 0o600 })
-  writeDefinitelyStaleOwnerEvidence(control)
+  writeDefinitelyStaleOwnerEvidence(control, dataDir)
 
   const r = runStatefulRestore(dataDir, backupsDir, snap, dockerBin, stateFile, {
     TEST_INSPECT_FAIL_ID: CONTAINER_A,
@@ -4357,13 +5646,13 @@ test('P6-R2 残锁自愈：docker inspect 故障不得伪装成 exact 容器不�
 
 test('P6-R2 残锁自愈：inspect 404 且 docker ps id filter 确认不存在时可安全报告残锁', () => {
   const { root, dataDir, backupsDir, snap, dockerBin, stateFile } = publicationCase('stale-container-gone')
-  const control = `${fs.realpathSync(dataDir)}.restore-control`
+  const control = restoreControlPath(dataDir)
   fs.mkdirSync(control, { mode: 0o700 })
   fs.writeFileSync(path.join(control, 'app-started'), '\n', { mode: 0o600 })
   fs.writeFileSync(path.join(control, 'container-id'), `${CONTAINER_A}\n`, { mode: 0o600 })
   fs.writeFileSync(path.join(control, 'compose-project'), 'xiaojimao-hub\n', { mode: 0o600 })
   fs.writeFileSync(path.join(control, 'compose-service'), 'app\n', { mode: 0o600 })
-  writeDefinitelyStaleOwnerEvidence(control)
+  writeDefinitelyStaleOwnerEvidence(control, dataDir)
   const state = readDockerState(stateFile)
   delete state.containers[CONTAINER_A]
   state.current = ''
@@ -4390,7 +5679,8 @@ test('P6-R2 published 残锁：Compose 漂到 B 时保留已验收 A，仅停止
   makeDb(path.join(dataB, 'app.db'), 'B-UNACCEPTED')
   const snap = path.join(backupsDir, 'backup-unused.db')
   makeSnapshot(snap, 'UNUSED')
-  const control = `${fs.realpathSync(dataA)}.restore-control`
+  const control = restoreControlPath(dataA)
+  ensureRestoreStateRoot()
   fs.mkdirSync(control, { mode: 0o700 })
   const accepted = `v2 ${CONTAINER_A} xiaojimao-hub app\n`
   fs.writeFileSync(path.join(control, 'ready-accepted'), accepted, { mode: 0o600 })
@@ -4398,7 +5688,7 @@ test('P6-R2 published 残锁：Compose 漂到 B 时保留已验收 A，仅停止
   fs.writeFileSync(path.join(control, 'container-id'), `${CONTAINER_A}\n`, { mode: 0o600 })
   fs.writeFileSync(path.join(control, 'compose-project'), 'xiaojimao-hub\n', { mode: 0o600 })
   fs.writeFileSync(path.join(control, 'compose-service'), 'app\n', { mode: 0o600 })
-  writeDefinitelyStaleOwnerEvidence(control)
+  writeDefinitelyStaleOwnerEvidence(control, dataA)
   const { dir: dockerBin, stateFile } = installStatefulDockerBin(root)
   const state = makeDockerState(dataA, dataB)
   state.containers[CONTAINER_B].composeProject = state.composeProject
@@ -4422,7 +5712,108 @@ test('P6-R2 published 残锁：Compose 漂到 B 时保留已验收 A，仅停止
   assert.ok(fs.existsSync(path.join(control, 'network-published')))
 })
 
-test('P6-R2 published 残锁：仅剩 handoff 且枚举失败时持久化 ambiguous 证据', () => {
+test('P6-R2 published record：app 可写 DATA_DIR 内的自报 handoff 不得获得 containment 授权', () => {
+  const root = fs.mkdtempSync(path.join(tmpDir, 'forged-public-handoff-'))
+  const dataA = path.join(root, 'data-a')
+  const dataB = path.join(root, 'data-b')
+  const backupsDir = path.join(dataA, 'backups')
+  fs.mkdirSync(backupsDir, { recursive: true })
+  makeDb(path.join(dataA, 'app.db'), 'A-PUBLISHED')
+  makeDb(path.join(dataB, 'app.db'), 'B-LIVE')
+  const snap = path.join(backupsDir, 'backup-unused.db')
+  makeSnapshot(snap, 'UNUSED')
+  const handoff = `${fs.realpathSync(dataA)}.restore-control-accepted`
+  fs.writeFileSync(handoff, `v2 ${CONTAINER_A} xiaojimao-hub app\n`, { mode: 0o600 })
+  const { dir: dockerBin, stateFile } = installStatefulDockerBin(root)
+  const state = makeDockerState(dataA, dataB)
+  state.containers[CONTAINER_B].composeProject = state.composeProject
+  state.containers[CONTAINER_B].composeService = state.composeService
+  state.containers[CONTAINER_B].running = true
+  state.current = CONTAINER_A
+  state.extraAppeared = true
+  fs.writeFileSync(stateFile, JSON.stringify(state))
+
+  const r = runStatefulRestore(dataA, backupsDir, snap, dockerBin, stateFile)
+  const afterState = readDockerState(stateFile)
+
+  assert.equal(r.status, 4)
+  assert.equal(afterState.containers[CONTAINER_A].running, true)
+  assert.equal(afterState.containers[CONTAINER_B].running, true, 'app 可写区的自报 handoff 不得当作 containment 授权')
+  assert.equal(afterState.events.filter((event) => event[0] === 'stop').length, 0)
+  assert.equal(afterState.events.filter((event) => event[0] === 'network-disconnect').length, 0)
+  assert.match(r.stderr, /legacy|handoff|private state-root|身份/i)
+})
+
+for (const malformed of [
+  {
+    label: '0644 文件',
+    mutate: (handoff: string) => fs.chmodSync(handoff, 0o644),
+  },
+  {
+    label: 'hardlink 文件',
+    mutate: (handoff: string) => fs.linkSync(handoff, `${handoff}.alias`),
+  },
+  {
+    label: '目录',
+    mutate: (handoff: string) => {
+      fs.unlinkSync(handoff)
+      fs.mkdirSync(handoff, { mode: 0o700 })
+    },
+  },
+] as const) {
+  test(`P6-R2 private published record：已存在的${malformed.label}必须在 Docker/DB 动作前拒绝`, () => {
+    const { dataDir, backupsDir } = scene(`malformed-published-${malformed.label}`, 'CURRENT')
+    const snapshot = path.join(backupsDir, 'backup-malformed-published.db')
+    makeSnapshot(snapshot, 'SNAPSHOT')
+    const handoff = writePublishedFixture(dataDir)
+    malformed.mutate(handoff)
+    const db = path.join(dataDir, 'app.db')
+    const before = fileSha256(db)
+
+    const r = runRestore(dataDir, backupsDir, snapshot)
+
+    assertNoDockerMutation(r.log)
+    assert.equal(fileSha256(db), before, '拒绝时不得修改活库')
+    assert.equal(r.status, 4)
+  })
+}
+
+test('P6-R2 private published record：sudo 下 node exists 不可执行时不可误判为 absent', () => {
+  const { dataDir, backupsDir } = scene('published-sudo-node-exists-denied', 'CURRENT')
+  const snapshot = path.join(backupsDir, 'backup-sudo-node-exists-denied.db')
+  makeSnapshot(snapshot, 'SNAPSHOT')
+  writePublishedFixture(dataDir)
+  const sudoLog = path.join(path.dirname(dataDir), 'sudo-node-exists.log')
+  const sudoShim = path.join(path.dirname(dataDir), 'sudo-node-exists-denied.sh')
+  fs.writeFileSync(
+    sudoShim,
+    `#!/bin/sh
+printf '%s\n' "$*" >> "$TEST_PUBLISHED_SUDO_LOG"
+if [ "$1" = "node" ] && [ "$2" = "-" ] && \
+   [ "$3" = "$RESTORE_STATE_DIR" ] && [ "$4" = "exists" ]; then
+  exit 77
+fi
+exec "$@"
+`,
+    { mode: 0o755 },
+  )
+  fs.writeFileSync(sudoLog, '')
+  const db = path.join(dataDir, 'app.db')
+  const before = fileSha256(db)
+
+  const r = runRestore(dataDir, backupsDir, snapshot, {
+    SUDO: sudoShim,
+    TEST_PUBLISHED_SUDO_LOG: sudoLog,
+  })
+
+  assertNoDockerMutation(r.log)
+  assert.equal(r.status, 4)
+  assert.equal(fileSha256(db), before, '不可观测 published record 时不得修改活库')
+  assert.match(fs.readFileSync(sudoLog, 'utf8'), /node - .*xiaojimao-restore-state exists/)
+  assert.match(r.stderr, /不可观测|metadata|state root|published/i)
+})
+
+test('P6-R2 published 残锁：仅剩 published record 且枚举失败时不得新建 ownerless control', () => {
   const root = fs.mkdtempSync(path.join(tmpDir, 'stale-published-handoff-enumeration-fail-'))
   const dataA = path.join(root, 'data-a')
   const dataB = path.join(root, 'data-b')
@@ -4432,10 +5823,8 @@ test('P6-R2 published 残锁：仅剩 handoff 且枚举失败时持久化 ambigu
   makeDb(path.join(dataB, 'app.db'), 'B-UNKNOWN')
   const snap = path.join(backupsDir, 'backup-unused.db')
   makeSnapshot(snap, 'UNUSED')
-  const physicalDataA = fs.realpathSync(dataA)
-  const control = `${physicalDataA}.restore-control`
-  const handoff = `${physicalDataA}.restore-control-accepted`
-  fs.writeFileSync(handoff, `v2 ${CONTAINER_A} xiaojimao-hub app\n`, { mode: 0o600 })
+  const control = restoreControlPath(dataA)
+  const handoff = writePublishedFixture(dataA)
   const { dir: dockerBin, stateFile } = installStatefulDockerBin(root)
   const state = makeDockerState(dataA, dataB)
   state.containers[CONTAINER_B].composeProject = state.composeProject
@@ -4449,18 +5838,15 @@ test('P6-R2 published 残锁：仅剩 handoff 且枚举失败时持久化 ambigu
     TEST_FAIL_SERVICE_PS_WHEN_EXTRA: '1',
   })
   const afterState = readDockerState(stateFile)
-  const ambiguous = path.join(control, 'ambiguous-publication')
-
   assert.equal(r.status, 4)
   assert.equal(afterState.containers[CONTAINER_A].running, true, 'published A 不得反向停机')
   assert.equal(afterState.containers[CONTAINER_B].running, true, '前置：枚举失败时 B 的状态无法确认')
-  assert.ok(fs.existsSync(handoff), 'accepted handoff 必须保留')
-  assert.ok(fs.existsSync(ambiguous), '🔴 published 残锁枚举失败必须持久化 ambiguous 证据')
-  assert.equal(fs.statSync(ambiguous).mode & 0o777, 0o600)
-  assert.equal(fs.readFileSync(ambiguous, 'utf8'), `v2 ${CONTAINER_A} xiaojimao-hub app\n`)
+  assert.ok(fs.existsSync(handoff), 'private published record 必须保留')
+  assert.ok(!fs.existsSync(control), '仅剩 published record 且无 v3 control-owner 时不得创建 ownerless control')
+  assert.match(r.stderr, /control-owner|身份|无法.*持久化/i)
 })
 
-test('P6-R2 published 残锁：仅剩 handoff 且 Compose ps 失败时同样持久化 ambiguous', () => {
+test('P6-R2 published 残锁：仅剩 published record 且 Compose ps 失败时同样不得新建 ownerless control', () => {
   const root = fs.mkdtempSync(path.join(tmpDir, 'stale-published-handoff-compose-fail-'))
   const dataA = path.join(root, 'data-a')
   const dataB = path.join(root, 'data-b')
@@ -4470,10 +5856,8 @@ test('P6-R2 published 残锁：仅剩 handoff 且 Compose ps 失败时同样持�
   makeDb(path.join(dataB, 'app.db'), 'B-UNKNOWN')
   const snap = path.join(backupsDir, 'backup-unused.db')
   makeSnapshot(snap, 'UNUSED')
-  const physicalDataA = fs.realpathSync(dataA)
-  const control = `${physicalDataA}.restore-control`
-  const handoff = `${physicalDataA}.restore-control-accepted`
-  fs.writeFileSync(handoff, `v2 ${CONTAINER_A} xiaojimao-hub app\n`, { mode: 0o600 })
+  const control = restoreControlPath(dataA)
+  const handoff = writePublishedFixture(dataA)
   const { dir: dockerBin, stateFile } = installStatefulDockerBin(root)
   const state = makeDockerState(dataA, dataB)
   state.containers[CONTAINER_B].composeProject = state.composeProject
@@ -4487,15 +5871,12 @@ test('P6-R2 published 残锁：仅剩 handoff 且 Compose ps 失败时同样持�
     TEST_FAIL_COMPOSE_PS_ALWAYS: '1',
   })
   const afterState = readDockerState(stateFile)
-  const ambiguous = path.join(control, 'ambiguous-publication')
-
   assert.equal(r.status, 4)
   assert.equal(afterState.containers[CONTAINER_A].running, true)
   assert.equal(afterState.containers[CONTAINER_B].running, true)
   assert.ok(fs.existsSync(handoff))
-  assert.ok(fs.existsSync(ambiguous))
-  assert.equal(fs.statSync(ambiguous).mode & 0o777, 0o600)
-  assert.equal(fs.readFileSync(ambiguous, 'utf8'), `v2 ${CONTAINER_A} xiaojimao-hub app\n`)
+  assert.ok(!fs.existsSync(control), '仅剩 published record 且无 v3 control-owner 时不得创建 ownerless control')
+  assert.match(r.stderr, /control-owner|身份|无法.*持久化/i)
 })
 
 test('P6-R2 public 残锁：仅 DATA_DIR 内伪造 matching accepted/published 不得获得停机授权', () => {
@@ -4507,7 +5888,7 @@ test('P6-R2 public 残锁：仅 DATA_DIR 内伪造 matching accepted/published �
   const snap = path.join(backupsDir, 'backup-legacy-forged.db')
   makeSnapshot(snap, 'UNUSED')
   const lock = path.join(dataDir, '.restore-in-progress')
-  const control = `${fs.realpathSync(dataDir)}.restore-control`
+  const control = restoreControlPath(dataDir)
   fs.mkdirSync(lock, { mode: 0o700 })
   const forged = `v1 forged-public ${CONTAINER_A}\n`
   fs.writeFileSync(path.join(lock, 'ready-accepted'), forged, { mode: 0o600 })
@@ -4575,7 +5956,7 @@ exec "${process.execPath}" "${path.join(binDir, 'docker-stub.mjs')}" "$@"
     detached: true,
     stdio: ['ignore', 'pipe', 'pipe'],
   })
-  const exited = collectExit(child)
+  const exited = collectExit(child, 25_000)
   let r: Awaited<typeof exited>
   try {
     await waitForFile(stopEntered)
@@ -4654,7 +6035,7 @@ fi
     detached: true,
     stdio: ['ignore', 'pipe', 'pipe'],
   })
-  const exited = collectExit(child)
+  const exited = collectExit(child, 25_000)
   let r: Awaited<typeof exited>
   try {
     await waitForFile(mvEntered, 20_000)
@@ -4679,7 +6060,7 @@ fi
   assert.equal(readMarker(path.join(dataDir, 'app.db')), 'CURRENT-ARMED', 'app.db 必须仍是旧库')
   assert.ok(!fs.existsSync(path.join(dataDir, '.restore-in-progress')), 'mv 前优雅信号应清 stage 并释放锁')
   assert.ok(
-    !fs.existsSync(`${fs.realpathSync(dataDir)}.restore-control`),
+    !fs.existsSync(restoreControlPath(dataDir)),
     '🔴 mv 未发生且旧 app 已恢复后必须同步释放 host-only control，不能留下假 post-replace 残锁',
   )
 })
@@ -4711,7 +6092,7 @@ for (const { label, status, body } of [
     const calls = r.log.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line) as string[])
     const starts = calls.filter((call) => call[0] === 'start' && call[1] === CONTAINER_A)
     const stops = calls.filter((call) => call[0] === 'stop' && call[1] === CONTAINER_A)
-    const control = `${fs.realpathSync(dataDir)}.restore-control`
+    const control = restoreControlPath(dataDir)
 
     assert.equal(r.status, 1, `🔴 ${label} 必须在 deadline 后失败：\n${r.stdout}\n${r.stderr}`)
     assert.doesNotMatch(r.stdout, /恢复完成/)
@@ -4761,7 +6142,7 @@ exec "${process.execPath}" "${path.join(binDir, 'docker-stub.mjs')}" "$@"
     encoding: 'utf8',
   })
   const calls = fs.readFileSync(logFile, 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line) as string[])
-  const control = `${fs.realpathSync(dataDir)}.restore-control`
+  const control = restoreControlPath(dataDir)
 
   assert.equal(r.status, 1, `🔴 NUL 响应不得变成合法 JSON 后成功：\n${r.stdout}\n${r.stderr}`)
   assert.doesNotMatch(r.stdout, /恢复完成/)
@@ -4773,9 +6154,8 @@ exec "${process.execPath}" "${path.join(binDir, 'docker-stub.mjs')}" "$@"
 
 test('P6-R2 readiness 严格接受：仅 200 + {"ok":true} 释放锁并宣告成功', () => {
   const { dataDir, backupsDir } = scene('ready-accepted', 'CURRENT')
-  const realDataDir = fs.realpathSync(dataDir)
-  const control = `${realDataDir}.restore-control`
-  const guard = `${realDataDir}.restore-control.guard`
+  const control = restoreControlPath(dataDir)
+  const guard = restoreGuardPath(dataDir)
   const snap = path.join(backupsDir, 'backup-ready-accepted.db')
   makeSnapshot(snap, 'SNAPSHOT-ACCEPTED')
   const r = runRestore(dataDir, backupsDir, snap, {
@@ -4791,8 +6171,8 @@ test('P6-R2 readiness 严格接受：仅 200 + {"ok":true} 释放锁并宣告成
   assert.ok(!fs.existsSync(control), '成功后 host-only control 必须释放')
   assert.ok(!fs.existsSync(guard), '成功后 control guard 必须释放')
   assert.deepEqual(
-    fs.readdirSync(path.dirname(realDataDir)).filter(
-      (name) => name.startsWith(`${path.basename(realDataDir)}.restore-control.guard.candidate.`),
+    fs.readdirSync(restoreStateRoot()).filter(
+      (name) => name.startsWith(`${restoreStateKey(dataDir)}.guard.candidate.`),
     ),
     [],
     '成功后不得遗留 guard candidate',
@@ -4834,7 +6214,7 @@ test('P6-R2 network publication：按 exact NetworkID 重连全部网络并恢�
 
 test('P6-R2 network publication：第一个 connect 失败也必须保持全隔离并记录 publication-failed', () => {
   const { dataDir, backupsDir, snap, dockerBin, stateFile } = publicationCase('network-first-connect-fail')
-  const control = `${fs.realpathSync(dataDir)}.restore-control`
+  const control = restoreControlPath(dataDir)
 
   const r = runStatefulRestore(dataDir, backupsDir, snap, dockerBin, stateFile, {
     TEST_FAIL_NETWORK_CONNECT: 'stub-network',
@@ -4845,7 +6225,10 @@ test('P6-R2 network publication：第一个 connect 失败也必须保持全隔�
   assert.equal(afterState.containers[CONTAINER_A].running, false)
   assert.deepEqual(afterState.containers[CONTAINER_A].networks, [])
   assert.ok(fs.existsSync(path.join(control, 'ready-accepted')))
-  assert.ok(fs.existsSync(path.join(control, 'publication-failed')))
+  assert.ok(
+    fs.existsSync(path.join(control, 'publication-failed')),
+    `publication-failed 缺失：control=${JSON.stringify(fs.readdirSync(control))}\n${r.stderr}`,
+  )
   assert.ok(!fs.existsSync(path.join(control, 'network-published')))
 })
 
@@ -4858,7 +6241,7 @@ test('P6-R2 network publication：第二个 connect 失败时回滚为全隔离�
     aliases: ['app-secondary'],
   })
   fs.writeFileSync(stateFile, JSON.stringify(state))
-  const control = `${fs.realpathSync(dataDir)}.restore-control`
+  const control = restoreControlPath(dataDir)
 
   const r = runStatefulRestore(dataDir, backupsDir, snap, dockerBin, stateFile, {
     TEST_FAIL_NETWORK_CONNECT: 'stub-network-2',
@@ -4871,7 +6254,10 @@ test('P6-R2 network publication：第二个 connect 失败时回滚为全隔离�
   assert.ok(fs.existsSync(path.join(control, 'ready-accepted')), '已通过 strict readiness 的 accepted 证据必须保留')
   assert.ok(fs.existsSync(path.join(control, 'container-networks')), '完整网络清单必须保留供重放/人工处置')
   assert.ok(fs.existsSync(path.join(control, 'networks-isolated')), '失败后必须保留隔离阶段证据')
-  assert.ok(fs.existsSync(path.join(control, 'publication-failed')), '可确认全撤回时必须记录 accepted-but-unpublished')
+  assert.ok(
+    fs.existsSync(path.join(control, 'publication-failed')),
+    `可确认全撤回时必须记录 accepted-but-unpublished：control=${JSON.stringify(fs.readdirSync(control))}\n${r.stderr}`,
+  )
   assert.ok(!fs.existsSync(path.join(control, 'network-published')), '网络未完整重连时绝不能提交 network-published')
   assert.equal(afterState.containers[CONTAINER_A].isolated, true, '🔴 部分 reconnect 失败必须撤回已连网络，恢复全隔离')
   assert.ok(
@@ -4889,7 +6275,7 @@ test('P6-R2 network publication：重连失败且撤回不完整时停实例并�
     aliases: ['app-secondary'],
   })
   fs.writeFileSync(stateFile, JSON.stringify(state))
-  const control = `${fs.realpathSync(dataDir)}.restore-control`
+  const control = restoreControlPath(dataDir)
 
   const r = runStatefulRestore(dataDir, backupsDir, snap, dockerBin, stateFile, {
     TEST_FAIL_NETWORK_CONNECT: 'stub-network-2',
@@ -4928,30 +6314,77 @@ test('P6-R2 network publication：重连失败且撤回不完整时停实例并�
   )
 })
 
-test('P6-R2 accepted 控制锁释放：host-only rmdir 失败时保留 trusted 0600 handoff', () => {
+test('P6-R2 accepted 控制锁释放：control verify 不可观测时不得误报成功或释放 guard', () => {
+  const { root, dataDir, backupsDir, snap, dockerBin, stateFile } = publicationCase('control-release-probe-eio')
+  const control = restoreControlPath(dataDir)
+  const guard = restoreGuardPath(dataDir)
+  const failure = installControlProbeFailurePreload(root, control, 'release-verify')
+
+  const r = runStatefulRestore(dataDir, backupsDir, snap, dockerBin, stateFile, {
+    NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --require=${failure.preload}`.trim(),
+  })
+  const afterState = readDockerState(stateFile)
+
+  assert.ok(fs.existsSync(failure.triggered), '前置：release control verify 故障注入必须命中')
+  assert.notEqual(r.status, 0, `control verify 不可观测时不得成功：\n${r.stdout}\n${r.stderr}`)
+  assert.doesNotMatch(r.stdout, /恢复完成/)
+  assert.ok(fs.existsSync(control), 'release probe 不可观测时必须保留 control')
+  assert.ok(fs.existsSync(guard), 'release probe 不可观测时不得释放 guard')
+  assert.ok(fs.existsSync(path.join(control, 'ready-accepted')))
+  assert.ok(fs.existsSync(path.join(control, 'network-published')))
+  assert.equal(fs.existsSync(restoreHandoffPath(dataDir)), false, 'handoff 尚未完成原子交接')
+  assert.equal(readMarker(path.join(dataDir, 'app.db')), 'ACCEPTED-SNAPSHOT')
+  assert.equal(afterState.containers[CONTAINER_A].running, true, '已发布 exact A 不得被 cleanup 反向停机')
+})
+
+test('P6-R2 public stage 释放：启动前 lock probe 不可观测时保持停机并保留 public/private 状态', () => {
+  const { root, dataDir, backupsDir, snap, dockerBin, stateFile } = publicationCase('public-lock-probe-eio-pre-start')
+  const lock = path.join(fs.realpathSync(dataDir), '.restore-in-progress')
+  const stateRoot = path.join(root, 'operator-state')
+  const control = path.join(stateRoot, `${restoreStateKey(dataDir)}.control`)
+  const guard = path.join(stateRoot, `${restoreStateKey(dataDir)}.guard`)
+  const failure = installPublicLockProbeFailureSudoShim(root, lock, 'pre-start')
+
+  const r = runStatefulRestore(dataDir, backupsDir, snap, dockerBin, stateFile, {
+    SUDO: failure.shim,
+    RESTORE_STATE_DIR: stateRoot,
+    TEST_PUBLIC_LOCK: lock,
+    TEST_PUBLIC_LOCK_PROBE_MODE: 'pre-start',
+    TEST_PUBLIC_LOCK_PROBE_TRIGGERED: failure.triggered,
+  })
+  const afterState = readDockerState(stateFile)
+
+  assert.ok(
+    fs.existsSync(failure.triggered),
+    `前置：必须在 app start 前命中 public lock probe 故障：\n${r.stdout}\n${r.stderr}`,
+  )
+  assert.notEqual(r.status, 0, `public lock 不可观测时不得宣告恢复成功：\n${r.stdout}\n${r.stderr}`)
+  assert.doesNotMatch(r.stdout, /恢复完成/)
+  assert.equal(readMarker(path.join(dataDir, 'app.db')), 'ACCEPTED-SNAPSHOT', '前置：库已替换、但尚未启动')
+  assert.equal(afterState.containers[CONTAINER_A].running, false, 'public lock 释放未证明前不得启动 app')
+  assert.equal(
+    afterState.events.filter((event) => event[0] === 'start' && event[1] === CONTAINER_A).length,
+    0,
+    '启动前 probe 故障后 docker start 调用必须为 0',
+  )
+  assert.ok(fs.existsSync(lock), 'public lock identity 不可观测时必须保留证据')
+  assert.ok(fs.existsSync(control), 'public lock 未释放时必须保留 private control')
+  assert.ok(fs.existsSync(guard), 'public lock 未释放时必须保留 private guard')
+})
+
+test('P6-R2 accepted 控制锁释放：host-only rmdir 失败时保留 trusted 0600 published record', () => {
   const { dataDir, backupsDir, snap, dockerBin, stateFile } = publicationCase('control-release-rmdir-fail')
-  const physicalDataDir = fs.realpathSync(dataDir)
   const dataB = path.join(path.dirname(dataDir), 'data-b')
   makeDb(path.join(dataB, 'app.db'), 'B-UNACCEPTED')
   fs.writeFileSync(stateFile, JSON.stringify(makeDockerState(dataDir, dataB)))
-  const control = `${physicalDataDir}.restore-control`
-  const trustedHandoff = `${physicalDataDir}.restore-control-accepted`
-  const failedOnce = path.join(path.dirname(dataDir), 'rmdir-failed-once')
-  fs.writeFileSync(
-    path.join(dockerBin, 'rmdir'),
-    `#!/bin/sh
-if [ "$1" = "$TEST_FAIL_RMDIR_TARGET" ] && [ ! -e "$TEST_FAIL_ONCE_MARKER" ]; then
-  : > "$TEST_FAIL_ONCE_MARKER"
-  exit 73
-fi
-/bin/rmdir "$@"
-`,
-    { mode: 0o755 },
-  )
+  const control = restoreControlPath(dataDir)
+  const trustedHandoff = restoreHandoffPath(dataDir)
+  const { preload, triggered: failedOnce } = installRmdirFailurePreload(path.dirname(dataDir))
 
   const first = runStatefulRestore(dataDir, backupsDir, snap, dockerBin, stateFile, {
     TEST_FAIL_RMDIR_TARGET: control,
     TEST_FAIL_ONCE_MARKER: failedOnce,
+    NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --require=${preload}`.trim(),
   })
   const stopCount = readDockerState(stateFile).events.filter(
     (event) => event[0] === 'stop' && event[1] === CONTAINER_A,
@@ -4960,7 +6393,7 @@ fi
   assert.notEqual(first.status, 0)
   assert.doesNotMatch(first.stdout, /恢复完成/)
   assert.ok(fs.existsSync(control), 'control rmdir 失败必须保留目录')
-  assert.ok(fs.existsSync(trustedHandoff), '🔴 trusted accepted 必须留在 app 不可见的 sibling handoff')
+  assert.ok(fs.existsSync(trustedHandoff), '🔴 trusted accepted 必须留在 app 不可见的 private published record')
   assert.equal(fs.statSync(trustedHandoff).mode & 0o777, 0o600)
   assert.ok(fs.existsSync(failedOnce), '前置：rmdir 首次故障注入已命中')
 
@@ -4984,89 +6417,54 @@ fi
   assert.equal(
     afterRetry.containers[CONTAINER_B].running,
     false,
-    '🔴 handoff 必须保留 project/service 元数据，使下次 restore 能枚举并停止非当前额外 B',
+    '🔴 published record 必须保留 project/service 元数据，使下次 restore 能枚举并停止非当前额外 B',
   )
   assert.match(
     fs.readFileSync(trustedHandoff, 'utf8'),
-    new RegExp(`^v2 ${CONTAINER_A} xiaojimao-hub app\\n$`),
-    'trusted handoff 必须携带 accepted exact ID 与 service 枚举身份',
+    new RegExp(`^v3 [0-9a-f]{64} ${restoreStateKey(dataDir)} ${fileIdentity(dataDir)} ${CONTAINER_A} xiaojimao-hub app network-published\\n$`),
+    'trusted published record 必须携带 accepted exact ID 与 service 枚举身份',
   )
 })
 
-test('P6-R2 accepted 控制锁释放：trusted accepted handoff rename 失败时原 marker 保持 0600', () => {
+test('P6-R2 accepted 控制锁释放：trusted published record rename 失败时原 marker 保持 0600', () => {
   const { dataDir, backupsDir, snap, dockerBin, stateFile } = publicationCase('control-release-rename-fail')
-  const physicalDataDir = fs.realpathSync(dataDir)
-  const control = `${physicalDataDir}.restore-control`
+  const control = restoreControlPath(dataDir)
   const trustedAccepted = path.join(control, 'ready-accepted')
-  const failedOnce = path.join(path.dirname(dataDir), 'accepted-rename-failed-once')
-  fs.writeFileSync(
-    path.join(dockerBin, 'mv'),
-    `#!/bin/sh
-source=
-for arg in "$@"; do
-  [ "$arg" = "--" ] && continue
-  case "$arg" in -*) continue ;; esac
-  source=$arg
-  break
-done
-if [ "$source" = "$TEST_FAIL_ACCEPTED_RENAME_SOURCE" ] && [ ! -e "$TEST_FAIL_ONCE_MARKER" ]; then
-  : > "$TEST_FAIL_ONCE_MARKER"
-  exit 75
-fi
-/bin/mv "$@"
-`,
-    { mode: 0o755 },
-  )
+  const failure = installStateFsFailurePreload(path.dirname(dataDir), 'rename', restoreHandoffPath(dataDir))
 
   const r = runStatefulRestore(dataDir, backupsDir, snap, dockerBin, stateFile, {
-    TEST_FAIL_ACCEPTED_RENAME_SOURCE: trustedAccepted,
-    TEST_FAIL_ONCE_MARKER: failedOnce,
+    NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --require=${failure.preload}`.trim(),
   })
 
   assert.notEqual(r.status, 0)
   assert.doesNotMatch(r.stdout, /恢复完成/)
   assert.ok(fs.existsSync(trustedAccepted), 'trusted rename 失败必须保留原 accepted marker')
   assert.equal(fs.statSync(trustedAccepted).mode & 0o777, 0o600)
-  assert.ok(!fs.existsSync(`${physicalDataDir}.restore-control-accepted`))
-  assert.ok(fs.existsSync(failedOnce), '前置：accepted rename 首次故障注入已命中')
+  assert.ok(!fs.existsSync(restoreHandoffPath(dataDir)))
+  assert.ok(fs.existsSync(failure.triggered), '前置：published rename 故障注入已命中')
 })
 
-test('P6-R2 accepted 控制锁释放：状态 unlink 失败时保留 trusted 0600 handoff 与明确诊断', () => {
+test('P6-R2 accepted 控制锁释放：状态 unlink 失败时保留 trusted 0600 published record 与明确诊断', () => {
   const { root, dataDir, backupsDir, snap, dockerBin, stateFile } = publicationCase('control-release-unlink-fail')
-  const physicalDataDir = fs.realpathSync(dataDir)
-  const control = `${physicalDataDir}.restore-control`
-  const trustedHandoff = `${physicalDataDir}.restore-control-accepted`
+  const control = restoreControlPath(dataDir)
+  const trustedHandoff = restoreHandoffPath(dataDir)
   const readyBody = path.join(control, 'ready-body')
-  const failedOnce = path.join(path.dirname(dataDir), 'control-unlink-failed-once')
-  fs.writeFileSync(
-    path.join(dockerBin, 'rm'),
-    `#!/bin/sh
-for arg in "$@"; do
-  if [ "$arg" = "$TEST_FAIL_UNLINK_TARGET" ] && [ ! -e "$TEST_FAIL_ONCE_MARKER" ]; then
-    : > "$TEST_FAIL_ONCE_MARKER"
-    exit 74
-  fi
-done
-/bin/rm "$@"
-`,
-    { mode: 0o755 },
-  )
+  const failure = installStateFsFailurePreload(path.dirname(dataDir), 'unlink', readyBody)
 
   const first = runStatefulRestore(dataDir, backupsDir, snap, dockerBin, stateFile, {
-    TEST_FAIL_UNLINK_TARGET: readyBody,
-    TEST_FAIL_ONCE_MARKER: failedOnce,
+    NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --require=${failure.preload}`.trim(),
   })
 
   assert.notEqual(first.status, 0)
   assert.doesNotMatch(first.stdout, /恢复完成/)
   assert.ok(fs.existsSync(control), '控制状态未清完时目录必须保留')
-  assert.ok(fs.existsSync(trustedHandoff), '🔴 accepted 必须已原子交接到 host-only sibling')
+  assert.ok(fs.existsSync(trustedHandoff), '🔴 accepted 必须已原子交接到 private published record')
   assert.equal(fs.statSync(trustedHandoff).mode & 0o777, 0o600)
-  assert.ok(fs.existsSync(failedOnce), '前置：状态 unlink 首次故障注入已命中')
+  assert.ok(fs.existsSync(failure.triggered), '前置：状态 unlink 故障注入已命中')
 
   const retry = runStatefulRestore(dataDir, backupsDir, snap, dockerBin, stateFile, {
     ...verifiedDeadOwnerRetryEnv(root, control),
-    TEST_FAIL_UNLINK_TARGET: readyBody,
+    NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --require=${failure.preload}`.trim(),
   })
   assert.equal(retry.status, 4)
   assert.match(retry.stderr, /最终身份.*确认|锁释放未完成|readiness.*确认/i)
@@ -5125,7 +6523,7 @@ test('R7-P1②：readiness 失败后保留新 WAL，停机并保留未接受恢�
   assert.equal(fs.readFileSync(shm, 'utf8'), 'NEW-DB-SHM')
   const calls = fs.readFileSync(logFile, 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line) as string[])
   assert.equal(calls.filter((call) => call[0] === 'stop' && call[1] === CONTAINER_A).length, 2)
-  const control = `${fs.realpathSync(dataDir)}.restore-control`
+  const control = restoreControlPath(dataDir)
   assert.ok(fs.existsSync(control), 'readiness 失败必须保留 host-only control')
   assert.ok(fs.existsSync(path.join(control, 'app-started')))
   assert.ok(!fs.existsSync(path.join(control, 'ready-accepted')))
@@ -5177,7 +6575,7 @@ done
   })
   const calls = fs.readFileSync(logFile, 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line) as string[])
   const lock = path.join(dataDir, '.restore-in-progress')
-  const control = `${fs.realpathSync(dataDir)}.restore-control`
+  const control = restoreControlPath(dataDir)
   assert.equal(r.status, 73, `应保留 rm 原退出码：\n${r.stdout}\n${r.stderr}`)
   assert.equal(calls.filter((call) => call[0] === 'start' && call[1] === CONTAINER_A).length, 0, '标记未清不得启动')
   assert.equal(calls.filter((call) => call[0] === 'stop' && call[1] === CONTAINER_A).length, 2, '收尾再 stop 保证停机')
@@ -5247,7 +6645,7 @@ done
   assert.ok(fs.existsSync(wal) && fs.existsSync(shm), '前置：注入确实让旧 sidecar 保持存在')
   assert.match(r.stderr, /拒绝重启 app|app 保持停止/, '必须明确说明是为防混库而保持停机')
   assert.ok(
-    fs.existsSync(path.join(`${fs.realpathSync(dataDir)}.restore-control`, 'replace-armed')),
+    fs.existsSync(path.join(restoreControlPath(dataDir), 'replace-armed')),
     '不安全失败必须保留 host-only armed 状态',
   )
   assert.equal(readMarker(path.join(dataDir, 'app.db')), 'SNAPSHOT-RM-FAIL', '数据库本体已经原子替换成功')
@@ -5301,9 +6699,171 @@ test('R7-P1② 反向：换库前就失败时，当前库的 -wal/-shm 必须原
   )
   assert.ok(!fs.existsSync(path.join(dataDir, '.restore-in-progress')), '未换库的优雅失败必须释放 public stage/锁')
   assert.ok(
-    !fs.existsSync(`${fs.realpathSync(dataDir)}.restore-control`),
+    !fs.existsSync(restoreControlPath(dataDir)),
     '🔴 未换库且旧 app 已安全重启后必须释放 host-only control，不能留下假残锁',
   )
+})
+
+test('R7-P1② cleanup：phase marker probe 不可观测时不得重启、删 sidecar 或释放状态', () => {
+  const { dataDir, backupsDir } = scene('cleanup-phase-probe-eio', 'CURRENT-PROBE-EIO')
+  const snap = path.join(backupsDir, 'backup-cleanup-phase-probe-eio.db')
+  makeSnapshot(snap, 'MUST-NOT-INSTALL')
+  const db = path.join(dataDir, 'app.db')
+  const before = fileSha256(db)
+  const wal = path.join(dataDir, 'app.db-wal')
+  const shm = path.join(dataDir, 'app.db-shm')
+  fs.writeFileSync(wal, 'COMMITTED-FRAMES-PROBE-EIO')
+  fs.writeFileSync(shm, 'SHM-PROBE-EIO')
+  const preRestoreTmp = path.join(backupsDir, 'pre-restore.db.tmp')
+  fs.mkdirSync(preRestoreTmp, { recursive: true })
+  const control = restoreControlPath(dataDir)
+  const guard = restoreGuardPath(dataDir)
+  const failure = installControlProbeFailurePreload(
+    path.dirname(dataDir),
+    control,
+    'cleanup-marker',
+    preRestoreTmp,
+  )
+
+  const r = runRestore(dataDir, backupsDir, snap, {
+    NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --require=${failure.preload}`.trim(),
+  })
+  const calls = r.log.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line) as string[])
+
+  assert.ok(fs.existsSync(failure.triggered), '前置：cleanup 首个 phase marker probe 的 EIO 必须命中')
+  assert.notEqual(r.status, 0)
+  assert.equal(fileSha256(db), before, 'phase 不可观测时活库不得变化')
+  assert.equal(fs.readFileSync(wal, 'utf8'), 'COMMITTED-FRAMES-PROBE-EIO')
+  assert.equal(fs.readFileSync(shm, 'utf8'), 'SHM-PROBE-EIO')
+  assert.equal(
+    calls.filter((call) => call[0] === 'start' && call[1] === CONTAINER_A).length,
+    0,
+    'phase 不可观测时不得选择 confirmed-unreplaced restart 分支',
+  )
+  assert.ok(fs.existsSync(control), 'phase 不可观测时必须保留 control 证据')
+  assert.ok(fs.existsSync(guard), 'phase 不可观测时必须保留 guard')
+  assert.match(r.stderr, /不可观测|phase|阶段|control/i)
+})
+
+test('P6-R2 public stage 收尾：未换库 cleanup 的 lock probe 不可观测时不重启或释放状态', () => {
+  const { root, dataDir, backupsDir, snap, dockerBin, stateFile } = publicationCase('public-lock-probe-eio-cleanup')
+  const db = path.join(dataDir, 'app.db')
+  const before = fileSha256(db)
+  const lock = path.join(fs.realpathSync(dataDir), '.restore-in-progress')
+  const stateRoot = path.join(root, 'operator-state')
+  const control = path.join(stateRoot, `${restoreStateKey(dataDir)}.control`)
+  const guard = path.join(stateRoot, `${restoreStateKey(dataDir)}.guard`)
+  fs.mkdirSync(path.join(backupsDir, 'pre-restore.db.tmp'), { recursive: true })
+  const failure = installPublicLockProbeFailureSudoShim(root, lock, 'cleanup-unreplaced')
+
+  const r = runStatefulRestore(dataDir, backupsDir, snap, dockerBin, stateFile, {
+    SUDO: failure.shim,
+    RESTORE_STATE_DIR: stateRoot,
+    TEST_PUBLIC_LOCK: lock,
+    TEST_PUBLIC_LOCK_PROBE_MODE: 'cleanup-unreplaced',
+    TEST_PUBLIC_LOCK_PROBE_TRIGGERED: failure.triggered,
+  })
+  const afterState = readDockerState(stateFile)
+
+  assert.ok(
+    fs.existsSync(failure.triggered),
+    `前置：cleanup 必须命中 public lock probe 故障：\n${r.stdout}\n${r.stderr}`,
+  )
+  assert.notEqual(r.status, 0)
+  assert.equal(fileSha256(db), before, '未换库 cleanup 不得改动 app.db')
+  assert.equal(afterState.containers[CONTAINER_A].running, false, 'public lock 不可观测时不得重启旧 app')
+  assert.equal(
+    afterState.events.filter((event) => event[0] === 'start' && event[1] === CONTAINER_A).length,
+    0,
+    'cleanup public lock probe 故障后 docker start 调用必须为 0',
+  )
+  assert.ok(fs.existsSync(lock), 'public stage/lock 必须保留供人工处置')
+  assert.ok(fs.existsSync(path.join(lock, 'snapshot.db')), '未替换的 exact stage 必须保留')
+  assert.ok(fs.existsSync(control), 'public lock 不可观测时不得删 private control')
+  assert.ok(fs.existsSync(guard), 'public lock 不可观测时不得删 private guard')
+})
+
+test('P6-R2 public stage 收尾：未换库 cleanup 的 release-lock EIO 时不得先重启旧 app', () => {
+  const { root, dataDir, backupsDir, snap, dockerBin, stateFile } = publicationCase('public-lock-release-eio-cleanup')
+  const db = path.join(dataDir, 'app.db')
+  const before = fileSha256(db)
+  const lock = path.join(fs.realpathSync(dataDir), '.restore-in-progress')
+  const stateRoot = path.join(root, 'operator-state')
+  const control = path.join(stateRoot, `${restoreStateKey(dataDir)}.control`)
+  const guard = path.join(stateRoot, `${restoreStateKey(dataDir)}.guard`)
+  fs.mkdirSync(path.join(backupsDir, 'pre-restore.db.tmp'), { recursive: true })
+  const failure = installPublicLockProbeFailureSudoShim(root, lock, 'cleanup-release')
+
+  const r = runStatefulRestore(dataDir, backupsDir, snap, dockerBin, stateFile, {
+    SUDO: failure.shim,
+    RESTORE_STATE_DIR: stateRoot,
+    TEST_PUBLIC_LOCK: lock,
+    TEST_PUBLIC_LOCK_PROBE_MODE: 'cleanup-release',
+    TEST_PUBLIC_LOCK_PROBE_TRIGGERED: failure.triggered,
+  })
+  const afterState = readDockerState(stateFile)
+
+  assert.ok(
+    fs.existsSync(failure.triggered),
+    `前置：cleanup 必须让 public-lock-status 成功后命中 release-lock 故障：\n${r.stdout}\n${r.stderr}`,
+  )
+  assert.notEqual(r.status, 0)
+  assert.equal(fileSha256(db), before, 'release-lock 失败时 app.db 必须保持原样')
+  assert.equal(afterState.containers[CONTAINER_A].running, false, 'public stage 未释放时旧 app 必须保持停止')
+  assert.equal(
+    afterState.events.filter((event) => event[0] === 'start' && event[1] === CONTAINER_A).length,
+    0,
+    'release-lock 本身失败时 docker start 调用必须为 0',
+  )
+  assert.ok(fs.existsSync(lock), 'release-lock 失败必须保留 public lock')
+  assert.ok(fs.existsSync(path.join(lock, 'snapshot.db')), 'release-lock 失败必须保留 exact stage')
+  assert.ok(fs.existsSync(control), 'release-lock 失败不得删 private control')
+  assert.ok(fs.existsSync(guard), 'release-lock 失败不得删 private guard')
+})
+
+test('R7-P1② cleanup：replace-armed 后 public stage 父目录被 rename 且 mv 失败时不得误判换库', () => {
+  const { root, dataDir, backupsDir, snap, dockerBin, stateFile } = publicationCase('public-stage-parent-rename')
+  const db = path.join(dataDir, 'app.db')
+  const before = fileSha256(db)
+  const lock = path.join(fs.realpathSync(dataDir), '.restore-in-progress')
+  const stage = path.join(lock, 'snapshot.db')
+  const control = restoreControlPath(dataDir)
+  const guard = restoreGuardPath(dataDir)
+  const wal = `${db}-wal`
+  const shm = `${db}-shm`
+  const race = installPublicStageRenameMvShim(dockerBin, lock)
+
+  const r = runStatefulRestore(dataDir, backupsDir, snap, dockerBin, stateFile, {
+    TEST_PUBLIC_STAGE: stage,
+    TEST_PUBLIC_LOCK: lock,
+    TEST_PUBLIC_LOCK_DISPLACED: race.displaced,
+    TEST_PUBLIC_STAGE_RENAME_TRIGGERED: race.triggered,
+    TEST_CONTROL_PATH: control,
+    TEST_WAL_PATH: wal,
+    TEST_SHM_PATH: shm,
+  })
+  const afterState = readDockerState(stateFile)
+
+  assert.ok(
+    fs.existsSync(race.triggered),
+    `前置：必须在 replace-armed 后、最终 mv 前 rename public stage 父目录：\n${r.stdout}\n${r.stderr}`,
+  )
+  assert.notEqual(r.status, 0)
+  assert.equal(fileSha256(db), before, '最终 mv 失败时 app.db 必须保持原样')
+  assert.equal(fs.readFileSync(wal, 'utf8'), 'COMMITTED-FRAMES-STAGE-RENAME', '未证明换库时必须保留旧 WAL')
+  assert.equal(fs.readFileSync(shm, 'utf8'), 'SHM-STAGE-RENAME', '未证明换库时必须保留旧 SHM')
+  assert.equal(afterState.containers[CONTAINER_A].running, false, '换库结果不可观测时必须保持停机')
+  assert.equal(
+    afterState.events.filter((event) => event[0] === 'start' && event[1] === CONTAINER_A).length,
+    0,
+    'stage parent identity 漂移后 docker start 调用必须为 0',
+  )
+  assert.ok(!fs.existsSync(lock), '前置：原 public lock pathname 已被 rename')
+  assert.ok(fs.existsSync(path.join(race.displaced, 'snapshot.db')), '原 exact stage inode 必须保留在 displaced 目录')
+  assert.ok(fs.existsSync(control), 'stage parent 漂移时 private control 必须保留')
+  assert.ok(fs.existsSync(guard), 'stage parent 漂移时 private guard 必须保留')
+  assert.ok(fs.existsSync(path.join(control, 'replace-armed')), 'replace-armed 证据必须保留')
+  assert.ok(!fs.existsSync(path.join(control, 'sidecars-clean')), '未证明换库时不得推进 sidecars-clean')
 })
 
 // ============================================================================

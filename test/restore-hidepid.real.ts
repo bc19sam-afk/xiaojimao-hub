@@ -116,6 +116,7 @@ PATH="/work/bin:$PATH" \
 SUDO= \
 DATA_DIR=/work/data \
 BACKUP_DIR=/work/data/backups \
+RESTORE_STATE_DIR=/work/operator/state \
 DOCKER_LOG=/work/docker.log \
 DOCKER_STATE=/work/docker-state \
 sh /work/restore.sh /work/data/backups/snapshot.db \
@@ -146,17 +147,14 @@ set -eu
 [ "$$" = "1" ] || { echo 'container entrypoint must be PID 1' >&2; exit 60; }
 mount -t proc proc /proc -o hidepid=2
 
-mkdir -p /work/bin /work/data/backups /work/data.restore-control /work/docker-state
+mkdir -p /work/bin /work/data/backups /work/operator/state /work/docker-state
+chmod 700 /work/operator /work/operator/state
 cp /fixture/restore.sh /work/restore.sh
 cp /fixture/docker-stub.sh /work/bin/docker
 cp /fixture/run-retry.sh /work/run-retry.sh
 chmod 755 /work/restore.sh /work/bin/docker /work/run-retry.sh
 : > /work/docker.log
 : > /work/data/backups/snapshot.db
-: > /work/data.restore-control/app-started
-printf '%s\n' '${CONTAINER_ID}' > /work/data.restore-control/container-id
-printf '%s\n' xiaojimao-hub > /work/data.restore-control/compose-project
-printf '%s\n' app > /work/data.restore-control/compose-service
 
 sh -c 'while :; do date +%s%N > /work/owner-heartbeat; sleep 0.2; done' &
 owner_pid=$!
@@ -170,8 +168,54 @@ done
 boot_id=$(cat /proc/sys/kernel/random/boot_id)
 owner_ticks=$(awk '{ print $22 }' "/proc/$owner_pid/stat")
 case "$owner_ticks" in ''|*[!0-9]*) echo 'invalid owner start ticks' >&2; exit 62 ;; esac
-printf '%s\n' "$owner_pid" > /work/data.restore-control/owner-pid
-printf 'v2 linux-proc %s %s\n' "$boot_id" "$owner_ticks" > /work/data.restore-control/owner-start-fingerprint
+
+OWNER_PID="$owner_pid" BOOT_ID="$boot_id" OWNER_TICKS="$owner_ticks" node <<'NODE'
+const fs = require('node:fs')
+const path = require('node:path')
+const crypto = require('node:crypto')
+const stateRoot = '/work/operator/state'
+const dataPath = '/work/data'
+const generation = 'd'.repeat(64)
+const stateKey = crypto.createHash('sha256').update(dataPath).digest('hex')
+const identity = (st) => String(st.dev) + ':' + String(st.ino)
+const write = (file, value) => {
+  fs.writeFileSync(file, value + '\\n', { mode: 0o600 })
+  fs.chmodSync(file, 0o600)
+}
+const candidate = path.join(stateRoot, stateKey + '.guard.candidate.fixture')
+const guard = path.join(stateRoot, stateKey + '.guard')
+const control = path.join(stateRoot, stateKey + '.control')
+write(candidate, 'v2 ' + generation)
+fs.linkSync(candidate, guard)
+fs.mkdirSync(control, { mode: 0o700 })
+fs.chmodSync(control, 0o700)
+const owner = path.join(control, 'control-owner')
+const ownerFd = fs.openSync(owner, 'wx', 0o600)
+const ownerStat = fs.fstatSync(ownerFd, { bigint: true })
+const record = {
+  version: 3,
+  generation,
+  guard: 'v2 ' + generation,
+  root: identity(fs.lstatSync(stateRoot, { bigint: true })),
+  directory: identity(fs.lstatSync(control, { bigint: true })),
+  owner: identity(ownerStat),
+  stateKey,
+  dataPath,
+  dataIdentity: identity(fs.lstatSync(dataPath, { bigint: true })),
+}
+fs.writeFileSync(ownerFd, JSON.stringify(record) + '\\n')
+fs.fchmodSync(ownerFd, 0o600)
+fs.closeSync(ownerFd)
+write(path.join(control, 'app-started'), '')
+write(path.join(control, 'container-id'), '${CONTAINER_ID}')
+write(path.join(control, 'compose-project'), 'xiaojimao-hub')
+write(path.join(control, 'compose-service'), 'app')
+write(path.join(control, 'owner-pid'), process.env.OWNER_PID)
+write(
+  path.join(control, 'owner-start-fingerprint'),
+  'v2 linux-proc ' + process.env.BOOT_ID + ' ' + process.env.OWNER_TICKS,
+)
+NODE
 
 chown -R 2001:2001 /work
 exec setpriv --reuid=2001 --regid=2001 --clear-groups \
