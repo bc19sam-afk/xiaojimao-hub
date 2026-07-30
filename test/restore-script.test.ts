@@ -1496,13 +1496,16 @@ function installControlIdentityMutationPreload(
     'const mode = process.env.TEST_CONTROL_IDENTITY_MUTATION',
     "const ingestTarget = path.join(control, 'snapshot.db')",
     'if (process.argv.includes(ingestTarget) && !fs.existsSync(trigger)) {',
-    "  fs.writeFileSync(trigger, '')",
     "  if (mode === 'owner-replacement') {",
     "    const owner = path.join(control, 'control-owner')",
+    "    const replacement = owner + '.replacement'",
+    '    const before = fs.lstatSync(owner)',
     '    const body = fs.readFileSync(owner)',
-    '    fs.rmSync(owner)',
-    '    fs.writeFileSync(owner, body, { mode: 0o600 })',
-    '    fs.chmodSync(owner, 0o600)',
+    "    fs.writeFileSync(replacement, body, { flag: 'wx', mode: 0o600 })",
+    '    fs.chmodSync(replacement, 0o600)',
+    '    fs.renameSync(replacement, owner)',
+    '    const after = fs.lstatSync(owner)',
+    "    if (before.dev === after.dev && before.ino === after.ino) throw new Error('owner inode did not change')",
     '  } else {',
     '    fs.renameSync(control, original)',
     '    fs.mkdirSync(control, { mode: 0o700 })',
@@ -1515,6 +1518,7 @@ function installControlIdentityMutationPreload(
     '      fs.chmodSync(targetPath, stat.mode & 0o777)',
     '    }',
     '  }',
+    "  fs.writeFileSync(trigger, '')",
     '}',
     '',
   ].join('\n')
@@ -1536,13 +1540,16 @@ function installControlMutationCommand(
     "const path = require('node:path')",
     'const [control, trigger, original, mode] = process.argv.slice(2)',
     'if (fs.existsSync(trigger)) process.exit(0)',
-    "fs.writeFileSync(trigger, '')",
     "if (mode === 'owner-replacement') {",
     "  const owner = path.join(control, 'control-owner')",
+    "  const replacement = owner + '.replacement'",
+    '  const before = fs.lstatSync(owner)',
     '  const body = fs.readFileSync(owner)',
-    '  fs.rmSync(owner)',
-    '  fs.writeFileSync(owner, body, { mode: 0o600 })',
-    '  fs.chmodSync(owner, 0o600)',
+    "  fs.writeFileSync(replacement, body, { flag: 'wx', mode: 0o600 })",
+    '  fs.chmodSync(replacement, 0o600)',
+    '  fs.renameSync(replacement, owner)',
+    '  const after = fs.lstatSync(owner)',
+    "  if (before.dev === after.dev && before.ino === after.ino) throw new Error('owner inode did not change')",
     '} else {',
     '  fs.renameSync(control, original)',
     '  fs.mkdirSync(control, { mode: 0o700 })',
@@ -1555,6 +1562,7 @@ function installControlMutationCommand(
     '    fs.chmodSync(targetPath, stat.mode & 0o777)',
     '  }',
     '}',
+    "fs.writeFileSync(trigger, '')",
     '',
   ].join('\n')
   fs.writeFileSync(command, source, { mode: 0o600 })
@@ -4829,7 +4837,7 @@ rc=$?
 if [ "$rc" -eq 0 ] && [ "$1" = "start" ] && [ "$2" = "${CONTAINER_A}" ] && \
    [ ! -e "$TEST_CONTROL_MUTATE_TRIGGER" ]; then
   "${process.execPath}" "$TEST_CONTROL_MUTATE_COMMAND" "$TEST_CONTROL_MUTATE_PATH" \
-    "$TEST_CONTROL_MUTATE_TRIGGER" "$TEST_CONTROL_MUTATE_ORIGINAL" "$TEST_CONTROL_MUTATE_MODE"
+    "$TEST_CONTROL_MUTATE_TRIGGER" "$TEST_CONTROL_MUTATE_ORIGINAL" "$TEST_CONTROL_MUTATE_MODE" || exit $?
 fi
 exit "$rc"
 `,
@@ -4866,7 +4874,7 @@ rc=$?
 if [ "$rc" -eq 0 ] && [ "$1" = "network" ] && [ "$2" = "connect" ] && \
    [ ! -e "$TEST_CONTROL_MUTATE_TRIGGER" ]; then
   "${process.execPath}" "$TEST_CONTROL_MUTATE_COMMAND" "$TEST_CONTROL_MUTATE_PATH" \
-    "$TEST_CONTROL_MUTATE_TRIGGER" "$TEST_CONTROL_MUTATE_ORIGINAL" "$TEST_CONTROL_MUTATE_MODE"
+    "$TEST_CONTROL_MUTATE_TRIGGER" "$TEST_CONTROL_MUTATE_ORIGINAL" "$TEST_CONTROL_MUTATE_MODE" || exit $?
 fi
 exit "$rc"
 `,
