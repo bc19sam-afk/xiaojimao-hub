@@ -356,8 +356,8 @@ export const migrations: Migration[] = [
     //   ① usage_rates —— 每次调用积分单价（按 provider/套餐分档、后台可配）。points_per_call 用 REAL：
     //      单价可为小数（如 0.1 分/次），结算时 Math.round(次数 × 单价) 落整数积分。老 point_rules（固定
     //      分值表）留库不动、不回滚——本单不触碰它。
-    //   ② daily_settlements —— 每号每日一笔结算，UNIQUE(contribution_id, date) 保证同号同日只结一次
-    //      （worker 重跑/重启幂等的第一道闸；第二道是 point_ledger 的 UNIQUE(reason, ref)）。
+    //   ② daily_settlements —— 每号每日一行累计结算水位。UNIQUE(contribution_id, date) 固定水位身份；
+    //      P7-R1 起由事务内单调推进 call_count/points，并为每个 higher 目标追加稳定 ref 的正 delta ledger。
     up(db) {
       db.exec(`
         CREATE TABLE IF NOT EXISTS usage_rates (
@@ -370,7 +370,7 @@ export const migrations: Migration[] = [
           UNIQUE(provider, plan)
         );
 
-        -- 每号每日结算：一号一日一笔。UNIQUE(contribution_id, date) = 按日结算幂等键。
+        -- 每号每日结算：一号一日一行累计水位。UNIQUE(contribution_id, date) 固定水位身份。
         CREATE TABLE IF NOT EXISTS daily_settlements (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           contribution_id TEXT NOT NULL,

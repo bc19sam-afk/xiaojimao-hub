@@ -4,6 +4,8 @@ import { DatabaseSync } from 'node:sqlite'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { spawn } from 'node:child_process'
+import { fileURLToPath } from 'node:url'
 import { migrate, migrations, LATEST_VERSION } from '../lib/migrate.ts'
 import { seedDefaults } from '../lib/seed-defaults.ts'
 import type { Contribution } from '../lib/db.ts'
@@ -43,7 +45,7 @@ test('迁移008：建 usage_rates + daily_settlements、版本到最新、按日
   const names = tableNames(d)
   assert.ok(names.has('usage_rates'), '缺表 usage_rates')
   assert.ok(names.has('daily_settlements'), '缺表 daily_settlements')
-  // UNIQUE(contribution_id, date)：同号同日二次插入必冲突（按日结算幂等的第一道闸）
+  // UNIQUE(contribution_id, date)：同号同日固定为一行累计水位，二次 INSERT 必冲突。
   const ins = (pts: number) =>
     d.prepare(
       `INSERT INTO daily_settlements (contribution_id, date, provider, account_id, call_count, points, settled_at)
@@ -63,6 +65,12 @@ let settle: typeof import('../lib/settle.ts')
 let cpa: typeof import('../lib/cpa.ts').cpa
 let collect: typeof import('../lib/collect.ts')
 let tmpDir: string
+
+const here = path.dirname(fileURLToPath(import.meta.url))
+const root = path.resolve(here, '..')
+const setupPath = path.join(root, 'test', 'setup.mjs')
+const cpaModule = path.join(root, 'lib', 'cpa.ts')
+const settleModule = path.join(root, 'lib', 'settle.ts')
 
 function makeContribution(over: Partial<Contribution>): Contribution {
   const now = Date.now()
@@ -106,6 +114,63 @@ async function withUsage<T>(usage: DailyUsage[], fn: () => Promise<T>): Promise<
   } finally {
     cpa.getDailyUsage = orig
   }
+}
+
+const CHILD_RECONCILE_SOURCE = [
+  "import fs from 'node:fs'",
+  "import { pathToFileURL } from 'node:url'",
+  'const { CPA_MODULE, SETTLE_MODULE, READY, BARRIER, USAGE, NOW } = process.env',
+  'const { cpa } = await import(pathToFileURL(CPA_MODULE).href)',
+  'const settle = await import(pathToFileURL(SETTLE_MODULE).href)',
+  'cpa.getDailyUsage = async () => JSON.parse(USAGE)',
+  "fs.writeFileSync(READY, '')",
+  'function sleep(ms) { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms) }',
+  'for (let i = 0; i < 10000 && !fs.existsSync(BARRIER); i++) sleep(1)',
+  'if (!fs.existsSync(BARRIER)) throw new Error("barrier timeout")',
+  'await settle.settleDailyUsage(Number(NOW), { force: true })',
+].join('\n')
+
+async function runConcurrentUsage(usages: DailyUsage[][], now: number): Promise<void> {
+  const runDir = fs.mkdtempSync(path.join(tmpDir, 'concurrent-'))
+  const readyDir = path.join(runDir, 'ready')
+  const barrier = path.join(runDir, 'GO')
+  const childPath = path.join(runDir, 'child.mjs')
+  fs.mkdirSync(readyDir)
+  fs.writeFileSync(childPath, CHILD_RECONCILE_SOURCE)
+
+  const children = usages.map((usage, index) => {
+    const child = spawn(process.execPath, ['--import', setupPath, childPath], {
+      cwd: root,
+      env: {
+        ...process.env,
+        MOCK: 'true',
+        DB_PATH: process.env.DB_PATH,
+        MOCK_CPA_PATH: path.join(runDir, `mock-${index}.json`),
+        CPA_MODULE: cpaModule,
+        SETTLE_MODULE: settleModule,
+        READY: path.join(readyDir, String(index)),
+        BARRIER: barrier,
+        USAGE: JSON.stringify(usage),
+        NOW: String(now),
+      },
+      stdio: ['ignore', 'ignore', 'pipe'],
+    })
+    let stderr = ''
+    child.stderr.on('data', (chunk) => (stderr += String(chunk)))
+    return new Promise<{ code: number | null; stderr: string }>((resolve) => {
+      child.on('exit', (code) => resolve({ code, stderr }))
+    })
+  })
+
+  const deadline = Date.now() + 15_000
+  while (fs.readdirSync(readyDir).length < usages.length) {
+    if (Date.now() > deadline) throw new Error('concurrent settlement children did not become ready')
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+  fs.writeFileSync(barrier, 'go')
+  const results = await Promise.all(children)
+  const failed = results.find((result) => result.code !== 0)
+  assert.equal(failed, undefined, `concurrent settlement child failed: ${failed?.stderr ?? ''}`)
 }
 
 // 直连临时库写一条用量单价（管理 CRUD 是 R3，这里为测折算精度用裸连接注入分数单价）
@@ -152,7 +217,26 @@ before(async () => {
 })
 
 after(() => {
+  const raw = new DatabaseSync(process.env.DB_PATH as string)
+  const quick = raw.prepare('PRAGMA quick_check').get() as { quick_check: string }
+  assert.equal(quick.quick_check, 'ok')
+  const settlementMismatches = raw.prepare(
+    `SELECT ds.contribution_id, ds.date
+     FROM daily_settlements ds
+     WHERE ds.points <> COALESCE((
+       SELECT SUM(pl.delta) FROM point_ledger pl
+       WHERE pl.reason='usage'
+         AND (
+           pl.ref = 'usage:' || ds.contribution_id || ':' || ds.date
+           OR substr(pl.ref, 1, length('usage:' || ds.contribution_id || ':' || ds.date || ':calls:'))
+              = 'usage:' || ds.contribution_id || ':' || ds.date || ':calls:'
+         )
+     ), 0)`,
+  ).all()
+  assert.deepEqual(settlementMismatches, [], 'settlement points must equal append-only usage ledger deltas')
+  raw.close()
   fs.rmSync(tmpDir, { recursive: true, force: true })
+  assert.equal(fs.existsSync(tmpDir), false)
 })
 
 // ① 折算 ratePerCall：精确 > provider 兜底(*) > 无规则=0（种子：codex/plus=1、codex/pro=2、codex/*=1、claude/*=1）
@@ -193,9 +277,229 @@ test('结算幂等：同号同日跑两次 → 一笔 settlement、余额只加�
   const r1 = await withUsage(usage, () => settle.settleDailyUsage(noonToday(), { force: true }))
   const r2 = await withUsage(usage, () => settle.settleDailyUsage(noonToday(), { force: true }))
   assert.deepEqual({ settled: r1.settled, awarded: r1.awarded }, { settled: 1, awarded: 1 }) // 首轮结算+发分
-  assert.deepEqual({ settled: r2.settled, awarded: r2.awarded }, { settled: 0, awarded: 0 }) // 次轮 hasSettled 跳过
+  assert.deepEqual({ settled: r2.settled, awarded: r2.awarded }, { settled: 0, awarded: 0 }) // 次轮 same 水位 no-op
   assert.equal(db.settlementsFor(id).length, 1) // 只一笔
   assert.equal(db.balance(uid), 10) // codex/plus=1 → 10×1=10，只加一次
+})
+
+test('累计结算：partial 5 后观察到 full 10，只补 5 并推进同一 settlement 水位', async () => {
+  const uid = 7002
+  const id = 'reconcile-partial-full'
+  const accountId = 'reconcile-partial-full-account'
+  const date = '2020-01-03'
+  seedC({ id, provider: 'codex', accountId, plan: 'plus', linuxdoId: uid })
+
+  const partial = await withUsage(
+    [{ accountId, provider: 'codex', date, count: 5 }],
+    () => settle.settleDailyUsage(noonToday(), { force: true }),
+  )
+  const full = await withUsage(
+    [{ accountId, provider: 'codex', date, count: 10 }],
+    () => settle.settleDailyUsage(noonToday(), { force: true }),
+  )
+
+  assert.deepEqual({ settled: partial.settled, awarded: partial.awarded }, { settled: 1, awarded: 1 })
+  assert.deepEqual({ settled: full.settled, awarded: full.awarded }, { settled: 1, awarded: 1 })
+  assert.deepEqual(
+    db.settlementsFor(id).map((row) => ({ callCount: row.callCount, points: row.points })),
+    [{ callCount: 10, points: 10 }],
+  )
+  assert.deepEqual(db.ledgerFor(uid).map((row) => row.delta).sort((a, b) => a - b), [5, 5])
+  assert.equal(db.balance(uid), 10)
+})
+
+test('累计结算：same 幂等、higher 按当前单价补新增 count、lower 不倒扣且日志脱敏', async () => {
+  const uid = 7003
+  const id = 'reconcile-monotonic'
+  const accountId = 'private-account-12345678'
+  const date = '2020-01-04'
+  const plan = 'changing-rate'
+  setRate('codex', plan, 1)
+  seedC({ id, provider: 'codex', accountId, plan, linuxdoId: uid })
+  const run = (count: number) => withUsage(
+    [{ accountId, provider: 'codex', date, count }],
+    () => settle.settleDailyUsage(noonToday(), { force: true }),
+  )
+
+  const initial = await run(10)
+  const same = await run(10)
+  setRate('codex', plan, 2)
+  const higher = await run(12)
+  const warnings: string[] = []
+  const originalWarn = console.warn
+  console.warn = (...args: unknown[]) => warnings.push(args.map(String).join(' '))
+  let lower: Awaited<ReturnType<typeof settle.settleDailyUsage>>
+  try {
+    lower = await run(11)
+  } finally {
+    console.warn = originalWarn
+  }
+  const newest = await run(13)
+
+  assert.deepEqual({ settled: initial.settled, awarded: initial.awarded }, { settled: 1, awarded: 1 })
+  assert.deepEqual({ settled: same.settled, awarded: same.awarded }, { settled: 0, awarded: 0 })
+  assert.deepEqual({ settled: higher.settled, awarded: higher.awarded }, { settled: 1, awarded: 1 })
+  assert.deepEqual({ settled: lower.settled, awarded: lower.awarded }, { settled: 0, awarded: 0 })
+  assert.deepEqual({ settled: newest.settled, awarded: newest.awarded }, { settled: 1, awarded: 1 })
+  assert.deepEqual(
+    db.settlementsFor(id).map((row) => ({ callCount: row.callCount, points: row.points })),
+    [{ callCount: 13, points: 16 }],
+  )
+  assert.deepEqual(db.ledgerFor(uid).map((row) => row.delta).sort((a, b) => a - b), [2, 4, 10])
+  assert.ok(db.ledgerFor(uid).some((row) => row.ref.endsWith(':calls:12')))
+  assert.ok(db.ledgerFor(uid).some((row) => row.ref.endsWith(':calls:13')))
+  assert.equal(db.balance(uid), 16)
+  assert.ok(warnings.some((line) => line.includes('observed=11') && line.includes('watermark=12')))
+  assert.ok(!warnings.join('\n').includes(accountId), 'regression diagnostics must not expose the full account id')
+})
+
+test('累计结算：小数当前单价逐段应用于新增 count，不重算历史 points', async () => {
+  const uid = 7004
+  const id = 'reconcile-fractional-delta'
+  const accountId = 'reconcile-fractional-account'
+  const date = '2020-01-05'
+  const plan = 'fractional-delta'
+  setRate('codex', plan, 0.5)
+  seedC({ id, provider: 'codex', accountId, plan, linuxdoId: uid })
+
+  await withUsage([{ accountId, provider: 'codex', date, count: 1 }], () =>
+    settle.settleDailyUsage(noonToday(), { force: true }))
+  await withUsage([{ accountId, provider: 'codex', date, count: 2 }], () =>
+    settle.settleDailyUsage(noonToday(), { force: true }))
+
+  assert.deepEqual(
+    db.settlementsFor(id).map((row) => ({ callCount: row.callCount, points: row.points })),
+    [{ callCount: 2, points: 2 }],
+  )
+  assert.deepEqual(db.ledgerFor(uid).map((row) => row.delta), [1, 1])
+})
+
+test('累计结算：mixed valid/invalid 内部快照在任何写入前整批失败', async () => {
+  const uid = 7005
+  const id = 'reconcile-invalid-batch'
+  const accountId = 'reconcile-invalid-batch-account'
+  seedC({ id, provider: 'codex', accountId, plan: 'plus', linuxdoId: uid })
+  const usage = [
+    { accountId, provider: 'codex', date: '2020-01-06', count: 3 },
+    { accountId, provider: 'codex', date: '2020-01-07', count: -1 },
+  ] as DailyUsage[]
+
+  await assert.rejects(
+    withUsage(usage, () => settle.settleDailyUsage(noonToday(), { force: true })),
+    /invalid daily usage snapshot/i,
+  )
+  assert.equal(db.settlementsFor(id).length, 0)
+  assert.equal(db.ledgerFor(uid).length, 0)
+  assert.equal(db.balance(uid), 0)
+})
+
+test('累计结算：水位更新失败时 ledger 与 settlement 一起回滚，修复后可重试', async () => {
+  const uid = 7006
+  const id = 'reconcile-rollback'
+  const accountId = 'reconcile-rollback-account'
+  const date = '2020-01-08'
+  seedC({ id, provider: 'codex', accountId, plan: 'plus', linuxdoId: uid })
+  await withUsage([{ accountId, provider: 'codex', date, count: 5 }], () =>
+    settle.settleDailyUsage(noonToday(), { force: true }))
+
+  const raw = new DatabaseSync(process.env.DB_PATH as string)
+  raw.exec(`
+    CREATE TRIGGER abort_usage_reconciliation
+    BEFORE UPDATE OF call_count, points ON daily_settlements
+    WHEN OLD.contribution_id = '${id}'
+    BEGIN
+      SELECT RAISE(ABORT, 'test reconciliation update failure');
+    END;
+  `)
+  await assert.rejects(
+    withUsage([{ accountId, provider: 'codex', date, count: 10 }], () =>
+      settle.settleDailyUsage(noonToday(), { force: true })),
+    /test reconciliation update failure/,
+  )
+  assert.deepEqual(
+    db.settlementsFor(id).map((row) => ({ callCount: row.callCount, points: row.points })),
+    [{ callCount: 5, points: 5 }],
+  )
+  assert.deepEqual(db.ledgerFor(uid).map((row) => row.delta), [5])
+  assert.equal(db.balance(uid), 5)
+
+  raw.exec('DROP TRIGGER abort_usage_reconciliation')
+  raw.close()
+  await withUsage([{ accountId, provider: 'codex', date, count: 10 }], () =>
+    settle.settleDailyUsage(noonToday(), { force: true }))
+  assert.equal(db.settlementsFor(id)[0].callCount, 10)
+  assert.equal(db.balance(uid), 10)
+})
+
+test('累计结算：非法单价或 points 溢出不推进水位，修复单价后可重试', async () => {
+  const uid = 7007
+  const id = 'reconcile-invalid-rate'
+  const accountId = 'reconcile-invalid-rate-account'
+  const date = '2020-01-09'
+  const plan = 'invalid-rate'
+  seedC({ id, provider: 'codex', accountId, plan, linuxdoId: uid })
+
+  setRate('codex', plan, -1)
+  const negative = await withUsage([{ accountId, provider: 'codex', date, count: 2 }], () =>
+    settle.settleDailyUsage(noonToday(), { force: true }))
+  setRate('codex', plan, Number.MAX_SAFE_INTEGER)
+  const overflow = await withUsage([{ accountId, provider: 'codex', date, count: 2 }], () =>
+    settle.settleDailyUsage(noonToday(), { force: true }))
+  assert.deepEqual({ settled: negative.settled, awarded: negative.awarded }, { settled: 0, awarded: 0 })
+  assert.deepEqual({ settled: overflow.settled, awarded: overflow.awarded }, { settled: 0, awarded: 0 })
+  assert.equal(db.settlementsFor(id).length, 0)
+  assert.equal(db.balance(uid), 0)
+
+  setRate('codex', plan, 1)
+  const retried = await withUsage([{ accountId, provider: 'codex', date, count: 2 }], () =>
+    settle.settleDailyUsage(noonToday(), { force: true }))
+  assert.deepEqual({ settled: retried.settled, awarded: retried.awarded }, { settled: 1, awarded: 1 })
+  assert.equal(db.balance(uid), 2)
+})
+
+test('累计结算：两个进程并发观察相同 full 水位，总正 delta 只追加一次', async () => {
+  const uid = 7008
+  const id = 'reconcile-concurrent'
+  const accountId = 'reconcile-concurrent-account'
+  const date = '2020-01-10'
+  const now = noonToday()
+  seedC({ id, provider: 'codex', accountId, plan: 'plus', linuxdoId: uid })
+  await withUsage([{ accountId, provider: 'codex', date, count: 5 }], () =>
+    settle.settleDailyUsage(now, { force: true }))
+
+  const full: DailyUsage[] = [{ accountId, provider: 'codex', date, count: 10 }]
+  await runConcurrentUsage([full, full], now)
+  assert.deepEqual(
+    db.settlementsFor(id).map((row) => ({ callCount: row.callCount, points: row.points })),
+    [{ callCount: 10, points: 10 }],
+  )
+  assert.deepEqual(db.ledgerFor(uid).map((row) => row.delta).sort((a, b) => a - b), [5, 5])
+  assert.equal(db.balance(uid), 10)
+})
+
+test('累计结算：SQLite busy 失败不记运行日，释放锁后同日非 force 可重试', async () => {
+  const uid = 7009
+  const id = 'reconcile-busy-retry'
+  const accountId = 'reconcile-busy-retry-account'
+  const date = '2031-12-31'
+  const now = new Date(2032, 0, 2, 12).getTime()
+  const usage: DailyUsage[] = [{ accountId, provider: 'codex', date, count: 4 }]
+  seedC({ id, provider: 'codex', accountId, plan: 'plus', linuxdoId: uid })
+
+  const locker = new DatabaseSync(process.env.DB_PATH as string)
+  locker.exec('BEGIN IMMEDIATE')
+  await assert.rejects(
+    withUsage(usage, () => settle.settleDailyUsage(now)),
+    /database is locked/i,
+  )
+  assert.equal(db.settlementsFor(id).length, 0)
+  locker.exec('ROLLBACK')
+  locker.close()
+
+  const retried = await withUsage(usage, () => settle.settleDailyUsage(now))
+  assert.ok(!retried.skipped)
+  assert.deepEqual({ settled: retried.settled, awarded: retried.awarded }, { settled: 1, awarded: 1 })
+  assert.equal(db.balance(uid), 4)
 })
 
 // ④ 结算资格＝**入过池**（pooled_at 非空），不看当前态（codex xhigh 于 PR #18）：入过池的 stopped/

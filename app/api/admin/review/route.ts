@@ -11,7 +11,7 @@ const REVIEW_ACTION_FAILURE = {
 
 // 人工复核处理（P4-R3，§7.4）：needs_review 号（残缺号 / 首检 reauth）的人工重试/终止——补上死胡同出口。
 // 🔴 §7.4 幂等：retryReview/terminateReview 都只走 transition CAS 改 verify_status，完全不碰
-//   daily_settlements / point_ledger，故「不得绕过同号同日只结算一次」天然成立（重试不结算、终止不删账本）。
+//   daily_settlements / point_ledger，故不会绕过累计水位 reconciliation（重试不结算、终止不删账本）。
 
 // needs_review 队列投影（只挑展示字段，GET 与 POST 后刷新共用）
 function reviewQueue() {
