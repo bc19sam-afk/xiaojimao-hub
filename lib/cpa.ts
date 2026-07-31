@@ -496,30 +496,17 @@ const realClient: CpaClient = {
     // R1 已核对（docs/probe-cpamp-real-R1.md §二②）：真实 usage 事件的三层结构与 account_snapshot /
     //   auth_provider_snapshot / auth_label_snapshot / timestamp 字段名与本实现完全吻合、无结构性错配。
     //   数据源 GET /v0/management/usage（P0-A 实探）：
-    //   { apis: { [端点]: { models: { [模型]: { details: RawUsageDetail[] } } } } }，每条 detail = 一次请求。
+    //   { apis: { [端点]: { models: { [模型]: { details: [...] } } } } }，每条 detail = 一次请求。
     // 计量口径（§3.1/P0-A）：按 (auth_provider_snapshot, account_snapshot) 分组、timestamp 落自然日、
     //   数 details 条数 = 该号当日调用次数（贡献号判定见 isHubContribution，现阶段恒放行）。
-    const data = (await req('GET', '/v0/management/usage')) as RawUsage
-    const agg = new Map<string, DailyUsage>() // key = provider\0accountId\0date
-    for (const apiEntry of Object.values(data.apis ?? {})) {
-      for (const model of Object.values(apiEntry?.models ?? {})) {
-        for (const d of model?.details ?? []) {
-          // R1 已核对：auth_label_snapshot 是 cpamp 自带账号 label（=邮箱）、非 hub 来源标记；贡献号判定见
-          // isHubContribution（现阶段恒放行）。专用 hub 来源标记写入见后续单（对接-R3）。
-          if (!isHubContribution(d.auth_label_snapshot)) continue
-          const provider = providerFromToken(d.auth_provider_snapshot) // R1 实测：真实值 = "claude"（非 "anthropic"，两名都认）、xai→grok
-          const accountId = d.account_snapshot ?? ''
-          const ts = d.timestamp
-          if (!provider || !accountId || ts == null) continue // 认不出 provider / 无稳定号 / 无时间戳 → 跳过
-          const date = dayStr(tsToMs(ts))
-          const key = `${provider}\0${accountId}\0${date}`
-          const cur = agg.get(key)
-          if (cur) cur.count++
-          else agg.set(key, { accountId, provider, date, count: 1 })
-        }
-      }
+    try {
+      return parseDailyUsage(await req('GET', '/v0/management/usage'))
+    } catch (err) {
+      if (err instanceof Error && err.message === CPA_UNAVAILABLE) throw err
+      const code = err instanceof UsagePayloadError ? err.code : 'transport_or_json'
+      console.error(`[cpa] usage unavailable: ${code}`)
+      throw new Error(CPA_UNAVAILABLE)
     }
-    return [...agg.values()]
   },
 }
 
@@ -562,15 +549,70 @@ export function mapInspection(r: RawInspectionResult): ProbeResult {
   return { accountId: r.accountId ?? '', decision, plan, reason, provider: providerFromToken(r.provider) }
 }
 
-// —— usage 事件流原始形状（R1 已核对：四字段名与真实 cpamp 吻合，见 getDailyUsage 注释）——
-interface RawUsageDetail {
-  account_snapshot?: string
-  auth_provider_snapshot?: string
-  auth_label_snapshot?: string
-  timestamp?: string | number
+const USAGE_ROW_LIMIT = 50_000
+
+class UsagePayloadError extends Error {
+  readonly code: string
+
+  constructor(code: string) {
+    super(code)
+    this.code = code
+  }
 }
-interface RawUsage {
-  apis?: Record<string, { models?: Record<string, { details?: RawUsageDetail[] }> }>
+
+function usageFail(code: string): never {
+  throw new UsagePayloadError(code)
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function parseDailyUsage(raw: unknown): DailyUsage[] {
+  if (!isRecord(raw) || !isRecord(raw.apis)) usageFail('invalid_apis')
+  const hintedTotal = raw.total_requests
+  if (Number.isSafeInteger(hintedTotal) && (hintedTotal as number) >= USAGE_ROW_LIMIT) {
+    usageFail('usage_row_limit')
+  }
+
+  const agg = new Map<string, DailyUsage>() // key = provider\0accountId\0date
+  let detailCount = 0
+  for (const apiEntry of Object.values(raw.apis)) {
+    if (!isRecord(apiEntry) || !isRecord(apiEntry.models)) usageFail('invalid_models')
+    for (const model of Object.values(apiEntry.models)) {
+      if (!isRecord(model) || !Array.isArray(model.details)) usageFail('invalid_details')
+      for (const detail of model.details) {
+        if (!isRecord(detail)) usageFail('invalid_detail')
+        detailCount++
+        if (!Number.isSafeInteger(detailCount)) usageFail('detail_count_overflow')
+        if (detailCount >= USAGE_ROW_LIMIT) usageFail('usage_row_limit')
+
+        const accountId = detail.account_snapshot
+        const providerToken = detail.auth_provider_snapshot
+        if (typeof accountId !== 'string' || accountId.trim() === '') usageFail('invalid_detail_account')
+        if (typeof providerToken !== 'string') usageFail('invalid_detail_provider')
+        const provider = providerFromToken(providerToken)
+        if (!provider) usageFail('invalid_detail_provider')
+        const timestamp = tsToMs(detail.timestamp)
+        const label = typeof detail.auth_label_snapshot === 'string' ? detail.auth_label_snapshot : undefined
+
+        // R1 已核对：auth_label_snapshot 是 cpamp 自带账号 label（=邮箱）、非 hub 来源标记；贡献号判定见
+        // isHubContribution（现阶段恒放行）。专用 hub 来源标记写入见后续单（对接-R3）。
+        if (!isHubContribution(label)) continue
+        const date = dayStr(timestamp)
+        const key = `${provider}\0${accountId}\0${date}`
+        const current = agg.get(key)
+        if (current) {
+          const next = current.count + 1
+          if (!Number.isSafeInteger(next)) usageFail('aggregate_count_overflow')
+          current.count = next
+        } else {
+          agg.set(key, { accountId, provider, date, count: 1 })
+        }
+      }
+    }
+  }
+  return [...agg.values()]
 }
 // 🔴 R1 已核对（docs/probe-cpamp-real-R1.md §二⑤/三.1）：真实 auth_label_snapshot = 账号自带 label
 // （= 邮箱），containsHub=false——它**不是** hub 注入的来源标记。故绝不可把 label 预过滤「升级回」按
@@ -584,9 +626,18 @@ function isHubContribution(_label: string | undefined): boolean {
 // R1 已核对（§二④）：真实 timestamp = UTC ISO-8601 字符串（如 2026-07-16T13:53:50.795Z），走 Date.parse
 // 分支解析成功；数字秒/毫秒分支对 claude 不触发，防御性保留。⚠️ 运维：源时间是 UTC，tsToMs→dayStr 落
 // 服务器本地时区日，故生产机时区必须对齐目标结算时区（与已知 CI-UTC-grace-window flaky 同源）。
-function tsToMs(ts: string | number): number {
-  if (typeof ts === 'number') return ts < 1e12 ? ts * 1000 : ts
-  return Date.parse(ts) || 0
+function tsToMs(ts: unknown): number {
+  let value: number
+  if (typeof ts === 'number') {
+    if (!Number.isSafeInteger(ts) || ts < 0) usageFail('invalid_detail_timestamp')
+    value = ts < 1e12 ? ts * 1000 : ts
+  } else if (typeof ts === 'string' && ts.trim() !== '') {
+    value = Date.parse(ts)
+  } else {
+    usageFail('invalid_detail_timestamp')
+  }
+  if (!Number.isSafeInteger(value) || value <= 0) usageFail('invalid_detail_timestamp')
+  return value
 }
 
 export const cpa: CpaClient = env.mock ? mockClient : realClient

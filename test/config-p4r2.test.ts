@@ -254,7 +254,7 @@ test('D4 audit 端到端：trust_gate 条目 recordAudit → listAudit 读回', 
 // ---------------------------- E：codex 复审 3 条回归 ----------------------------
 
 // E1 结算防御闸（codex 复审 P2）：巨额单价 → round(count×rate) 溢出 Infinity → 该(号,日)不结不发；
-//    改回正常单价 → 该日未被 hasSettled 吞、下轮重结自愈补发
+//    改回正常单价 → 水位未推进、下轮重结自愈补发
 test('E1 结算防御闸：巨额单价该日不结不发；改回正常后下轮自愈', async () => {
   const uid = 8100
   const accountId = 'guard-acc'
@@ -267,7 +267,7 @@ test('E1 结算防御闸：巨额单价该日不结不发；改回正常后下�
   await withUsage(usage, () => settle.settleDailyUsage(now, { force: true }))
   assert.equal(db.settlementsFor(id).length, 0, '非法折算不落 settlement')
   assert.equal(db.balance(uid), 0, '非法折算不发分')
-  // 管理员改回正常单价 → 该日未被 hasSettled 吞、下轮重结自愈
+  // 管理员改回正常单价 → 该日水位仍未推进、下轮重结自愈
   db.upsertUsageRate({ provider: 'grok', plan: 'super', pointsPerCall: 2, enabled: true, label: '修' })
   await withUsage(usage, () => settle.settleDailyUsage(now, { force: true }))
   assert.equal(db.settlementsFor(id).length, 1, '修好后能补结（自愈）')

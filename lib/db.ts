@@ -212,7 +212,7 @@ function toObservation(r: ObsRow): Observation {
   }
 }
 
-// 按日结算行（P2-R2）：daily_settlements 一行 = 某号某自然日一笔结算
+// 按日结算行（P2-R2/P7-R1）：daily_settlements 一行 = 某号某自然日的累计结算水位
 interface DsRow {
   id: number
   contribution_id: string
@@ -685,8 +685,8 @@ export const db = {
     return conn.prepare('DELETE FROM usage_rates WHERE id=?').run(id).changes === 1
   },
 
-  // 记一笔当日结算：INSERT，(contribution_id, date) 冲突则 DO NOTHING（按日结算幂等）。返回是否本次真正落库。
-  // 这是「同号同日只结一次」的第一道闸；发分幂等由 awardPoints 的 UNIQUE(reason, ref) 兜第二道。
+  // 直接写入一条结算水位的低层 helper，保留给测试夹具和只读展示准备；生产结算路径必须走
+  // reconcileUsageSettlement，才能在同一事务内原子追加正 delta ledger 并推进累计水位。
   recordSettlement(rec: {
     contributionId: string
     date: string
@@ -706,35 +706,117 @@ export const db = {
     return r.changes > 0
   },
 
-  // 该号该日是否已结算（settleDailyUsage 的快速跳过闸；真正防重复结算/发分靠两层 UNIQUE 约束）
+  // 查询该号该日是否已有累计水位。仅供检查；不能据此跳过 reconciliation，否则迟到用量会永久漏发。
   hasSettled(contributionId: string, date: string): boolean {
     return !!conn
       .prepare('SELECT 1 FROM daily_settlements WHERE contribution_id=? AND date=? LIMIT 1')
       .get(contributionId, date)
   },
 
-  // 发分 + 记结算：**同一事务**（codex xhigh 于 PR #16 指出：两写分离时，夹缝崩溃会让下轮以变化后的
-  // 用量/单价补记 settlement，与已入账的 ledger 笔数值分叉）。BEGIN IMMEDIATE 内两写同成同败；两层
-  // UNIQUE（point_ledger(reason,ref) / daily_settlements(contribution_id,date)）仍各自幂等兜底。
-  // 返回 { settled, awarded }＝本次是否真正落库/入账。
-  settleAndAward(rec: {
+  // daily_settlements 的唯一行是该号该日的单调累计水位。BEGIN IMMEDIATE 在读取旧值前取写锁，
+  // 跨进程相同快照会串行看到最新水位；正 delta ledger 与水位 INSERT/UPDATE 同成同败。
+  reconcileUsageSettlement(rec: {
     contributionId: string
     date: string
     provider: string
     accountId: string
+    plan: string
     callCount: number
-    points: number
     linuxdoId: number
-  }): { settled: boolean; awarded: boolean } {
+  }): {
+    status: 'created' | 'advanced' | 'unchanged' | 'regressed' | 'invalid'
+    settled: boolean
+    awarded: boolean
+    rate?: number
+    previousCallCount?: number
+  } {
+    if (!Number.isSafeInteger(rec.callCount) || rec.callCount < 0) {
+      throw new Error('invalid daily usage count')
+    }
     conn.exec('BEGIN IMMEDIATE')
     try {
-      let awarded = false
-      if (rec.points > 0) {
-        awarded = db.awardPoints(rec.linuxdoId, rec.points, 'usage', `usage:${rec.contributionId}:${rec.date}`)
+      const existing = conn
+        .prepare(
+          `SELECT id, contribution_id, date, provider, account_id, call_count, points, settled_at
+           FROM daily_settlements WHERE contribution_id=? AND date=?`,
+        )
+        .get(rec.contributionId, rec.date) as unknown as DsRow | undefined
+
+      if (existing) {
+        if (existing.provider !== rec.provider || existing.account_id !== rec.accountId) {
+          throw new Error('usage settlement identity mismatch')
+        }
+        if (!Number.isSafeInteger(existing.call_count) || existing.call_count < 0 ||
+            !Number.isSafeInteger(existing.points) || existing.points < 0) {
+          throw new Error('invalid stored usage settlement watermark')
+        }
+        if (rec.callCount < existing.call_count) {
+          conn.exec('COMMIT')
+          return {
+            status: 'regressed',
+            settled: false,
+            awarded: false,
+            previousCallCount: existing.call_count,
+          }
+        }
+        if (rec.callCount === existing.call_count) {
+          conn.exec('COMMIT')
+          return { status: 'unchanged', settled: false, awarded: false }
+        }
       }
-      const settled = db.recordSettlement(rec)
+
+      const oldCount = existing?.call_count ?? 0
+      const countDelta = rec.callCount - oldCount
+      const rate = db.ratePerCall(rec.provider, rec.plan)
+      const pointsDelta = Math.round(countDelta * rate)
+      const nextPoints = (existing?.points ?? 0) + pointsDelta
+      if (!Number.isFinite(rate) || rate < 0 ||
+          !Number.isSafeInteger(pointsDelta) || pointsDelta < 0 ||
+          !Number.isSafeInteger(nextPoints) || nextPoints < 0) {
+        conn.exec('COMMIT')
+        return { status: 'invalid', settled: false, awarded: false, rate }
+      }
+
+      if (pointsDelta > 0) {
+        const ref = existing
+          ? `usage:${rec.contributionId}:${rec.date}:calls:${rec.callCount}`
+          : `usage:${rec.contributionId}:${rec.date}`
+        conn
+          .prepare('INSERT INTO point_ledger (linuxdo_id, delta, reason, ref, created_at) VALUES (?,?,?,?,?)')
+          .run(rec.linuxdoId, pointsDelta, 'usage', ref, Date.now())
+      }
+
+      if (existing) {
+        const updated = conn
+          .prepare(
+            `UPDATE daily_settlements SET call_count=?, points=?, settled_at=?
+             WHERE id=? AND call_count=? AND points=?`,
+          )
+          .run(rec.callCount, nextPoints, Date.now(), existing.id, existing.call_count, existing.points)
+        if (updated.changes !== 1) throw new Error('usage settlement watermark update conflict')
+      } else {
+        conn
+          .prepare(
+            `INSERT INTO daily_settlements
+               (contribution_id, date, provider, account_id, call_count, points, settled_at)
+             VALUES (?,?,?,?,?,?,?)`,
+          )
+          .run(
+            rec.contributionId,
+            rec.date,
+            rec.provider,
+            rec.accountId,
+            rec.callCount,
+            nextPoints,
+            Date.now(),
+          )
+      }
       conn.exec('COMMIT')
-      return { settled, awarded }
+      return {
+        status: existing ? 'advanced' : 'created',
+        settled: true,
+        awarded: pointsDelta > 0,
+      }
     } catch (err) {
       conn.exec('ROLLBACK')
       throw err
@@ -1327,7 +1409,7 @@ export const db = {
   // ===== 人工复核处理（P4-R3，§7.4）=====
   // needs_review 号（拿不到稳定 account_id 的残缺号 / 首检 OAuth 失效 reauth）现无任何自动出口＝死胡同。
   // 两动作都只走 transition CAS 改 verify_status，**完全不碰 daily_settlements / point_ledger**，故天然满足
-  // §7.4「不得绕过同号同日只结算一次」——重试不触发结算、终止不删已有结算/账本。CAS from=['needs_review']
+  // §7.4：人工重试不触发 reconciliation、终止不删已有累计水位/账本。CAS from=['needs_review']
   // 亦防并发/状态已变时误操作（对非 needs_review 号调用返 false 不改）。
 
   // 重试：按 pooled_at 分叉去向（codex 复审 P1）。needs_review 有两类，不能一律回首检：
@@ -1581,7 +1663,7 @@ export function shortAccountLabel(provider: string, accountId: string): string {
   return tail ? `${name}·${tail}` : name
 }
 
-// 一笔积分流水 → 中文原因文案。usage 笔解析 ref（'usage:<cid>:YYYY-MM-DD'）出日期 + 账号短标识，
+// 一笔积分流水 → 中文原因文案。usage 笔解析首次 ref 或带目标累计次数的补差 ref，
 // 显示「〔账号〕M 月 D 日 用量结算」；其它 reason（redeem / 贡献老笔）给稳定中文、原样保留。
 // accountOf：cid → 该号 (provider, accountId)，由调用方按用户号表构建（解析不到则回落「账号」）。
 export function describeLedgerEntry(
@@ -1589,7 +1671,7 @@ export function describeLedgerEntry(
   accountOf: (cid: string) => { provider: string; accountId: string } | undefined,
 ): string {
   if (e.reason === 'usage') {
-    const m = /^usage:([^:]+):(\d{4})-(\d{2})-(\d{2})$/.exec(e.ref)
+    const m = /^usage:([^:]+):(\d{4})-(\d{2})-(\d{2})(?::calls:\d+)?$/.exec(e.ref)
     if (m) {
       const acct = accountOf(m[1])
       const who = acct ? shortAccountLabel(acct.provider, acct.accountId) : '账号'
