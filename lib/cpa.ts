@@ -636,7 +636,9 @@ function tsToMs(ts: unknown): number {
   } else {
     usageFail('invalid_detail_timestamp')
   }
-  if (!Number.isSafeInteger(value) || value <= 0) usageFail('invalid_detail_timestamp')
+  if (!Number.isSafeInteger(value) || value <= 0 || !Number.isFinite(new Date(value).getTime())) {
+    usageFail('invalid_detail_timestamp')
+  }
   return value
 }
 

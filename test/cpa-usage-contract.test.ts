@@ -84,6 +84,7 @@ test('usage rejects invalid required detail fields but preserves numeric timesta
     detail({ auth_provider_snapshot: 'unknown-provider' }),
     detail({ timestamp: 'not-a-date' }),
     detail({ timestamp: Number.NaN }),
+    detail({ timestamp: Number.MAX_SAFE_INTEGER }),
   ]) {
     await expectUnavailable(payload([invalid]))
   }
