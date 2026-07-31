@@ -570,9 +570,12 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function parseDailyUsage(raw: unknown): DailyUsage[] {
   if (!isRecord(raw) || !isRecord(raw.apis)) usageFail('invalid_apis')
-  const hintedTotal = raw.total_requests
-  if (Number.isSafeInteger(hintedTotal) && (hintedTotal as number) >= USAGE_ROW_LIMIT) {
-    usageFail('usage_row_limit')
+  if (Object.prototype.hasOwnProperty.call(raw, 'total_requests')) {
+    const hintedTotal = raw.total_requests
+    if (typeof hintedTotal !== 'number' || !Number.isSafeInteger(hintedTotal) || hintedTotal < 0) {
+      usageFail('invalid_total_requests')
+    }
+    if (hintedTotal >= USAGE_ROW_LIMIT) usageFail('usage_row_limit')
   }
 
   const agg = new Map<string, DailyUsage>() // key = provider\0accountId\0date
@@ -626,13 +629,30 @@ function isHubContribution(_label: string | undefined): boolean {
 // R1 已核对（§二④）：真实 timestamp = UTC ISO-8601 字符串（如 2026-07-16T13:53:50.795Z），走 Date.parse
 // 分支解析成功；数字秒/毫秒分支对 claude 不触发，防御性保留。⚠️ 运维：源时间是 UTC，tsToMs→dayStr 落
 // 服务器本地时区日，故生产机时区必须对齐目标结算时区（与已知 CI-UTC-grace-window flaky 同源）。
+function hasValidIsoCalendarDate(value: string): boolean {
+  const match = /^(\d{4})-(\d{2})-(\d{2})(?=$|[Tt\s])/.exec(value)
+  if (!match) return true
+
+  const year = Number(match[1])
+  const month = Number(match[2])
+  const day = Number(match[3])
+  const probe = new Date(0)
+  probe.setUTCHours(0, 0, 0, 0)
+  probe.setUTCFullYear(year, month - 1, day)
+  return probe.getUTCFullYear() === year &&
+    probe.getUTCMonth() === month - 1 &&
+    probe.getUTCDate() === day
+}
+
 function tsToMs(ts: unknown): number {
   let value: number
   if (typeof ts === 'number') {
     if (!Number.isSafeInteger(ts) || ts < 0) usageFail('invalid_detail_timestamp')
     value = ts < 1e12 ? ts * 1000 : ts
   } else if (typeof ts === 'string' && ts.trim() !== '') {
-    value = Date.parse(ts)
+    const timestamp = ts.trim()
+    if (!hasValidIsoCalendarDate(timestamp)) usageFail('invalid_detail_timestamp')
+    value = Date.parse(timestamp)
   } else {
     usageFail('invalid_detail_timestamp')
   }

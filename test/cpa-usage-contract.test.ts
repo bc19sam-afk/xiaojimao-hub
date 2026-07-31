@@ -92,6 +92,16 @@ test('usage rejects invalid required detail fields but preserves numeric timesta
   assert.deepEqual(await read(payload([detail({ timestamp: 1_753_000_000 })])), [
     { accountId: 'acct-fixture', provider: 'codex', date: '2025-07-20', count: 1 },
   ])
+  assert.equal((await read(payload([
+    detail({ timestamp: '2026-02-28T23:30:00.000-05:00' }),
+  ])))[0]?.count, 1)
+})
+
+test('usage rejects an impossible ISO calendar date before returning any valid rows', async () => {
+  await expectUnavailable(payload([
+    detail(),
+    detail({ timestamp: '2026-02-30T00:00:00.000Z' }),
+  ]))
 })
 
 test('usage allows 49,999 rows and fails the whole payload closed at 50,000 rows', async () => {
@@ -103,6 +113,20 @@ test('usage allows 49,999 rows and fails the whole payload closed at 50,000 rows
   const truncatedHint = payload(Array(49_999).fill(repeated))
   truncatedHint.total_requests = 50_000
   await expectUnavailable(truncatedHint)
+})
+
+test('usage validates total_requests whenever the field is present', async () => {
+  for (const valid of [0, 49_999]) {
+    const body = payload([detail()])
+    body.total_requests = valid
+    assert.equal((await read(body))[0]?.count, 1)
+  }
+
+  for (const invalid of [50_000.5, '50000', -1, null, true, {}]) {
+    const body = payload([detail()])
+    body.total_requests = invalid
+    await expectUnavailable(body)
+  }
 })
 
 test('usage payload failures expose only CPA_UNAVAILABLE and never log raw payload data', async () => {
