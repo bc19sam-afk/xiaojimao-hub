@@ -70,8 +70,8 @@ function openDb(): DatabaseSync {
   fs.mkdirSync(path.dirname(DB_PATH), { recursive: true })
   const d = new DatabaseSync(DB_PATH)
   try {
-    // busy_timeout 必须先设：它一设即生效且自身不取锁，随后所有取锁语句（WAL 建立、seedDefaults 的
-    // BEGIN IMMEDIATE）都受这 5s 等待保护。若顺序颠倒，next build 多 worker 同刻 openDb 争 WAL 建立
+    // busy_timeout 必须先设：它一设即生效且自身不取锁，随后所有取锁语句（含 WAL 建立）
+    // 都受这 5s 等待保护。若顺序颠倒，next build 多 worker 同刻 openDb 争 WAL 建立
     // 的短暂排他锁时，journal_mode=WAL 会以 busy_timeout=0 立刻抛 "database is locked"（无重试）。
     d.exec('PRAGMA busy_timeout = 5000')
     d.exec('PRAGMA journal_mode = WAL')
@@ -79,7 +79,6 @@ function openDb(): DatabaseSync {
     // mock（开发/演示）保持启动自动迁移。
     if (env.mock) migrate(d)
     else assertSchemaCurrent(d)
-    seedDefaults(d)
     return d
   } catch (error) {
     d.close()
@@ -87,93 +86,7 @@ function openDb(): DatabaseSync {
   }
 }
 
-// 首次运行播种合理默认值（管理页可随时改）。仅在表为空时插入。
-// ⚠️ 并发播种竞态（TOCTOU）：next build 并行拉起多个 worker 进程，各自 openDb→seedDefaults 打同一
-// data/app.db。每块「SELECT COUNT==0 then INSERT」非原子，两进程同读 count=0 再各插 →
-//   point_rules / usage_rates（UNIQUE(provider,plan)）撞唯一键抛错 → build 挂；
-//   redeem_items（无唯一键）静默插两份种子（4→8）；app_config（key 为 PRIMARY KEY）同样会撞。
-// 修法：整个函数体包进 BEGIN IMMEDIATE 单事务（openDb 已设 busy_timeout=5s）。先到者持写锁播完提交，
-// 后到者阻塞至提交后、其读到各表 count>0 全部跳过——一处修好所有块及任何未来种子表，且不改任何
-// 单条 INSERT / 种子值。与 migrate() / settleAndAward 同款「BEGIN IMMEDIATE 兼作并发锁」模式。
-// export：供 test/seed-concurrency.test.ts 直接驱动并发（子进程各开 target 连接、对齐后调本函数），
-// 测其 BEGIN IMMEDIATE 原子播种。生产无其它调用方（仅 openDb 内部用）。
-export function seedDefaults(d: DatabaseSync): void {
-  d.exec('BEGIN IMMEDIATE')
-  try {
-    const ruleCount = (d.prepare('SELECT COUNT(*) AS n FROM point_rules').get() as { n: number }).n
-    if (ruleCount === 0) {
-      const rules: [string, string, number, string][] = [
-        ['codex', 'plus', 10, 'ChatGPT Plus'],
-        ['codex', 'pro', 30, 'ChatGPT Pro'],
-        ['codex', 'team', 50, 'ChatGPT Team'],
-        ['codex', 'edu', 20, 'ChatGPT Edu / K12'],
-        ['codex', '*', 5, 'ChatGPT 其它'],
-        ['claude', '*', 20, 'Claude'],
-        ['grok', '*', 20, 'SuperGrok'],
-      ]
-      const stmt = d.prepare(
-        'INSERT INTO point_rules (provider, plan, points, label) VALUES (?,?,?,?)',
-      )
-      for (const [p, pl, pts, label] of rules) stmt.run(p, pl, pts, label)
-    }
-    // 用量单价（usage_rates，P2-R2）：每次调用积分单价，占位值、后台可调。分档演示 codex-pro 高于 plus；
-    // claude/grok 用兜底档。数字皆占位——需求 §3.4「数字全为占位、随时调」。
-    // ⚠️ 一次性播种（P4-R2 codex 复审 P1）：本轮新增 DELETE usage-rates 让「管理员删空＝停发」成立，但旧逻辑
-    // 每次启动 rateCount===0 就播回默认档＝重启/部署后静默恢复发分。改用 marker 键 'usage_rates_seeded'
-    // （仿下方 observe_window_ms 的「键缺失才播」范式）：仅首次（无 marker）才进本段播种，**无论是否播种都写
-    // marker**，之后启动一律跳过、删空不回种。存量库（rates>0 且无 marker）首次重开跳过播种、补写 marker，
-    // 行为不变。整段已在外层 BEGIN IMMEDIATE 内、无并发问题。
-    if (d.prepare('SELECT 1 FROM app_config WHERE key=?').get('usage_rates_seeded') == null) {
-      const rateCount = (d.prepare('SELECT COUNT(*) AS n FROM usage_rates').get() as { n: number }).n
-      if (rateCount === 0) {
-        const rates: [string, string, number, string][] = [
-          ['codex', 'plus', 1, 'Codex Plus 每次调用'],
-          ['codex', 'pro', 2, 'Codex Pro 每次调用'],
-          ['codex', '*', 1, 'Codex 其它每次调用'],
-          ['claude', '*', 1, 'Claude 每次调用'],
-          ['grok', '*', 1, 'SuperGrok 每次调用'],
-        ]
-        // ON CONFLICT DO NOTHING：既有幂等兜底，保留无害（现整段已在外层 BEGIN IMMEDIATE 单事务内）。
-        const stmt = d.prepare(
-          `INSERT INTO usage_rates (provider, plan, points_per_call, label) VALUES (?,?,?,?)
-           ON CONFLICT(provider, plan) DO NOTHING`,
-        )
-        for (const [p, pl, ppc, label] of rates) stmt.run(p, pl, ppc, label)
-      }
-      // 无论是否播种都落 marker：之后启动不再进本段（管理员删空后不回种）
-      d.prepare('INSERT INTO app_config (key, value, updated_at) VALUES (?,?,?)').run(
-        'usage_rates_seeded',
-        '1',
-        Date.now(),
-      )
-    }
-    const itemCount = (d.prepare('SELECT COUNT(*) AS n FROM redeem_items').get() as { n: number }).n
-    if (itemCount === 0) {
-      const items: [string, string, number, string, number][] = [
-        ['限时额度（高）', '较高额度，限时使用', 50, 'timed_quota', 1],
-        ['永久额度', '永久有效的额度', 100, 'permanent_quota', 2],
-        ['注册邀请码', '公益站注册邀请码 ×1', 150, 'invite_code', 3],
-        ['订阅 VIP', '一段时间的 VIP 订阅', 200, 'vip', 4],
-      ]
-      const stmt = d.prepare(
-        'INSERT INTO redeem_items (name, description, cost, kind, sort) VALUES (?,?,?,?,?)',
-      )
-      for (const [n, desc, cost, kind, sort] of items) stmt.run(n, desc, cost, kind, sort)
-    }
-    // 考察窗口 T 默认值（app_config KV）：mock 8s 便于演示 / 真实 24h。仅键缺失时播种，管理页可改。
-    if (d.prepare('SELECT 1 FROM app_config WHERE key=?').get('observe_window_ms') == null) {
-      d.prepare('INSERT INTO app_config (key, value, updated_at) VALUES (?,?,?)').run(
-        'observe_window_ms',
-        String(env.mock ? 8000 : 86_400_000),
-        Date.now(),
-      )
-    }
-    d.exec('COMMIT')
-  } catch (err) {
-    d.exec('ROLLBACK')
-    throw err
-  }
-}
+export { seedDefaults } from './seed-defaults'
 
 // 跨热更新复用同一连接。连接本身惰性创建：DB-backed 模块可以安全完成 ESM 求值；若坏库令
 // openDb() 失败，本次调用抛错但模块不会进入 rejected-module cache，修库后下一次调用会重新尝试。
@@ -619,8 +532,8 @@ export const db = {
       )
       .run(r.provider.toLowerCase(), r.plan.toLowerCase(), r.points, r.enabled ? 1 : 0, r.label)
   },
-  deletePointRule(id: number): void {
-    conn.prepare('DELETE FROM point_rules WHERE id=?').run(id)
+  deletePointRule(id: number): boolean {
+    return conn.prepare('DELETE FROM point_rules WHERE id=?').run(id).changes === 1
   },
 
   // ===== 配置：兑换项 =====
@@ -692,8 +605,8 @@ export const db = {
        VALUES (?,?,?,?)`,
     ).run(request.requestKey, request.payloadHash, request.itemId, request.createdAt)
   },
-  deleteRedeemItem(id: number): void {
-    conn.prepare('DELETE FROM redeem_items WHERE id=?').run(id)
+  deleteRedeemItem(id: number): boolean {
+    return conn.prepare('DELETE FROM redeem_items WHERE id=?').run(id).changes === 1
   },
 
   // ===== 积分：发放/消耗/余额 =====
@@ -768,8 +681,8 @@ export const db = {
       )
       .run(r.provider.toLowerCase(), r.plan.toLowerCase(), r.pointsPerCall, r.enabled ? 1 : 0, r.label)
   },
-  deleteUsageRate(id: number): void {
-    conn.prepare('DELETE FROM usage_rates WHERE id=?').run(id)
+  deleteUsageRate(id: number): boolean {
+    return conn.prepare('DELETE FROM usage_rates WHERE id=?').run(id).changes === 1
   },
 
   // 记一笔当日结算：INSERT，(contribution_id, date) 冲突则 DO NOTHING（按日结算幂等）。返回是否本次真正落库。
@@ -1449,7 +1362,8 @@ export const db = {
 
   // ===== readiness 只读探针（P6-R2，§9）=====
   // 同时验证两件此前被混为一谈的事实：① 应用实际在用的常驻连接仍活着；② DB_PATH 当前仍指向
-  // 启动时打开的同一 dev/inode，并且新只读连接能从磁盘路径读出 schema。只做其中任一半都会假绿：
+  // 启动时打开的同一 dev/inode，并且新连接能从最终磁盘文件重跑 canonical schema + 写探针。
+  // 只做其中任一半都会假绿：
   // 新连接证明不了常驻连接；常驻连接在路径被 unlink/rename 后又会继续读写已不可见的旧 inode。
   // fresh 连接不使用 immutable=1：运行中的库是 WAL，immutable 会忽略 WAL 里尚未 checkpoint 的已提交状态。
   // DB_PATH 在 stat/open/stat 间变化会抛错或身份不匹配，由调用方统一判 503；fresh 连接始终 finally close。
@@ -1508,9 +1422,10 @@ export const db = {
       }
     }
 
-    const disk = new DatabaseSync(DB_PATH, { readOnly: true })
+    const disk = new DatabaseSync(DB_PATH)
     try {
-      disk.exec('PRAGMA busy_timeout = 5000')
+      disk.exec('PRAGMA busy_timeout = 50')
+      assertDatabaseReady(disk)
       const diskSchemaVersion = readSchemaVersion(disk)
       const finalIdentity = dbFileIdentity() as DbFileIdentity
       return {

@@ -54,6 +54,20 @@ function createDatabase(dbPath: string, broken = false): void {
   db.close()
 }
 
+function removeAutoincrement(db: DatabaseSync, tableName: string): void {
+  const tableSql = (db.prepare(
+    "SELECT sql FROM sqlite_schema WHERE type='table' AND name=?",
+  ).get(tableName) as { sql: string }).sql
+  const indexSql = (db.prepare(
+    "SELECT sql FROM sqlite_schema WHERE type='index' AND tbl_name=? AND sql IS NOT NULL ORDER BY name",
+  ).all(tableName) as { sql: string }[]).map((row) => row.sql)
+  const brokenSql = tableSql.replace(/\bAUTOINCREMENT\b/gi, '')
+  assert.notEqual(brokenSql, tableSql, `前置：${tableName} 应包含 AUTOINCREMENT`)
+  db.exec(`DROP TABLE "${tableName}"`)
+  db.exec(brokenSql)
+  for (const sql of indexSql) db.exec(sql)
+}
+
 function spawnProbeServer(
   dbPath: string,
   options: {
@@ -61,6 +75,7 @@ function spawnProbeServer(
     workerEnabled?: boolean
     workerIntervalMs?: number
     mockCpaPath?: string
+    nodeOptions?: string
   } = {},
 ): Promise<{
   child: ChildProcessWithoutNullStreams
@@ -87,6 +102,7 @@ function spawnProbeServer(
       LINUXDO_CLIENT_ID: '',
       LINUXDO_CLIENT_SECRET: '',
       XJM_PROBE_ROOT: root,
+      NODE_OPTIONS: [process.env.NODE_OPTIONS, options.nodeOptions].filter(Boolean).join(' ') || undefined,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   })
@@ -144,6 +160,92 @@ function spawnProbeServer(
     throw error
   })
 }
+
+test('real HTTP readiness is side-effect free for an already-migrated empty business database', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xjm-probe-ready-read-only-'))
+  const dbPath = path.join(dir, 'app.db')
+  createDatabase(dbPath)
+  let server: Awaited<ReturnType<typeof spawnProbeServer>> | undefined
+  const readBusinessState = () => {
+    const db = new DatabaseSync(dbPath, { readOnly: true })
+    try {
+      return {
+        pointRules: db.prepare('SELECT provider, plan, points, enabled, label FROM point_rules ORDER BY id').all(),
+        redeemItems: db.prepare('SELECT name, description, cost, kind, enabled, sort FROM redeem_items ORDER BY id').all(),
+      }
+    } finally {
+      db.close()
+    }
+  }
+  try {
+    server = await spawnProbeServer(dbPath, { workerEnabled: false })
+    const before = readBusinessState()
+    assert.deepEqual(before, { pointRules: [], redeemItems: [] })
+
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const response = await fetch(`${server.baseUrl}/api/ready`)
+      assert.equal(response.status, 200)
+      assert.deepEqual(await response.json(), { ok: true })
+    }
+
+    assert.deepEqual(readBusinessState(), before, '重复 ready 不得播种或改写业务默认数据')
+  } finally {
+    await server?.stop()
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('real HTTP first readiness rejects a same-version non-canonical replacement before final resident gate', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xjm-probe-ready-toctou-'))
+  const dbPath = path.join(dir, 'app.db')
+  const replacementPath = path.join(dir, 'replacement.db')
+  const triggerPath = path.join(dir, 'replacement-triggered')
+  const preloadPath = path.join(dir, 'swap-after-open.cjs')
+  createDatabase(dbPath)
+  createDatabase(replacementPath)
+  const replacement = new DatabaseSync(replacementPath)
+  try {
+    removeAutoincrement(replacement, 'redeem_items')
+  } finally {
+    replacement.close()
+  }
+  fs.writeFileSync(preloadPath, `
+const fs = require('node:fs')
+const path = require('node:path')
+const originalStatSync = fs.statSync.bind(fs)
+const dbPath = ${JSON.stringify(dbPath)}
+const replacementPath = ${JSON.stringify(replacementPath)}
+const triggerPath = ${JSON.stringify(triggerPath)}
+let swapped = false
+fs.statSync = function patchedStatSync(target, ...args) {
+  if (!swapped && path.resolve(String(target)) === dbPath) {
+    swapped = true
+    fs.renameSync(replacementPath, dbPath)
+    fs.writeFileSync(triggerPath, 'swapped')
+  }
+  return originalStatSync(target, ...args)
+}
+`)
+
+  let server: Awaited<ReturnType<typeof spawnProbeServer>> | undefined
+  try {
+    server = await spawnProbeServer(dbPath, {
+      workerEnabled: false,
+      nodeOptions: `--require=${preloadPath}`,
+    })
+    const response = await fetch(`${server.baseUrl}/api/ready`)
+    assert.ok(fs.existsSync(triggerPath), '测试必须命中 resident 文件身份核验后的替换窗口')
+    assert.equal(response.status, 503)
+    assert.deepEqual(await response.json(), {
+      ok: false,
+      code: 'DATABASE_NOT_READY',
+      summary: '数据库尚未就绪',
+    })
+  } finally {
+    await server?.stop()
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
 
 async function wait(ms: number): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, ms))

@@ -17,14 +17,16 @@ export async function assertReadinessDatabase(): Promise<void> {
 
   const db = new DatabaseSync(DB_PATH)
   try {
-    const probe = IN_MEMORY ? undefined : () => new DatabaseSync(DB_PATH)
-    assertDatabaseReady(db, probe)
+    // Canonical validation and the bounded rollback write probe must target this same opened
+    // database, not two pathname resolutions that an atomic replacement can split.
+    assertDatabaseReady(db)
   } finally {
     db.close()
   }
 
   // P6-R2 resident/disk gate: the application connection must still be alive and bound to the
-  // same dev/inode, while a fresh disk connection sees the current schema. checkReady catches
+  // same dev/inode, while a fresh final connection revalidates canonical schema and write access.
+  // checkReady catches
   // initialization failures and remains retryable because lib/db opens its singleton lazily.
   const { checkReady } = await import('./ready')
   if (!(await checkReady())) throw new Error('resident database is not ready')

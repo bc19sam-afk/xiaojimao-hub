@@ -1497,6 +1497,167 @@ test('real /api/ready fails closed for a broken schema and recovers without prob
   ).all())).toEqual([])
 })
 
+test('admin DELETE routes reject invalid or missing IDs without changing rows or audit history', async ({ page }) => {
+  await openAdmin(page)
+  const invalidIds = ['-1', '0', '1.5', 'NaN', 'not-a-number', '1e3', String(Number.MAX_SAFE_INTEGER + 1)]
+  const missingId = String(Number.MAX_SAFE_INTEGER)
+  const routes = [
+    {
+      endpoint: 'point-rules',
+      table: 'point_rules',
+      auditAction: 'point_rule.delete',
+      invalid: { ok: false, code: 'POINT_RULE_INVALID_ID', error: '发分规则 ID 无效' },
+      missing: { ok: false, code: 'POINT_RULE_NOT_FOUND', error: '发分规则不存在或已被删除' },
+    },
+    {
+      endpoint: 'usage-rates',
+      table: 'usage_rates',
+      auditAction: 'usage_rate.delete',
+      invalid: { ok: false, code: 'USAGE_RATE_INVALID_ID', error: '折算规则 ID 无效' },
+      missing: { ok: false, code: 'USAGE_RATE_NOT_FOUND', error: '折算规则不存在或已被删除' },
+    },
+    {
+      endpoint: 'redeem-items',
+      table: 'redeem_items',
+      auditAction: 'redeem_item.delete',
+      invalid: { ok: false, code: 'REDEEM_ITEM_INVALID_ID', error: '商品 ID 无效' },
+      missing: { ok: false, code: 'REDEEM_ITEM_NOT_FOUND', error: '兑换项不存在或已被删除' },
+    },
+  ] as const
+
+  for (const route of routes) {
+    const before = withE2eDb((db) => ({
+      rows: (db.prepare(`SELECT COUNT(*) AS n FROM ${route.table}`).get() as { n: number }).n,
+      audits: (db.prepare('SELECT COUNT(*) AS n FROM audit_log WHERE action=?').get(route.auditAction) as { n: number }).n,
+    }))
+
+    for (const id of invalidIds) {
+      const response = await page.request.delete(`/api/admin/${route.endpoint}?id=${encodeURIComponent(id)}`)
+      expect(response.status(), `${route.endpoint} id=${id}`).toBe(400)
+      expect(await response.json()).toEqual(route.invalid)
+    }
+
+    const missing = await page.request.delete(`/api/admin/${route.endpoint}?id=${missingId}`)
+    expect(missing.status()).toBe(404)
+    expect(await missing.json()).toEqual(route.missing)
+
+    expect(withE2eDb((db) => ({
+      rows: (db.prepare(`SELECT COUNT(*) AS n FROM ${route.table}`).get() as { n: number }).n,
+      audits: (db.prepare('SELECT COUNT(*) AS n FROM audit_log WHERE action=?').get(route.auditAction) as { n: number }).n,
+    }))).toEqual(before)
+  }
+})
+
+test('admin keeps page width bounded and primary controls visible at mobile and desktop widths', async ({ page }) => {
+  const suffix = Date.now()
+  const contributionId = `admin-layout-${suffix}`
+  const longAccount = `admin-${'long-account-segment-'.repeat(18)}tail`
+  seedContribution({
+    id: contributionId,
+    accountId: longAccount,
+    username: `admin_${'long_user_'.repeat(8)}`,
+    verifyStatus: 'pooled',
+    pooledAt: Date.now() - 86_400_000,
+  })
+  withE2eDb((db) => {
+    db.prepare(
+      `INSERT INTO daily_settlements
+       (contribution_id, date, provider, account_id, call_count, points, settled_at)
+       VALUES (?,?,?,?,?,?,?)`,
+    ).run(contributionId, '2026-07-31', 'grok', longAccount, 987_654_321, 123_456_789, Date.now())
+    db.prepare(
+      `INSERT INTO audit_log
+       (actor_type, actor_id, actor_label, action, target, old_value, new_value, created_at)
+       VALUES (?,?,?,?,?,?,?,?)`,
+    ).run('password', null, '管理员', 'layout.probe', longAccount, JSON.stringify({ value: longAccount }), null, Date.now())
+  })
+
+  try {
+    await page.setViewportSize({ width: 390, height: 900 })
+    await openAdmin(page)
+    await expect(page.getByTestId('contributions-table-scroll').getByText(longAccount, { exact: true })).toHaveCount(1)
+    await expect(page.getByTestId('settlements-table-scroll').getByText(longAccount, { exact: true })).toHaveCount(1)
+    await expect(page.getByTestId('audit-table-scroll').getByText(longAccount, { exact: true })).toHaveCount(1)
+    const longCdk = `CDK-${'X'.repeat(500)}`
+    await page.getByPlaceholder('一行一码，或用逗号 / 空格分隔').fill(longCdk)
+
+    for (const width of [320, 375, 390, 430, 1440]) {
+      await page.setViewportSize({ width, height: 900 })
+      const layout = await page.evaluate(async (expectedLongAccount) => {
+        await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())))
+        const root = document.documentElement
+        const buttons = Array.from(document.querySelectorAll<HTMLButtonElement>('button'))
+        const textarea = document.querySelector<HTMLTextAreaElement>('textarea[placeholder="一行一码，或用逗号 / 空格分隔"]')
+        const keyElements = [
+          document.querySelector<HTMLElement>('[data-testid="refresh-system-status"]'),
+          document.querySelector<HTMLElement>('[data-testid="refresh-audit"]'),
+          document.querySelector<HTMLElement>('[data-testid="redeem-item-save"]'),
+          textarea,
+          buttons.find((button) => button.textContent?.trim() === '导入') ?? null,
+        ]
+        const scrollAreas = [
+          'audit-table-scroll',
+          'review-table-scroll',
+          'contributions-table-scroll',
+          'settlements-table-scroll',
+          'redemptions-table-scroll',
+        ].map((testId) => {
+          const element = document.querySelector<HTMLElement>(`[data-testid="${testId}"]`)
+          if (!element) return null
+          const rect = element.getBoundingClientRect()
+          return {
+            testId,
+            left: rect.left,
+            right: rect.right,
+            width: rect.width,
+            clientWidth: element.clientWidth,
+            scrollWidth: element.scrollWidth,
+            overflowX: getComputedStyle(element).overflowX,
+            containsLongAccount: element.textContent?.includes(expectedLongAccount) ?? false,
+          }
+        })
+        return {
+          clientWidth: root.clientWidth,
+          scrollWidth: root.scrollWidth,
+          textareaLength: textarea?.value.length ?? -1,
+          controls: keyElements.map((element) => {
+            if (!element) return null
+            const rect = element.getBoundingClientRect()
+            return { left: rect.left, right: rect.right, width: rect.width }
+          }),
+          scrollAreas,
+        }
+      }, longAccount)
+
+      expect(layout.scrollWidth, `${width}px Admin 页面不应出现页面级横向滚动`).toBeLessThanOrEqual(layout.clientWidth + 1)
+      expect(layout.textareaLength, `${width}px 长 CDK 文本应完整保留`).toBe(longCdk.length)
+      for (const control of layout.controls) {
+        expect(control, `${width}px 关键控件应存在`).not.toBeNull()
+        expect(control!.width).toBeGreaterThan(0)
+        expect(control!.left).toBeGreaterThanOrEqual(-1)
+        expect(control!.right).toBeLessThanOrEqual(layout.clientWidth + 1)
+      }
+      for (const area of layout.scrollAreas) {
+        expect(area, `${width}px 宽表容器应存在`).not.toBeNull()
+        expect(area!.width).toBeGreaterThan(0)
+        expect(area!.left).toBeGreaterThanOrEqual(-1)
+        expect(area!.right).toBeLessThanOrEqual(layout.clientWidth + 1)
+        expect(area!.overflowX).toBe('auto')
+        expect(area!.scrollWidth).toBeGreaterThanOrEqual(area!.clientWidth)
+        if (width < 640 && area!.containsLongAccount) {
+          expect(area!.scrollWidth, `${width}px 长内容应由表格自身横向滚动承载`).toBeGreaterThan(area!.clientWidth)
+        }
+      }
+    }
+  } finally {
+    withE2eDb((db) => {
+      db.prepare('DELETE FROM daily_settlements WHERE contribution_id=?').run(contributionId)
+      db.prepare('DELETE FROM contributions WHERE id=?').run(contributionId)
+      db.prepare("DELETE FROM audit_log WHERE action='layout.probe' AND target=?").run(longAccount)
+    })
+  }
+})
+
 test('favicon endpoint returns a non-empty image response', async ({ request }) => {
   const response = await request.get('/favicon.ico')
   expect(response.status()).toBe(200)

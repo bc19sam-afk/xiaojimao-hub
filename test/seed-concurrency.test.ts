@@ -10,15 +10,15 @@ import { migrate } from '../lib/migrate.ts'
 
 // ============================================================================
 // seedDefaults 并发播种竞态（TOCTOU）回归。next build 并行拉起多个 worker 进程，各自
-// openDb→seedDefaults 打同一 data/app.db；每块「SELECT COUNT==0 then INSERT」非原子，
+// 显式 bootstrap 进程并发调用 seedDefaults 打同一 data/app.db；每块「SELECT COUNT==0 then INSERT」非原子，
 // 两进程同读 count=0 再各插 → point_rules/usage_rates(UNIQUE) 撞唯一键崩溃、build 挂；
 // redeem_items(无唯一键) 静默翻倍(4→8)；app_config(key PRIMARY KEY) 同样会撞。
 // 修复＝整个 seedDefaults 包 BEGIN IMMEDIATE 单事务：先到者持写锁播完提交，后到者阻塞至提交后
 // 读到 count>0 全部跳过。
 //
 // 复现的难点：种子临界区仅微秒级，进程到达抖动（毫秒级）远大于它 → 单纯并发起进程极难撞上。
-// 故本测「紧对齐」：每个子进程先 import db.ts（其单例 openDb 走 DB_PATH=:memory:，只在内存播种、
-// 绝不碰 target）拿到导出的 seedDefaults，再开 target 连接、写 ready 文件、自旋等 GO；父进程见 N 个
+// 故本测「紧对齐」：每个子进程先 import db.ts（其单例连接保持惰性，不碰 target）拿到导出的
+// seedDefaults，再开 target 连接、写 ready 文件、自旋等 GO；父进程见 N 个
 // ready 齐了才落 GO，把所有子进程同刻放行去调真实 seedDefaults(target)——临界区对齐，破损版必撞。
 // 断言：① 无子进程崩溃（全 exit 0）；② 种子表行数精确——redeem_items 恒 4（竞态曾 4→8）、
 // point_rules=7、usage_rates=5、app_config observe_window_ms 恰 1 行。跑多轮加固。
@@ -55,7 +55,7 @@ function sleep(ms: number): Promise<void> {
   return new Promise((res) => setTimeout(res, ms))
 }
 
-// 子进程脚本：import db.ts（单例 openDb→:memory:，不碰 target）取 seedDefaults → 开 target 连接 →
+// 子进程脚本：import db.ts（单例连接保持惰性，不碰 target）取 seedDefaults → 开 target 连接 →
 // 写 ready → 自旋等 GO → 调真实 seedDefaults(target)。撞唯一键则抛 → 进程非零退出；redeem 翻倍不抛。
 const CHILD_SRC = [
   "import fs from 'node:fs'",

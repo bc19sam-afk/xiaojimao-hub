@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { createHash } from 'node:crypto'
 import { getAdminActor } from '@/lib/admin'
+import { parsePositiveSafeInteger } from '@/lib/admin-input'
 import { db } from '@/lib/db'
 import { auditRedeemItemUpsert, auditRedeemItemDelete } from '@/lib/audit'
 
@@ -231,12 +232,12 @@ export async function PUT(req: NextRequest) {
 export async function DELETE(req: NextRequest) {
   const actor = await getAdminActor()
   if (!actor) return NextResponse.json({ error: '无权限' }, { status: 403 })
-  const id = Number(new URL(req.url).searchParams.get('id'))
-  if (!id) return NextResponse.json({ error: '缺 id' }, { status: 400 })
+  const id = parsePositiveSafeInteger(new URL(req.url).searchParams.get('id'))
+  if (id === null) return NextResponse.json(REDEEM_ITEM_INVALID_ID, { status: 400 })
   try {
     const result = db.withTransaction(() => {
       const old = db.getRedeemItem(id)
-      db.deleteRedeemItem(id)
+      if (!old || !db.deleteRedeemItem(id)) throw new RedeemItemNotFoundError()
       db.recordAudit(actor, auditRedeemItemDelete(old, id))
       return {
         redeemItems: db.listRedeemItems(false),
@@ -245,6 +246,9 @@ export async function DELETE(req: NextRequest) {
     })
     return NextResponse.json({ ok: true, ...result })
   } catch (error) {
+    if (error instanceof RedeemItemNotFoundError) {
+      return NextResponse.json(REDEEM_ITEM_NOT_FOUND, { status: 404 })
+    }
     console.error('[admin] redeem item delete failed', error instanceof Error ? error.name : 'unknown')
     return NextResponse.json(REDEEM_ITEM_DELETE_FAILURE, { status: 500 })
   }

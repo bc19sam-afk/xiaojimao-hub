@@ -1,13 +1,28 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getAdminActor } from '@/lib/admin'
+import { parsePositiveSafeInteger } from '@/lib/admin-input'
 import { db } from '@/lib/db'
 import { auditUsageRateUpsert, auditUsageRateDelete } from '@/lib/audit'
+
+const USAGE_RATE_INVALID_ID = {
+  ok: false,
+  code: 'USAGE_RATE_INVALID_ID',
+  error: '折算规则 ID 无效',
+} as const
+
+const USAGE_RATE_NOT_FOUND = {
+  ok: false,
+  code: 'USAGE_RATE_NOT_FOUND',
+  error: '折算规则不存在或已被删除',
+} as const
 
 const USAGE_RATE_DELETE_FAILURE = {
   ok: false,
   code: 'USAGE_RATE_DELETE_FAILED',
   error: '删除折算规则失败，请重试',
 } as const
+
+class UsageRateNotFoundError extends Error {}
 
 // 折算规则（按次单价）读/改/删（P4-R2 §3.4）：仿 point-rules，唯一差异＝单价可小数（points_per_call REAL）。
 // GET 供 AdminPanel 初始加载（point-rules 走 /api/admin/config；usage-rates 自包含）。
@@ -45,17 +60,20 @@ export async function PUT(req: NextRequest) {
 export async function DELETE(req: NextRequest) {
   const actor = await getAdminActor()
   if (!actor) return NextResponse.json({ error: '无权限' }, { status: 403 })
-  const id = Number(new URL(req.url).searchParams.get('id'))
-  if (!id) return NextResponse.json({ error: '缺 id' }, { status: 400 })
+  const id = parsePositiveSafeInteger(new URL(req.url).searchParams.get('id'))
+  if (id === null) return NextResponse.json(USAGE_RATE_INVALID_ID, { status: 400 })
   try {
     const usageRates = db.withTransaction(() => {
       const old = db.listUsageRates().find((r) => r.id === id)
-      db.deleteUsageRate(id)
+      if (!old || !db.deleteUsageRate(id)) throw new UsageRateNotFoundError()
       db.recordAudit(actor, auditUsageRateDelete(old, id))
       return db.listUsageRates()
     })
     return NextResponse.json({ ok: true, usageRates })
   } catch (error) {
+    if (error instanceof UsageRateNotFoundError) {
+      return NextResponse.json(USAGE_RATE_NOT_FOUND, { status: 404 })
+    }
     console.error('[admin] usage rate delete failed', error instanceof Error ? error.name : 'unknown')
     return NextResponse.json(USAGE_RATE_DELETE_FAILURE, { status: 500 })
   }

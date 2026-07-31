@@ -1,6 +1,7 @@
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
 import { DatabaseSync } from 'node:sqlite'
+import { spawnSync } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -98,19 +99,21 @@ test('半建库跑 migrate()：补全缺表、原数据不丢、版本=LATEST', 
   db.close()
 })
 
-// ② 集成：半建库经 lib/db.ts 的 openDb（mock 默认自动迁移）自愈 → 数据不丢且 seedDefaults 正常播种
-// 复现真实故障路径「openDb → seedDefaults 查缺表抛错、库起不来」，证明其已修复。
+// ② 集成：半建库经 lib/db.ts 的 openDb（mock 默认自动迁移）自愈 → 数据不丢，且连接本身不播种业务默认值。
+// 默认值仅由显式 scripts/migrate.ts bootstrap 写入，避免 readiness/首次连接产生管理员可见副作用。
 let liveDb: typeof import('../lib/db.ts').db
 let tmpDir: string
+let bootstrapDbPath: string
 
 before(async () => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'xjm-hb-'))
   const dbPath = path.join(tmpDir, 'app.db')
+  bootstrapDbPath = path.join(tmpDir, 'bootstrap.db')
   // 先把半建库落到磁盘（独立连接，建完即关）
   const seed = new DatabaseSync(dbPath)
   makeHalfBuilt(seed)
   seed.close()
-  // 再让 lib/db.ts 打开它：MOCK 默认开 → openDb 自动 migrate()+seedDefaults()
+  // 再让 lib/db.ts 打开它：MOCK 默认开 → openDb 只自动 migrate()，不播种业务默认值。
   process.env.MOCK = 'true'
   process.env.DB_PATH = dbPath
   ;({ db: liveDb } = await import('../lib/db.ts'))
@@ -120,11 +123,49 @@ after(() => {
   fs.rmSync(tmpDir, { recursive: true, force: true })
 })
 
-test('半建库经 openDb 自愈：原数据不丢且 seedDefaults 正常播种', () => {
+test('半建库经 openDb 自愈：原数据不丢且不隐式播种业务默认值', () => {
   // 原有行仍在（自动 001 补表 + 002 重建后不丢）
   const mine = liveDb.all().find((c) => c.id === 'hb1')
   assert.ok(mine, '半建库原有行应在自愈后保留')
   assert.equal(mine.accountId, 'hb-acc-1')
-  // seedDefaults 正常跑：point_rules 有种子行（修复前此处 openDb 直接抛、库起不来）
-  assert.ok(liveDb.listPointRules().length > 0, 'seedDefaults 应已播种 point_rules 种子行')
+  assert.equal(liveDb.listPointRules().length, 0, 'openDb 不得隐式播种 point_rules')
+  assert.equal(liveDb.listRedeemItems().length, 0, 'openDb 不得隐式播种 redeem_items')
+})
+
+test('显式 migrate 脚本修复半建库、保留原数据并播种默认业务配置', () => {
+  const seed = new DatabaseSync(bootstrapDbPath)
+  makeHalfBuilt(seed)
+  seed.close()
+
+  const root = process.cwd()
+  const result = spawnSync(
+    process.execPath,
+    ['--import', path.join(root, 'test/setup.mjs'), path.join(root, 'scripts/migrate.ts')],
+    {
+      cwd: root,
+      env: {
+        ...process.env,
+        DB_PATH: bootstrapDbPath,
+        MOCK: 'true',
+        SESSION_SECRET: 'x'.repeat(64),
+      },
+      encoding: 'utf8',
+    },
+  )
+  assert.equal(result.status, 0, result.stderr)
+
+  const db = new DatabaseSync(bootstrapDbPath, { readOnly: true })
+  try {
+    const original = db.prepare('SELECT account_id, points FROM contributions WHERE id=?').get('hb1') as {
+      account_id: string
+      points: number
+    }
+    assert.equal(original.account_id, 'hb-acc-1')
+    assert.equal(original.points, 30)
+    assert.equal((db.prepare('SELECT COUNT(*) AS n FROM point_rules').get() as { n: number }).n, 7)
+    assert.equal((db.prepare('SELECT COUNT(*) AS n FROM usage_rates').get() as { n: number }).n, 5)
+    assert.equal((db.prepare('SELECT COUNT(*) AS n FROM redeem_items').get() as { n: number }).n, 4)
+  } finally {
+    db.close()
+  }
 })
