@@ -31,6 +31,7 @@ function seedContribution(args: {
   id: string
   accountId: string
   username: string
+  linuxdoId?: number
   verifyStatus?: string
   pooledAt?: number | null
 }) {
@@ -44,7 +45,7 @@ function seedContribution(args: {
        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     ).run(
       args.id,
-      1,
+      args.linuxdoId ?? 1,
       args.username,
       args.accountId,
       '',
@@ -1551,13 +1552,16 @@ test('admin DELETE routes reject invalid or missing IDs without changing rows or
 test('admin keeps page width bounded and primary controls visible at mobile and desktop widths', async ({ page }) => {
   const suffix = Date.now()
   const contributionId = `admin-layout-${suffix}`
+  const redemptionId = `admin-layout-redemption-${suffix}`
+  const layoutLinuxdoId = 8_000_000 + (suffix % 1_000_000)
   const longAccount = `admin-${'long-account-segment-'.repeat(18)}tail`
+  const longUsername = `admin_${'long_username_'.repeat(36)}tail`
   seedContribution({
     id: contributionId,
     accountId: longAccount,
-    username: `admin_${'long_user_'.repeat(8)}`,
-    verifyStatus: 'pooled',
-    pooledAt: Date.now() - 86_400_000,
+    username: longUsername,
+    linuxdoId: layoutLinuxdoId,
+    verifyStatus: 'needs_review',
   })
   withE2eDb((db) => {
     db.prepare(
@@ -1570,20 +1574,36 @@ test('admin keeps page width bounded and primary controls visible at mobile and 
        (actor_type, actor_id, actor_label, action, target, old_value, new_value, created_at)
        VALUES (?,?,?,?,?,?,?,?)`,
     ).run('password', null, '管理员', 'layout.probe', longAccount, JSON.stringify({ value: longAccount }), null, Date.now())
+    db.prepare('DELETE FROM redemptions WHERE id=?').run(redemptionId)
+    db.prepare(
+      `INSERT INTO redemptions
+       (id, linuxdo_id, item_id, item_name, cost, status, result, created_at)
+       VALUES (?,?,?,?,?,?,?,?)`,
+    ).run(redemptionId, layoutLinuxdoId, 1, '移动端长用户名布局验证', 987_654_321, 'fulfilled', '', Date.now())
   })
 
   try {
     await page.setViewportSize({ width: 390, height: 900 })
     await openAdmin(page)
+    await expect(page.getByTestId('review-table-scroll').getByText(longUsername, { exact: true })).toHaveCount(1)
     await expect(page.getByTestId('contributions-table-scroll').getByText(longAccount, { exact: true })).toHaveCount(1)
     await expect(page.getByTestId('settlements-table-scroll').getByText(longAccount, { exact: true })).toHaveCount(1)
     await expect(page.getByTestId('audit-table-scroll').getByText(longAccount, { exact: true })).toHaveCount(1)
+    await expect(page.getByTestId('contributions-table-scroll').getByText(longUsername, { exact: true })).toHaveCount(1)
+    await expect(page.getByTestId('settlements-table-scroll').getByText(longUsername, { exact: true })).toHaveCount(1)
+    await expect(page.getByTestId('redemptions-table-scroll').getByText(longUsername, { exact: true })).toHaveCount(1)
     const longCdk = `CDK-${'X'.repeat(500)}`
     await page.getByPlaceholder('一行一码，或用逗号 / 空格分隔').fill(longCdk)
 
+    const retryButton = page.getByRole('button', { name: `重试人工复核 grok ${longAccount}` })
+    const terminateButton = page.getByRole('button', { name: `终止人工复核 grok ${longAccount}` })
+
     for (const width of [320, 375, 390, 430, 1440]) {
       await page.setViewportSize({ width, height: 900 })
-      const layout = await page.evaluate(async (expectedLongAccount) => {
+      await retryButton.scrollIntoViewIfNeeded()
+      const layout = await page.evaluate(async ({ expectedLongAccount, expectedLongUsername }) => {
+        const reviewScroll = document.querySelector<HTMLElement>('[data-testid="review-table-scroll"]')
+        if (reviewScroll) reviewScroll.scrollLeft = reviewScroll.scrollWidth
         await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())))
         const root = document.documentElement
         const buttons = Array.from(document.querySelectorAll<HTMLButtonElement>('button'))
@@ -1616,6 +1636,72 @@ test('admin keeps page width bounded and primary controls visible at mobile and 
             containsLongAccount: element.textContent?.includes(expectedLongAccount) ?? false,
           }
         })
+        const userCells = [
+          'review-table-scroll',
+          'contributions-table-scroll',
+          'settlements-table-scroll',
+          'redemptions-table-scroll',
+        ].map((testId) => {
+          const table = document.querySelector<HTMLElement>(`[data-testid="${testId}"]`)
+          const cell = table
+            ? Array.from(table.querySelectorAll<HTMLElement>('span')).find(
+                (candidate) => candidate.childElementCount === 0 && candidate.textContent === expectedLongUsername,
+              )
+            : undefined
+          if (!cell) return null
+          const cellRect = cell.getBoundingClientRect()
+          const range = document.createRange()
+          range.selectNodeContents(cell)
+          const fragments = Array.from(range.getClientRects()).map((rect) => ({
+            left: rect.left,
+            right: rect.right,
+            width: rect.width,
+            height: rect.height,
+          }))
+          const style = getComputedStyle(cell)
+          return {
+            testId,
+            left: cellRect.left,
+            right: cellRect.right,
+            width: cellRect.width,
+            height: cellRect.height,
+            clientWidth: cell.clientWidth,
+            scrollWidth: cell.scrollWidth,
+            overflowX: style.overflowX,
+            wordBreak: style.wordBreak,
+            overflowWrap: style.overflowWrap,
+            fragments,
+          }
+        })
+        const actionButtons = [
+          `重试人工复核 grok ${expectedLongAccount}`,
+          `终止人工复核 grok ${expectedLongAccount}`,
+        ].map((label) => {
+          const button = buttons.find((candidate) => candidate.getAttribute('aria-label') === label)
+          if (!button || !reviewScroll) return null
+          const buttonRect = button.getBoundingClientRect()
+          const scrollRect = reviewScroll.getBoundingClientRect()
+          const hit = document.elementFromPoint(
+            buttonRect.left + buttonRect.width / 2,
+            buttonRect.top + buttonRect.height / 2,
+          )
+          const textRange = document.createRange()
+          textRange.selectNodeContents(button)
+          const textRect = textRange.getBoundingClientRect()
+          return {
+            label,
+            left: buttonRect.left,
+            right: buttonRect.right,
+            width: buttonRect.width,
+            height: buttonRect.height,
+            scrollLeft: scrollRect.left,
+            scrollRight: scrollRect.right,
+            textLeft: textRect.left,
+            textRight: textRect.right,
+            hit: hit === button || button.contains(hit),
+            visible: getComputedStyle(button).visibility === 'visible' && Number(getComputedStyle(button).opacity) > 0,
+          }
+        })
         return {
           clientWidth: root.clientWidth,
           scrollWidth: root.scrollWidth,
@@ -1626,8 +1712,10 @@ test('admin keeps page width bounded and primary controls visible at mobile and 
             return { left: rect.left, right: rect.right, width: rect.width }
           }),
           scrollAreas,
+          userCells,
+          actionButtons,
         }
-      }, longAccount)
+      }, { expectedLongAccount: longAccount, expectedLongUsername: longUsername })
 
       expect(layout.scrollWidth, `${width}px Admin 页面不应出现页面级横向滚动`).toBeLessThanOrEqual(layout.clientWidth + 1)
       expect(layout.textareaLength, `${width}px 长 CDK 文本应完整保留`).toBe(longCdk.length)
@@ -1648,9 +1736,43 @@ test('admin keeps page width bounded and primary controls visible at mobile and 
           expect(area!.scrollWidth, `${width}px 长内容应由表格自身横向滚动承载`).toBeGreaterThan(area!.clientWidth)
         }
       }
+      for (const cell of layout.userCells) {
+        expect(cell, `${width}px 四张管理表的用户名格应存在`).not.toBeNull()
+        expect(cell!.width).toBeGreaterThan(0)
+        expect(cell!.height).toBeGreaterThan(0)
+        expect(cell!.scrollWidth, `${width}px 超长用户名不得逸出固定列`).toBeLessThanOrEqual(cell!.clientWidth + 1)
+        expect(cell!.fragments.length).toBeGreaterThan(0)
+        for (const fragment of cell!.fragments) {
+          expect(fragment.width).toBeGreaterThan(0)
+          expect(fragment.height).toBeGreaterThan(0)
+          expect(fragment.left, `${width}px 用户名文本不得画到单元格左侧`).toBeGreaterThanOrEqual(cell!.left - 1)
+          expect(fragment.right, `${width}px 用户名文本不得画到相邻列`).toBeLessThanOrEqual(cell!.right + 1)
+        }
+      }
+      for (const button of layout.actionButtons) {
+        expect(button, `${width}px 待复核操作按钮应存在`).not.toBeNull()
+        expect(button!.visible).toBe(true)
+        expect(button!.width).toBeGreaterThan(0)
+        expect(button!.height).toBeGreaterThan(0)
+        expect(button!.left).toBeGreaterThanOrEqual(button!.scrollLeft - 1)
+        expect(button!.right).toBeLessThanOrEqual(button!.scrollRight + 1)
+        expect(button!.textLeft).toBeGreaterThanOrEqual(button!.left - 1)
+        expect(button!.textRight).toBeLessThanOrEqual(button!.right + 1)
+        expect(button!.hit, `${width}px 超长用户名不得覆盖操作按钮的命中区`).toBe(true)
+      }
+
+      await retryButton.click()
+      await expect(page.getByRole('dialog')).toBeVisible()
+      await page.keyboard.press('Escape')
+      await expect(page.getByRole('dialog')).toBeHidden()
+      await terminateButton.click()
+      await expect(page.getByRole('dialog')).toBeVisible()
+      await page.keyboard.press('Escape')
+      await expect(page.getByRole('dialog')).toBeHidden()
     }
   } finally {
     withE2eDb((db) => {
+      db.prepare('DELETE FROM redemptions WHERE id=?').run(redemptionId)
       db.prepare('DELETE FROM daily_settlements WHERE contribution_id=?').run(contributionId)
       db.prepare('DELETE FROM contributions WHERE id=?').run(contributionId)
       db.prepare("DELETE FROM audit_log WHERE action='layout.probe' AND target=?").run(longAccount)

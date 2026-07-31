@@ -1020,10 +1020,12 @@ export default function AdminPanel() {
                 className="grid grid-cols-[130px_110px_80px_1fr_auto] items-center gap-2 border-t border-white/5 py-1.5 text-[11px] text-neutral-300"
               >
                 <span className="text-neutral-500">{new Date(r.createdAt).toLocaleString('zh-CN')}</span>
-                <span>{r.username || <span className="text-neutral-500">#{r.linuxdoId}</span>}</span>
+                <span className="min-w-0 break-all [overflow-wrap:anywhere]">
+                  {r.username || <span className="text-neutral-500">#{r.linuxdoId}</span>}
+                </span>
                 <span className="text-neutral-400">{r.provider}</span>
                 <span className="break-all text-neutral-400">{r.accountId}</span>
-                <div className="flex gap-1">
+                <div className="flex min-w-max gap-1">
                   <button
                     type="button"
                     onClick={() => confirmReviewAction(r, 'retry')}
@@ -1071,7 +1073,9 @@ export default function AdminPanel() {
                 className="grid grid-cols-[120px_100px_70px_60px_80px_1fr_56px] items-center gap-2 border-t border-white/5 py-1.5 text-[11px] text-neutral-300"
               >
                 <span className="text-neutral-500">{new Date(c.createdAt).toLocaleString('zh-CN')}</span>
-                <span>{c.username || <span className="text-neutral-500">#{c.linuxdoId}</span>}</span>
+                <span className="min-w-0 break-all [overflow-wrap:anywhere]">
+                  {c.username || <span className="text-neutral-500">#{c.linuxdoId}</span>}
+                </span>
                 <span className="text-neutral-400">{c.provider}</span>
                 <span className="text-neutral-400">{c.plan}</span>
                 <span className="font-mono text-neutral-400">{c.verifyStatus}</span>
@@ -1107,7 +1111,9 @@ export default function AdminPanel() {
                 className="grid grid-cols-[100px_100px_70px_1fr_56px_56px_130px] items-center gap-2 border-t border-white/5 py-1.5 text-[11px] text-neutral-300"
               >
                 <span className="text-neutral-400">{s.date}</span>
-                <span>{s.username || <span className="text-neutral-500">#{s.linuxdoId ?? '—'}</span>}</span>
+                <span className="min-w-0 break-all [overflow-wrap:anywhere]">
+                  {s.username || <span className="text-neutral-500">#{s.linuxdoId ?? '—'}</span>}
+                </span>
                 <span className="text-neutral-400">{s.provider}</span>
                 <span className="break-all text-neutral-400">{s.accountId}</span>
                 <span className="text-neutral-400">{s.callCount}</span>
@@ -1145,7 +1151,9 @@ export default function AdminPanel() {
                 className="grid grid-cols-[130px_110px_1fr_64px_90px] items-center gap-2 border-t border-white/5 py-1.5 text-[11px] text-neutral-300"
               >
                 <span className="text-neutral-500">{new Date(r.createdAt).toLocaleString('zh-CN')}</span>
-                <span>{r.username || <span className="text-neutral-500">#{r.linuxdoId}</span>}</span>
+                <span className="min-w-0 break-all [overflow-wrap:anywhere]">
+                  {r.username || <span className="text-neutral-500">#{r.linuxdoId}</span>}
+                </span>
                 <span className="break-all text-neutral-400">{r.itemName}</span>
                 <span className="text-neutral-400">{r.cost}</span>
                 <span className="font-mono text-neutral-400">{r.status}</span>
