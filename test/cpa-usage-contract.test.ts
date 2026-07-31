@@ -97,11 +97,19 @@ test('usage rejects invalid required detail fields but preserves numeric timesta
   ])))[0]?.count, 1)
 })
 
-test('usage rejects an impossible ISO calendar date before returning any valid rows', async () => {
-  await expectUnavailable(payload([
-    detail(),
-    detail({ timestamp: '2026-02-30T00:00:00.000Z' }),
-  ]))
+test('usage rejects impossible or non-ISO timestamp strings before returning any valid rows', async () => {
+  for (const timestamp of [
+    '2026-02-30T00:00:00.000Z',
+    '2026-02-30Z',
+    '2026/02/30',
+    '02/30/2026',
+    'Feb 30 2026',
+  ]) {
+    await expectUnavailable(payload([
+      detail(),
+      detail({ timestamp }),
+    ]))
+  }
 })
 
 test('usage allows 49,999 rows and fails the whole payload closed at 50,000 rows', async () => {

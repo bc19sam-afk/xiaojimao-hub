@@ -629,9 +629,9 @@ function isHubContribution(_label: string | undefined): boolean {
 // R1 已核对（§二④）：真实 timestamp = UTC ISO-8601 字符串（如 2026-07-16T13:53:50.795Z），走 Date.parse
 // 分支解析成功；数字秒/毫秒分支对 claude 不触发，防御性保留。⚠️ 运维：源时间是 UTC，tsToMs→dayStr 落
 // 服务器本地时区日，故生产机时区必须对齐目标结算时区（与已知 CI-UTC-grace-window flaky 同源）。
-function hasValidIsoCalendarDate(value: string): boolean {
-  const match = /^(\d{4})-(\d{2})-(\d{2})(?=$|[Tt\s])/.exec(value)
-  if (!match) return true
+function hasValidIsoTimestamp(value: string): boolean {
+  const match = /^(\d{4})-(\d{2})-(\d{2})[Tt]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[Zz]|[+-]\d{2}:\d{2})$/.exec(value)
+  if (!match) return false
 
   const year = Number(match[1])
   const month = Number(match[2])
@@ -651,7 +651,7 @@ function tsToMs(ts: unknown): number {
     value = ts < 1e12 ? ts * 1000 : ts
   } else if (typeof ts === 'string' && ts.trim() !== '') {
     const timestamp = ts.trim()
-    if (!hasValidIsoCalendarDate(timestamp)) usageFail('invalid_detail_timestamp')
+    if (!hasValidIsoTimestamp(timestamp)) usageFail('invalid_detail_timestamp')
     value = Date.parse(timestamp)
   } else {
     usageFail('invalid_detail_timestamp')
