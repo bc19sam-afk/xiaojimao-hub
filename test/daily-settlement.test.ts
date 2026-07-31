@@ -5,6 +5,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { migrate, migrations, LATEST_VERSION } from '../lib/migrate.ts'
+import { seedDefaults } from '../lib/seed-defaults.ts'
 import type { Contribution } from '../lib/db.ts'
 import type { DailyUsage } from '../lib/cpa.ts'
 import type { SessionUser } from '../lib/session.ts'
@@ -140,6 +141,10 @@ before(async () => {
   process.env.MOCK = 'true'
   process.env.DB_PATH = path.join(tmpDir, 'app.db')
   process.env.MOCK_CPA_PATH = path.join(tmpDir, 'mock-cpa.json')
+  const bootstrap = new DatabaseSync(process.env.DB_PATH)
+  migrate(bootstrap)
+  seedDefaults(bootstrap, true)
+  bootstrap.close()
   ;({ db } = await import('../lib/db.ts'))
   settle = await import('../lib/settle.ts')
   ;({ cpa } = await import('../lib/cpa.ts'))

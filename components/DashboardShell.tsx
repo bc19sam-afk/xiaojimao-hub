@@ -96,12 +96,12 @@ export default function DashboardShell({
   }, [load])
 
   return (
-    <main className="bg-ink relative min-h-screen overflow-hidden">
+    <main className="bg-ink relative min-h-screen">
       <NebulaBackground />
       <StarField />
       <div className="bg-grid absolute inset-0" />
 
-      <div className="relative mx-auto max-w-6xl px-4 py-8">
+      <div className="relative mx-auto min-w-0 max-w-6xl px-4 py-8">
         <header className="mb-8 flex items-center justify-between">
           <div className="flex items-center gap-3">
             <div className="flex h-9 w-9 items-center justify-center rounded-lg border border-white/10 bg-[var(--ink-soft)]">
@@ -133,8 +133,8 @@ export default function DashboardShell({
         </div>
 
         {/* 左右栏 */}
-        <div className="grid gap-6 lg:grid-cols-3">
-          <div className="space-y-6 lg:col-span-2">
+        <div className="grid min-w-0 gap-6 lg:grid-cols-3">
+          <div className="min-w-0 space-y-6 lg:col-span-2">
             <CollectPanel onDone={afterChange} />
             <Contributions
               list={list}
@@ -144,7 +144,7 @@ export default function DashboardShell({
               onVerified={afterChange}
             />
           </div>
-          <div className="space-y-6">
+          <div className="min-w-0 space-y-6">
             <RedeemStore refreshKey={storeKey} onRedeemed={afterChange} />
             <PointsLedger ledger={ledger} />
             <Leaderboard refreshKey={lbKey} meId={user.id} />

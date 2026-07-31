@@ -488,6 +488,24 @@ export const migrations: Migration[] = [
       `)
     },
   },
+  {
+    version: 13,
+    // migration 013（UI-R1）：管理端新增兑换商品的持久化幂等键。浏览器可能在服务端已经提交后
+    // 丢失响应；重试必须按同一 request_key 找回原 item_id，而不是再插一件商品/再写一条审计。
+    // 不使用 name 充当天然键（业务未声明唯一）；request_key PRIMARY KEY 才是跨进程/并发硬约束。
+    // 故意不用 IF NOT EXISTS：若 v12 库里已有同名残表但形状不兼容，迁移必须在外层事务内失败并
+    // 保持 schema_version=12，不能把残表静默当成已完成迁移。
+    up(db) {
+      db.exec(`
+        CREATE TABLE redeem_item_create_requests (
+          request_key TEXT PRIMARY KEY,
+          payload_hash TEXT NOT NULL,
+          item_id      INTEGER NOT NULL,
+          created_at   INTEGER NOT NULL
+        )
+      `)
+    },
+  },
 ]
 
 // 代码所知的最新 schema 版本（从 migrations 数组派生，勿手写）
@@ -605,4 +623,154 @@ export function migrate(db: DatabaseSync): number {
     version = m.version
   }
   return version
+}
+
+interface SchemaColumnSignature {
+  name: string
+  type: string
+  notnull: number
+  defaultValue: string | null
+  pk: number
+}
+
+interface TableSchemaSignature {
+  columns: Map<string, SchemaColumnSignature>
+  indexes: string[]
+  autoIncrement: boolean
+}
+
+type CanonicalSchemaManifest = Map<string, TableSchemaSignature>
+
+let canonicalSchemaManifest: CanonicalSchemaManifest | undefined
+
+function quotedIdentifier(value: string): string {
+  return `"${value.replaceAll('"', '""')}"`
+}
+
+function normalizedColumn(row: {
+  name: string
+  type: string
+  notnull: number
+  dflt_value: string | null
+  pk: number
+}): SchemaColumnSignature {
+  return {
+    name: row.name,
+    type: row.type.trim().replace(/\s+/g, ' ').toUpperCase(),
+    notnull: Number(row.notnull),
+    defaultValue: row.dflt_value == null ? null : String(row.dflt_value).trim().replace(/\s+/g, ' '),
+    pk: Number(row.pk),
+  }
+}
+
+function schemaManifest(db: DatabaseSync): CanonicalSchemaManifest {
+  const tables = db
+    .prepare(
+      `SELECT name FROM sqlite_schema
+       WHERE type='table' AND name NOT LIKE 'sqlite_%'
+       ORDER BY name`,
+    )
+    .all() as unknown as { name: string }[]
+  const manifest: CanonicalSchemaManifest = new Map()
+  for (const { name } of tables) {
+    const tableSql = (
+      db.prepare("SELECT sql FROM sqlite_schema WHERE type='table' AND name=?").get(name) as {
+        sql: string | null
+      }
+    ).sql
+    const columns = db
+      .prepare(`PRAGMA table_info(${quotedIdentifier(name)})`)
+      .all() as unknown as {
+        name: string
+        type: string
+        notnull: number
+        dflt_value: string | null
+        pk: number
+      }[]
+    const indexes = db
+      .prepare(`PRAGMA index_list(${quotedIdentifier(name)})`)
+      .all() as unknown as {
+        name: string
+        unique: number
+        origin: string
+        partial: number
+      }[]
+    const indexSignatures = indexes.map((index) => {
+      const keyColumns = (
+        db.prepare(`PRAGMA index_xinfo(${quotedIdentifier(index.name)})`).all() as unknown as {
+          seqno: number
+          name: string | null
+          desc: number
+          coll: string | null
+          key: number
+        }[]
+      )
+        .filter((column) => column.key === 1)
+        .sort((a, b) => a.seqno - b.seqno)
+        .map((column) => ({
+          name: column.name,
+          desc: Number(column.desc),
+          coll: column.coll ?? null,
+        }))
+      return JSON.stringify({
+        unique: Number(index.unique),
+        origin: index.origin,
+        partial: Number(index.partial),
+        keyColumns,
+      })
+    }).sort()
+    manifest.set(name, {
+      columns: new Map(columns.map((row) => [row.name, normalizedColumn(row)])),
+      indexes: indexSignatures,
+      // The migration contract relies on the INTEGER primary-key allocator's
+      // no-reuse guarantee. Match the key definition itself, not an arbitrary
+      // occurrence of the keyword elsewhere in a table declaration.
+      autoIncrement: /\bid\s+INTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT\b/i.test(tableSql ?? ''),
+    })
+  }
+  return manifest
+}
+
+function expectedSchemaManifest(): CanonicalSchemaManifest {
+  if (canonicalSchemaManifest) return canonicalSchemaManifest
+  const canonical = new DatabaseSync(':memory:')
+  try {
+    migrate(canonical)
+    canonicalSchemaManifest = schemaManifest(canonical)
+    return canonicalSchemaManifest
+  } finally {
+    canonical.close()
+  }
+}
+
+// Readiness 的 schema 形状校验直接从 migrations 在内存库生成最新版 manifest，避免维护第二份
+// 易漂移的表/列清单。目标库可以有向后兼容的额外表/列，但每个 canonical 表及其列签名必须存在。
+export function assertSchemaMatchesMigrations(db: DatabaseSync): void {
+  const expected = expectedSchemaManifest()
+  const actual = schemaManifest(db)
+  for (const [tableName, expectedTable] of expected) {
+    const actualTable = actual.get(tableName)
+    if (!actualTable) throw new Error(`[db] schema 缺少必需表 ${tableName}`)
+    for (const [columnName, expectedColumn] of expectedTable.columns) {
+      const actualColumn = actualTable.columns.get(columnName)
+      if (!actualColumn) throw new Error(`[db] schema ${tableName} 缺少必需列 ${columnName}`)
+      if (
+        actualColumn.type !== expectedColumn.type ||
+        actualColumn.notnull !== expectedColumn.notnull ||
+        actualColumn.defaultValue !== expectedColumn.defaultValue ||
+        actualColumn.pk !== expectedColumn.pk
+      ) {
+        throw new Error(`[db] schema ${tableName}.${columnName} 列签名与迁移定义不一致`)
+      }
+    }
+    if (actualTable.autoIncrement !== expectedTable.autoIncrement) {
+      throw new Error(`[db] schema ${tableName} AUTOINCREMENT 约束与迁移定义不一致`)
+    }
+    const remainingIndexes = [...actualTable.indexes]
+    for (const expectedIndex of expectedTable.indexes) {
+      const index = remainingIndexes.indexOf(expectedIndex)
+      if (index === -1) throw new Error(`[db] schema ${tableName} 缺少迁移定义的索引或唯一约束`)
+      remainingIndexes.splice(index, 1)
+    }
+  }
 }

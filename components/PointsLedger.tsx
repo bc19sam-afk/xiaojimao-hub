@@ -19,7 +19,7 @@ function fmtTime(ms: number): string {
 
 export default function PointsLedger({ ledger }: { ledger: LedgerItem[] }) {
   return (
-    <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-6">
+    <div className="min-w-0 rounded-2xl border border-white/10 bg-white/[0.03] p-6">
       <h3 className="mb-4 flex items-center gap-2 font-bold text-white">
         <ReceiptIcon size={18} weight="fill" className="text-[var(--brand-bright)]" />
         积分明细

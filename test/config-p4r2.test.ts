@@ -1,10 +1,13 @@
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
+import { DatabaseSync } from 'node:sqlite'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { migrate } from '../lib/migrate.ts'
+import { seedDefaults } from '../lib/seed-defaults.ts'
 import type { DailyUsage } from '../lib/cpa.ts'
 import type { Contribution } from '../lib/db.ts'
 
@@ -18,15 +21,20 @@ import type { Contribution } from '../lib/db.ts'
 //   before() 设 MIN_TRUST_LEVEL='2'（先于 import env）：让「缺省回落 env」可与 0 区分。
 // ============================================================================
 
-// 子进程重启模拟（E2 一次性播种测试用）：仿 seed-concurrency.test.ts——spawn 子进程用同 DB_PATH import
-// lib/db.ts（import 即触发单例 openDb→seedDefaults）再退出，验删空 usage_rates 后重开不回种。
+// 子进程重启模拟（E2 一次性播种测试用）：仿 seed-concurrency.test.ts——spawn 子进程用同 DB_PATH
+// 显式调用 seedDefaults 再退出，验删空 usage_rates 后下一次 bootstrap 不回种。
 const here = path.dirname(fileURLToPath(import.meta.url))
 const root = path.resolve(here, '..')
 const setupPath = path.join(root, 'test', 'setup.mjs') // 子进程 --import：装 .ts 解析钩子
-const dbModule = path.join(root, 'lib', 'db.ts')
+const seedModule = path.join(root, 'lib', 'seed-defaults.ts')
 const CHILD_ONESHOT = [
   "import { pathToFileURL } from 'node:url'",
-  'await import(pathToFileURL(process.env.DB_MODULE).href)', // import 即触发 openDb→seedDefaults
+  "import { DatabaseSync } from 'node:sqlite'",
+  'const { seedDefaults } = await import(pathToFileURL(process.env.SEED_MODULE).href)',
+  'const db = new DatabaseSync(process.env.DB_PATH)',
+  "db.exec('PRAGMA busy_timeout = 5000')",
+  'seedDefaults(db, true)',
+  'db.close()',
   '',
 ].join('\n')
 
@@ -68,6 +76,10 @@ before(async () => {
   process.env.DB_PATH = path.join(tmpDir, 'app.db')
   process.env.MOCK_CPA_PATH = path.join(tmpDir, 'mock-cpa.json')
   process.env.MIN_TRUST_LEVEL = '2' // 先于 import env：env.linuxdo.minTrustLevel=2，供「缺省回落 env」测试
+  const bootstrap = new DatabaseSync(process.env.DB_PATH)
+  migrate(bootstrap)
+  seedDefaults(bootstrap, true)
+  bootstrap.close()
   ;({ db } = await import('../lib/db.ts'))
   audit = await import('../lib/audit.ts')
   settle = await import('../lib/settle.ts')
@@ -262,19 +274,19 @@ test('E1 结算防御闸：巨额单价该日不结不发；改回正常后下�
   assert.equal(db.balance(uid), 20, '10 次 × 2 = 20 补发')
 })
 
-// E2 usage_rates 一次性播种（codex 复审 P1）：删空后重开进程（子进程 import lib/db.ts）不回种、marker 仍在
+// E2 usage_rates 一次性播种（codex 复审 P1）：删空后下一次显式 bootstrap 不回种、marker 仍在
 test('E2 usage_rates 一次性播种：删空后重开进程不回种（marker 生效）', async () => {
-  assert.ok(db.getConfig('usage_rates_seeded') != null, '首次 import 已写 marker')
+  assert.ok(db.getConfig('usage_rates_seeded') != null, '首次显式 bootstrap 已写 marker')
   for (const r of db.listUsageRates()) db.deleteUsageRate(r.id) // 模拟管理员删空＝停发
   assert.equal(db.listUsageRates().length, 0, '删空后 usage_rates 为空')
-  // spawn 子进程用同 DB_PATH import lib/db.ts（触发 openDb→seedDefaults）再退出
+  // spawn 子进程用同 DB_PATH 显式调用 seedDefaults 再退出
   const childPath = path.join(tmpDir, 'oneshot-child.mjs')
   fs.writeFileSync(childPath, CHILD_ONESHOT)
   let stderr = ''
   const code = await new Promise<number | null>((resolve) => {
     const child = spawn(process.execPath, ['--import', setupPath, childPath], {
       cwd: root,
-      env: { ...process.env, DB_MODULE: dbModule }, // 继承同 DB_PATH / MOCK=true
+      env: { ...process.env, SEED_MODULE: seedModule }, // 继承同 DB_PATH / MOCK=true
       stdio: ['ignore', 'ignore', 'pipe'],
     })
     child.stderr.on('data', (b) => (stderr += b))

@@ -5,11 +5,12 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { migrate, migrations, LATEST_VERSION } from '../lib/migrate.ts'
+import { seedDefaults } from '../lib/seed-defaults.ts'
 import type { Contribution } from '../lib/db.ts'
 import type { AuthFile, DailyUsage, ProbeResult } from '../lib/cpa.ts'
 
-// ⚠️ db.ts 模块级会 openDb()——绝不在顶部 **值导入** 它，否则在 before() 设 DB_PATH 前就打开真实
-// data/app.db（globalThis.__appDb 缓存后 before() 的动态 import 也复用它）→ 破坏隔离红线。
+// ⚠️ db.ts 的连接虽已惰性创建，测试仍须在 before() 设 DB_PATH 后再 **值导入**，避免后续首次访问
+// 误开真实 data/app.db（globalThis.__appDb 缓存后无法切换）→ 破坏隔离红线。
 // describeLedgerEntry/shortAccountLabel 虽是纯函数，也一律走 before() 的动态 import 取得。
 
 // ============================================================================
@@ -147,6 +148,10 @@ before(async () => {
   process.env.MOCK = 'true'
   process.env.DB_PATH = path.join(tmpDir, 'app.db')
   process.env.MOCK_CPA_PATH = path.join(tmpDir, 'mock-cpa.json')
+  const bootstrap = new DatabaseSync(process.env.DB_PATH)
+  migrate(bootstrap)
+  seedDefaults(bootstrap, true)
+  bootstrap.close()
   const dbMod = await import('../lib/db.ts') // 动态 import：此刻 DB_PATH 已指向 tmp
   db = dbMod.db
   describeLedgerEntry = dbMod.describeLedgerEntry

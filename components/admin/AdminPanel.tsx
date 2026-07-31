@@ -1,6 +1,17 @@
 'use client'
 
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
+import ConfirmDialog, { type ConfirmDialogRequest } from './ConfirmDialog'
+import {
+  loadingServiceProbe,
+  probeSystemStatus,
+  type ServiceProbeResult,
+} from '@/lib/service-status'
+import {
+  parseAdminRedeemItemsResponse,
+  type AdminOverviewResponse,
+  type AdminRedeemItem,
+} from '@/lib/admin-redeem-items-response'
 
 interface PointRule {
   id: number
@@ -19,18 +30,7 @@ interface UsageRate {
   enabled: number
   label: string
 }
-interface RedeemItem {
-  id: number
-  name: string
-  description: string
-  cost: number
-  kind: string
-  enabled: number
-  sort: number
-  config: string
-  fulfillment?: string
-  perUserLimit?: number
-}
+type RedeemItem = AdminRedeemItem
 // 审计日志一行（P4-R1，§7.3）：old/new 为已脱敏 JSON 摘要串（绝不含码/密钥），查看侧原样展示不泄敏感值
 interface AuditRow {
   id: number
@@ -92,6 +92,46 @@ interface ReviewRow {
   createdAt: number
   updatedAt: number
 }
+type AdminOverview = AdminOverviewResponse
+interface PendingConfirmation extends ConfirmDialogRequest {
+  run: () => Promise<void>
+  fallbackFocus: () => HTMLElement | null
+}
+
+const PUBLIC_DELETE_ERRORS = {
+  pointRule: '删除发分规则失败，请重试',
+  usageRate: '删除折算规则失败，请重试',
+  redeemItem: '删除兑换项失败，请重试',
+  review: '人工复核操作失败，请重试',
+} as const
+
+const PUBLIC_REDEEM_ITEM_SAVE_ERROR = '保存兑换项失败，请重试'
+const PUBLIC_ADMIN_LOAD_ERROR = '部分后台数据暂时无法加载，请刷新重试'
+const PUBLIC_AUDIT_LOAD_ERROR = '审计记录暂时无法加载，请重试'
+const PUBLIC_REDEEM_ITEM_SAVE_ERRORS_BY_CODE: Record<string, string> = {
+  REDEEM_ITEM_SAVE_FAILED: PUBLIC_REDEEM_ITEM_SAVE_ERROR,
+  REDEEM_ITEM_NOT_FOUND: '兑换项不存在或已被删除，请刷新后重试',
+  IDEMPOTENCY_KEY_CONFLICT: '该新增请求与已提交内容不一致，请重新编辑后再试',
+}
+
+const PUBLIC_ACTION_ERRORS_BY_CODE = {
+  POINT_RULE_DELETE_FAILED: PUBLIC_DELETE_ERRORS.pointRule,
+  USAGE_RATE_DELETE_FAILED: PUBLIC_DELETE_ERRORS.usageRate,
+  REDEEM_ITEM_DELETE_FAILED: PUBLIC_DELETE_ERRORS.redeemItem,
+  REDEEM_ITEM_SAVE_FAILED: PUBLIC_REDEEM_ITEM_SAVE_ERROR,
+  REVIEW_ACTION_FAILED: PUBLIC_DELETE_ERRORS.review,
+} as const
+
+function publicActionError(code: unknown, expectedCode: keyof typeof PUBLIC_ACTION_ERRORS_BY_CODE, fallback: string) {
+  if (code !== expectedCode) return fallback
+  return PUBLIC_ACTION_ERRORS_BY_CODE[expectedCode]
+}
+
+function publicRedeemItemSaveError(code: unknown): string {
+  return typeof code === 'string'
+    ? PUBLIC_REDEEM_ITEM_SAVE_ERRORS_BY_CODE[code] ?? PUBLIC_REDEEM_ITEM_SAVE_ERROR
+    : PUBLIC_REDEEM_ITEM_SAVE_ERROR
+}
 
 const KINDS = [
   { v: 'timed_quota', t: '限时额度' },
@@ -109,6 +149,90 @@ const FULFILLMENTS = [
 const field =
   'rounded-lg border border-white/10 bg-white/5 px-2 py-1.5 text-sm text-neutral-100 outline-none focus:border-emerald-400/50'
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+function isSafeInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value)
+}
+
+function isNonNegativeSafeInteger(value: unknown): value is number {
+  return isSafeInteger(value) && value >= 0
+}
+
+function isPointRule(value: unknown): value is PointRule {
+  return isRecord(value) && isSafeInteger(value.id) && value.id > 0 &&
+    typeof value.provider === 'string' && typeof value.plan === 'string' &&
+    isSafeInteger(value.points) && (value.enabled === 0 || value.enabled === 1) &&
+    typeof value.label === 'string'
+}
+
+function isUsageRate(value: unknown): value is UsageRate {
+  return isRecord(value) && isSafeInteger(value.id) && value.id > 0 &&
+    typeof value.provider === 'string' && typeof value.plan === 'string' &&
+    typeof value.pointsPerCall === 'number' && Number.isFinite(value.pointsPerCall) && value.pointsPerCall >= 0 &&
+    (value.enabled === 0 || value.enabled === 1) && typeof value.label === 'string'
+}
+
+function isContributionRow(value: unknown): value is ContributionRow {
+  return isRecord(value) && typeof value.id === 'string' && isSafeInteger(value.linuxdoId) && value.linuxdoId > 0 &&
+    typeof value.username === 'string' && typeof value.provider === 'string' && typeof value.plan === 'string' &&
+    typeof value.accountId === 'string' && typeof value.verifyStatus === 'string' &&
+    isNonNegativeSafeInteger(value.points) && isNonNegativeSafeInteger(value.createdAt)
+}
+
+function isSettlementRow(value: unknown): value is SettlementRow {
+  return isRecord(value) && isSafeInteger(value.id) && value.id > 0 &&
+    typeof value.contributionId === 'string' &&
+    (value.linuxdoId === null || (isSafeInteger(value.linuxdoId) && value.linuxdoId > 0)) &&
+    typeof value.username === 'string' && typeof value.date === 'string' &&
+    typeof value.provider === 'string' && typeof value.accountId === 'string' &&
+    isNonNegativeSafeInteger(value.callCount) && isSafeInteger(value.points) &&
+    isNonNegativeSafeInteger(value.settledAt)
+}
+
+function isRedemptionRow(value: unknown): value is RedemptionRow {
+  return isRecord(value) && typeof value.id === 'string' && isSafeInteger(value.linuxdoId) && value.linuxdoId > 0 &&
+    typeof value.username === 'string' && typeof value.itemName === 'string' &&
+    isNonNegativeSafeInteger(value.cost) && typeof value.status === 'string' &&
+    isNonNegativeSafeInteger(value.createdAt)
+}
+
+function isReviewRow(value: unknown): value is ReviewRow {
+  return isRecord(value) && typeof value.id === 'string' && isSafeInteger(value.linuxdoId) && value.linuxdoId > 0 &&
+    typeof value.username === 'string' && typeof value.provider === 'string' &&
+    typeof value.accountId === 'string' && isNonNegativeSafeInteger(value.createdAt) &&
+    isNonNegativeSafeInteger(value.updatedAt)
+}
+
+function isAuditRow(value: unknown): value is AuditRow {
+  if (!isRecord(value)) return false
+  return (
+    typeof value.id === 'number' && Number.isSafeInteger(value.id) && value.id > 0 &&
+    typeof value.actorType === 'string' &&
+    (value.actorId === null || (typeof value.actorId === 'number' && Number.isSafeInteger(value.actorId))) &&
+    typeof value.actorLabel === 'string' &&
+    typeof value.action === 'string' &&
+    typeof value.target === 'string' &&
+    (value.oldValue === null || typeof value.oldValue === 'string') &&
+    (value.newValue === null || typeof value.newValue === 'string') &&
+    typeof value.createdAt === 'number' && Number.isSafeInteger(value.createdAt) && value.createdAt >= 0
+  )
+}
+
+async function fetchAdminObject(url: string): Promise<Record<string, unknown>> {
+  const response = await fetch(url, { cache: 'no-store' })
+  let body: unknown
+  try {
+    body = await response.json()
+  } catch {
+    throw new Error('invalid admin response')
+  }
+  if (!response.ok || !isRecord(body)) throw new Error('admin request failed')
+  return body
+}
+
 export default function AdminPanel() {
   const [rules, setRules] = useState<PointRule[]>([])
   const [rates, setRates] = useState<UsageRate[]>([]) // 折算规则（按次单价）
@@ -124,56 +248,159 @@ export default function AdminPanel() {
   const [settlements, setSettlements] = useState<SettlementRow[]>([])
   const [redemptions, setRedemptions] = useState<RedemptionRow[]>([])
   const [review, setReview] = useState<ReviewRow[]>([])
+  const [overview, setOverview] = useState<AdminOverview | null>(null)
+  const [systemStatus, setSystemStatus] = useState<{
+    liveness: ServiceProbeResult
+    readiness: ServiceProbeResult
+  }>({ liveness: loadingServiceProbe(), readiness: loadingServiceProbe() })
+  const [refreshingStatus, setRefreshingStatus] = useState(false)
+  const [confirmation, setConfirmation] = useState<PendingConfirmation | null>(null)
+  const statusRefreshInFlight = useRef(false)
+  const ruleHeadingRef = useRef<HTMLHeadingElement>(null)
+  const rateHeadingRef = useRef<HTMLHeadingElement>(null)
+  const itemHeadingRef = useRef<HTMLHeadingElement>(null)
+  const reviewHeadingRef = useRef<HTMLHeadingElement>(null)
   const [msg, setMsg] = useState('')
+  const [itemError, setItemError] = useState('')
+  const [auditError, setAuditError] = useState('')
+  const [adminLoadError, setAdminLoadError] = useState('')
+  const savingItemKeysRef = useRef(new Set<string>())
+  const [savingItemKeys, setSavingItemKeys] = useState<Set<string>>(() => new Set())
 
   const load = useCallback(async () => {
-    const d = await fetch('/api/admin/config', { cache: 'no-store' }).then((r) => r.json())
-    setRules(d.pointRules ?? [])
-    setItems(d.redeemItems ?? [])
+    try {
+      const d = await fetchAdminObject('/api/admin/config')
+      if (!Array.isArray(d.pointRules) || !d.pointRules.every(isPointRule)) throw new Error('invalid point rules')
+      const parsed = parseAdminRedeemItemsResponse({
+        ok: true,
+        redeemItems: d.redeemItems,
+        overview: d.overview,
+      })
+      if (!parsed) throw new Error('invalid redeem item config')
+      setRules(d.pointRules)
+      setItems(parsed.redeemItems)
+      setOverview(parsed.overview)
+    } catch {
+      setAdminLoadError(PUBLIC_ADMIN_LOAD_ERROR)
+    }
   }, [])
   const loadRates = useCallback(async () => {
-    const d = await fetch('/api/admin/usage-rates', { cache: 'no-store' }).then((r) => r.json())
-    if (d.ok) setRates(d.usageRates ?? [])
+    try {
+      const d = await fetchAdminObject('/api/admin/usage-rates')
+      if (d.ok !== true || !Array.isArray(d.usageRates) || !d.usageRates.every(isUsageRate)) throw new Error('invalid usage rates')
+      setRates(d.usageRates)
+    } catch {
+      setAdminLoadError(PUBLIC_ADMIN_LOAD_ERROR)
+    }
   }, [])
   const loadQuota = useCallback(async () => {
-    const d = await fetch('/api/admin/ldc-quota', { cache: 'no-store' }).then((r) => r.json())
-    if (d.ok) setQuota(String(d.quota))
+    try {
+      const d = await fetchAdminObject('/api/admin/ldc-quota')
+      if (d.ok !== true || typeof d.quota !== 'number' || !Number.isSafeInteger(d.quota) || d.quota < 0) {
+        throw new Error('invalid quota')
+      }
+      setQuota(String(d.quota))
+    } catch {
+      setAdminLoadError(PUBLIC_ADMIN_LOAD_ERROR)
+    }
   }, [])
   const loadGate = useCallback(async () => {
-    const d = await fetch('/api/admin/trust-gate', { cache: 'no-store' }).then((r) => r.json())
-    if (d.ok) {
+    try {
+      const d = await fetchAdminObject('/api/admin/trust-gate')
+      if (
+        d.ok !== true || typeof d.enabled !== 'boolean' || typeof d.minTrust !== 'number' ||
+        !Number.isSafeInteger(d.minTrust) || d.minTrust < 0
+      ) throw new Error('invalid trust gate')
       setGateEnabled(d.enabled)
       setMinTrust(String(d.minTrust))
+    } catch {
+      setAdminLoadError(PUBLIC_ADMIN_LOAD_ERROR)
     }
   }, [])
   const loadSettle = useCallback(async () => {
-    const d = await fetch('/api/admin/settle-params', { cache: 'no-store' }).then((r) => r.json())
-    if (d.ok) setGraceMinutes(String(d.graceMinutes))
+    try {
+      const d = await fetchAdminObject('/api/admin/settle-params')
+      if (
+        d.ok !== true || typeof d.graceMinutes !== 'number' || !Number.isSafeInteger(d.graceMinutes) ||
+        d.graceMinutes < 0 || d.graceMinutes > 1439
+      ) throw new Error('invalid settle params')
+      setGraceMinutes(String(d.graceMinutes))
+    } catch {
+      setAdminLoadError(PUBLIC_ADMIN_LOAD_ERROR)
+    }
   }, [])
   const loadPool = useCallback(async () => {
-    const d = await fetch('/api/admin/pool-priority', { cache: 'no-store' }).then((r) => r.json())
-    if (d.ok) setPoolPriority(String(d.poolPriority))
+    try {
+      const d = await fetchAdminObject('/api/admin/pool-priority')
+      if (
+        d.ok !== true || typeof d.poolPriority !== 'number' || !Number.isSafeInteger(d.poolPriority) ||
+        d.poolPriority < 0
+      ) throw new Error('invalid pool priority')
+      setPoolPriority(String(d.poolPriority))
+    } catch {
+      setAdminLoadError(PUBLIC_ADMIN_LOAD_ERROR)
+    }
   }, [])
   const loadAudit = useCallback(async () => {
-    const d = await fetch('/api/admin/audit?limit=50', { cache: 'no-store' }).then((r) => r.json())
-    if (d.ok) setAudit(d.audit ?? [])
+    try {
+      const d = await fetchAdminObject('/api/admin/audit?limit=50')
+      if (d.ok !== true || !Array.isArray(d.audit) || !d.audit.every(isAuditRow)) {
+        throw new Error('invalid audit')
+      }
+      setAudit(d.audit)
+      setAuditError('')
+    } catch {
+      setAuditError(PUBLIC_AUDIT_LOAD_ERROR)
+    }
   }, [])
   // 数据查看三块：各拉一页（limit=50）。§8——兑换记录后端已脱敏，不含 result
   const loadContributions = useCallback(async () => {
-    const d = await fetch('/api/admin/contributions?limit=50', { cache: 'no-store' }).then((r) => r.json())
-    if (d.ok) setContributions(d.contributions ?? [])
+    try {
+      const d = await fetchAdminObject('/api/admin/contributions?limit=50')
+      if (d.ok !== true || !Array.isArray(d.contributions) || !d.contributions.every(isContributionRow)) throw new Error('invalid contributions')
+      setContributions(d.contributions)
+    } catch {
+      setAdminLoadError(PUBLIC_ADMIN_LOAD_ERROR)
+    }
   }, [])
   const loadSettlements = useCallback(async () => {
-    const d = await fetch('/api/admin/settlements?limit=50', { cache: 'no-store' }).then((r) => r.json())
-    if (d.ok) setSettlements(d.settlements ?? [])
+    try {
+      const d = await fetchAdminObject('/api/admin/settlements?limit=50')
+      if (d.ok !== true || !Array.isArray(d.settlements) || !d.settlements.every(isSettlementRow)) throw new Error('invalid settlements')
+      setSettlements(d.settlements)
+    } catch {
+      setAdminLoadError(PUBLIC_ADMIN_LOAD_ERROR)
+    }
   }, [])
   const loadRedemptions = useCallback(async () => {
-    const d = await fetch('/api/admin/redemptions?limit=50', { cache: 'no-store' }).then((r) => r.json())
-    if (d.ok) setRedemptions(d.redemptions ?? [])
+    try {
+      const d = await fetchAdminObject('/api/admin/redemptions?limit=50')
+      if (d.ok !== true || !Array.isArray(d.redemptions) || !d.redemptions.every(isRedemptionRow)) throw new Error('invalid redemptions')
+      setRedemptions(d.redemptions)
+    } catch {
+      setAdminLoadError(PUBLIC_ADMIN_LOAD_ERROR)
+    }
   }, [])
   const loadReview = useCallback(async () => {
-    const d = await fetch('/api/admin/review', { cache: 'no-store' }).then((r) => r.json())
-    if (d.ok) setReview(d.review ?? [])
+    try {
+      const d = await fetchAdminObject('/api/admin/review')
+      if (d.ok !== true || !Array.isArray(d.review) || !d.review.every(isReviewRow)) throw new Error('invalid review')
+      setReview(d.review)
+    } catch {
+      setAdminLoadError(PUBLIC_ADMIN_LOAD_ERROR)
+    }
+  }, [])
+  const refreshSystemStatus = useCallback(async () => {
+    if (statusRefreshInFlight.current) return
+    statusRefreshInFlight.current = true
+    setRefreshingStatus(true)
+    setSystemStatus({ liveness: loadingServiceProbe(), readiness: loadingServiceProbe() })
+    try {
+      setSystemStatus(await probeSystemStatus())
+    } finally {
+      statusRefreshInFlight.current = false
+      setRefreshingStatus(false)
+    }
   }, [])
   useEffect(() => {
     load()
@@ -187,9 +414,10 @@ export default function AdminPanel() {
     loadSettlements()
     loadRedemptions()
     loadReview()
+    refreshSystemStatus()
   }, [
     load, loadRates, loadQuota, loadGate, loadSettle, loadPool, loadAudit,
-    loadContributions, loadSettlements, loadRedemptions, loadReview,
+    loadContributions, loadSettlements, loadRedemptions, loadReview, refreshSystemStatus,
   ])
 
   const flash = (t: string) => {
@@ -291,9 +519,14 @@ export default function AdminPanel() {
     } else flash(d.error || '失败')
   }
   async function delRule(id: number) {
-    const d = await fetch('/api/admin/point-rules?id=' + id, { method: 'DELETE' }).then((r) => r.json())
+    const res = await fetch('/api/admin/point-rules?id=' + id, { method: 'DELETE' })
+    const d = await res.json().catch(() => ({}))
+    if (!res.ok || !d.ok || !Array.isArray(d.pointRules)) {
+      throw new Error(publicActionError(d.code, 'POINT_RULE_DELETE_FAILED', PUBLIC_DELETE_ERRORS.pointRule))
+    }
     setRules(d.pointRules)
     flash('已删除')
+    void loadAudit().catch(() => {})
   }
   async function saveRate(r: Partial<UsageRate>) {
     const res = await fetch('/api/admin/usage-rates', {
@@ -309,26 +542,62 @@ export default function AdminPanel() {
     } else flash(d.error || '失败')
   }
   async function delRate(id: number) {
-    const d = await fetch('/api/admin/usage-rates?id=' + id, { method: 'DELETE' }).then((r) => r.json())
+    const res = await fetch('/api/admin/usage-rates?id=' + id, { method: 'DELETE' })
+    const d = await res.json().catch(() => ({}))
+    if (!res.ok || !d.ok || !Array.isArray(d.usageRates)) {
+      throw new Error(publicActionError(d.code, 'USAGE_RATE_DELETE_FAILED', PUBLIC_DELETE_ERRORS.usageRate))
+    }
     setRates(d.usageRates)
     flash('已删除')
+    void loadAudit().catch(() => {})
   }
-  async function saveItem(it: Partial<RedeemItem>) {
-    const res = await fetch('/api/admin/redeem-items', {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ...it, enabled: it.enabled !== 0 }),
-    })
-    const d = await res.json()
-    if (res.ok) {
-      setItems(d.redeemItems)
+  async function saveItem(
+    it: Partial<RedeemItem>,
+    rowKey: string,
+    idempotencyKey?: string,
+  ): Promise<boolean> {
+    if (savingItemKeysRef.current.has(rowKey)) return false
+    savingItemKeysRef.current.add(rowKey)
+    setSavingItemKeys(new Set(savingItemKeysRef.current))
+    setItemError('')
+    try {
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+      if (idempotencyKey) headers['Idempotency-Key'] = idempotencyKey
+      const res = await fetch('/api/admin/redeem-items', {
+        method: 'PUT',
+        headers,
+        body: JSON.stringify({ ...it, enabled: it.enabled !== 0 }),
+      })
+      const d = await res.json().catch(() => null)
+      const parsed = parseAdminRedeemItemsResponse(d)
+      if (!res.ok || !parsed) {
+        setItemError(publicRedeemItemSaveError(isRecord(d) ? d.code : undefined))
+        return false
+      }
+      setItems(parsed.redeemItems)
+      setOverview(parsed.overview)
       flash('已保存')
-    } else flash(d.error || '失败')
+      void loadAudit()
+      return true
+    } catch {
+      setItemError(PUBLIC_REDEEM_ITEM_SAVE_ERROR)
+      return false
+    } finally {
+      savingItemKeysRef.current.delete(rowKey)
+      setSavingItemKeys(new Set(savingItemKeysRef.current))
+    }
   }
   async function delItem(id: number) {
-    const d = await fetch('/api/admin/redeem-items?id=' + id, { method: 'DELETE' }).then((r) => r.json())
-    setItems(d.redeemItems)
+    const res = await fetch('/api/admin/redeem-items?id=' + id, { method: 'DELETE' })
+    const d = await res.json().catch(() => null)
+    const parsed = parseAdminRedeemItemsResponse(d)
+    if (!res.ok || !parsed) {
+      throw new Error(publicActionError(isRecord(d) ? d.code : undefined, 'REDEEM_ITEM_DELETE_FAILED', PUBLIC_DELETE_ERRORS.redeemItem))
+    }
+    setItems(parsed.redeemItems)
+    setOverview(parsed.overview)
     flash('已删除')
+    void loadAudit().catch(() => {})
   }
 
   // 人工复核处理（P4-R3，§7.4）：重试（按是否入过池分叉：未入过→回首检 / 入过→直接回池）/ 终止（→ 停用）。
@@ -340,22 +609,75 @@ export default function AdminPanel() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ id, action }),
     })
-    const d = await res.json()
+    const d = await res.json().catch(() => ({}))
     if (res.ok && d.ok) {
       setReview(d.review ?? [])
       flash(action === 'retry' ? '已重试' : '已终止')
-      loadAudit()
-      loadContributions()
-    } else flash(d.error || '失败')
+      void loadAudit().catch(() => {})
+      void loadContributions().catch(() => {})
+      void load().catch(() => {})
+    } else throw new Error(publicActionError(d.code, 'REVIEW_ACTION_FAILED', PUBLIC_DELETE_ERRORS.review))
   }
 
+  function confirmRuleDelete(rule: PointRule) {
+    setConfirmation({
+      title: '确认删除发分规则',
+      target: `${rule.provider} / ${rule.plan}`,
+      consequence: '删除后该规则立即停止发分；如需恢复，必须重新创建并保存。',
+      confirmLabel: '确认删除',
+      run: () => delRule(rule.id),
+      fallbackFocus: () => ruleHeadingRef.current,
+    })
+  }
+
+  function confirmRateDelete(rate: UsageRate) {
+    setConfirmation({
+      title: '确认删除折算规则',
+      target: `${rate.provider} / ${rate.plan}`,
+      consequence: '删除后该套餐将不再按此单价结算；如无兜底规则，后续用量可能不再发分。',
+      confirmLabel: '确认删除',
+      run: () => delRate(rate.id),
+      fallbackFocus: () => rateHeadingRef.current,
+    })
+  }
+
+  function confirmItemDelete(item: RedeemItem) {
+    setConfirmation({
+      title: '确认删除兑换项',
+      target: item.name,
+      consequence: '该商品会从商店配置中删除；历史兑换记录仍保留，但此操作不能在当前页面撤销。',
+      confirmLabel: '确认删除',
+      run: () => delItem(item.id),
+      fallbackFocus: () => itemHeadingRef.current,
+    })
+  }
+
+  function confirmReviewAction(row: ReviewRow, action: 'retry' | 'terminate') {
+    const retry = action === 'retry'
+    setConfirmation({
+      title: retry ? '确认重试人工复核' : '确认终止人工复核',
+      target: `${row.provider} / ${row.accountId}`,
+      consequence: retry
+        ? '该账号会按既有状态机重新进入首检或直接回池；已有结算与唯一键语义不变。'
+        : '该账号会被标记为已停用并退出待复核队列；历史记录与已有结算会保留。',
+      confirmLabel: retry ? '确认重试' : '确认终止',
+      run: () => doReview(row.id, action),
+      fallbackFocus: () => reviewHeadingRef.current,
+    })
+  }
+
+  const lastCheckedAt = Math.max(
+    systemStatus.liveness.checkedAt ?? 0,
+    systemStatus.readiness.checkedAt ?? 0,
+  )
+
   return (
-    <main className="min-h-[100dvh] bg-neutral-950 px-4 py-8 text-neutral-200">
-      <div className="mx-auto max-w-4xl">
-        <header className="mb-6 flex items-center justify-between">
+    <main className="min-h-[100dvh] min-w-0 bg-neutral-950 px-4 py-8 text-neutral-200">
+      <div className="mx-auto min-w-0 max-w-4xl">
+        <header className="mb-6 flex flex-wrap items-center justify-between gap-3">
           <h1 className="text-xl font-bold text-white">管理后台</h1>
-          <div className="flex items-center gap-3">
-            {msg && <span className="text-xs text-emerald-400">{msg}</span>}
+          <div className="flex min-w-0 flex-wrap items-center justify-end gap-3">
+            {msg && <span role="status" aria-live="polite" className="min-w-0 break-words text-xs text-emerald-400">{msg}</span>}
             <a href="/dashboard" className="text-sm text-neutral-400 hover:text-white">
               前台
             </a>
@@ -368,58 +690,135 @@ export default function AdminPanel() {
           </div>
         </header>
 
+        {adminLoadError && (
+          <p role="alert" className="mb-6 rounded-lg border border-amber-400/20 bg-amber-500/10 px-3 py-2 text-xs text-amber-100">
+            {adminLoadError}
+          </p>
+        )}
+
+        <section aria-labelledby="admin-overview-title" className="mb-8 min-w-0 rounded-2xl border border-white/10 bg-white/[0.03] p-5">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <h2 id="admin-overview-title" className="font-bold text-white">运营概览</h2>
+              <p className="mt-1 text-xs text-neutral-500">真实数据库总数与当前服务探针；Liveness 和 Readiness 分别检查。</p>
+            </div>
+            <button
+              type="button"
+              data-testid="refresh-system-status"
+              onClick={refreshSystemStatus}
+              disabled={refreshingStatus}
+              className="rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 text-xs font-medium text-neutral-200 transition hover:bg-white/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {refreshingStatus ? '检查中…' : '刷新系统状态'}
+            </button>
+          </div>
+
+          <dl className="mt-4 grid grid-cols-2 overflow-hidden rounded-xl border border-white/10 bg-black/15 sm:grid-cols-4">
+            {[
+              ['在池账号', overview?.pooledAccounts],
+              ['待人工复核', overview?.needsReview],
+              ['待处理兑换', overview?.pendingRedemptions],
+              ['已启用商品', overview?.enabledRedeemItems],
+            ].map(([label, value], index) => (
+              <div
+                key={String(label)}
+                className={`px-3 py-3 ${index % 2 === 1 ? 'border-l border-white/10' : ''} ${index >= 2 ? 'border-t border-white/10 sm:border-t-0' : ''} ${index > 0 ? 'sm:border-l sm:border-white/10' : ''}`}
+              >
+                <dt className="text-[11px] text-neutral-500">{label}</dt>
+                <dd className="mono mt-1 text-xl font-bold text-white">{value ?? '—'}</dd>
+              </div>
+            ))}
+          </dl>
+
+          <div className="mt-4 grid gap-3 sm:grid-cols-2">
+            <ServiceStatusCard
+              testId="liveness-status"
+              title="Liveness"
+              subtitle="进程存活 / 可响应"
+              result={systemStatus.liveness}
+            />
+            <ServiceStatusCard
+              testId="readiness-status"
+              title="Readiness"
+              subtitle="本地 SQLite / Schema / 写入"
+              result={systemStatus.readiness}
+            />
+          </div>
+          <p className="mt-3 text-right text-[11px] text-neutral-600">
+            {lastCheckedAt > 0
+              ? `最近检查：${new Date(lastCheckedAt).toLocaleTimeString('zh-CN', { hour12: false })}`
+              : '最近检查：尚未完成'}
+          </p>
+        </section>
+
         {/* 发分规则 */}
-        <section className="mb-8 rounded-2xl border border-white/10 bg-white/[0.02] p-5">
-          <h2 className="mb-1 font-bold text-white">发分规则</h2>
+        <section className="mb-8 min-w-0 rounded-2xl border border-white/10 bg-white/[0.02] p-5">
+          <h2 ref={ruleHeadingRef} tabIndex={-1} className="mb-1 font-bold text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400">发分规则</h2>
           <p className="mb-4 text-xs text-neutral-500">
             账号验证通过后，按 (provider, 套餐) 发放积分。plan 填 <code>*</code> 作为该 provider 的兜底。改完点保存即时生效。
           </p>
           <div className="space-y-2">
-            <div className="grid grid-cols-[1fr_1fr_80px_1.4fr_auto_auto] gap-2 text-[11px] text-neutral-500">
+            <div className="hidden grid-cols-[1fr_1fr_80px_1.4fr_auto_auto] gap-2 text-[11px] text-neutral-500 sm:grid">
               <span>provider</span><span>plan</span><span>积分</span><span>标签</span><span>启用</span><span></span>
             </div>
             {rules.map((r) => (
-              <RuleRow key={r.id} rule={r} onSave={saveRule} onDelete={() => delRule(r.id)} />
+              <RuleRow key={r.id} rule={r} onSave={saveRule} onDelete={() => confirmRuleDelete(r)} />
             ))}
             <RuleRow onSave={saveRule} isNew />
           </div>
         </section>
 
         {/* 折算规则（按次单价，P4-R2 §3.4）：按 (provider, 套餐) 每次调用积分单价，可小数。plan 填 * 作兜底 */}
-        <section className="mb-8 rounded-2xl border border-white/10 bg-white/[0.02] p-5">
-          <h2 className="mb-1 font-bold text-white">折算规则（按次单价）</h2>
+        <section className="mb-8 min-w-0 rounded-2xl border border-white/10 bg-white/[0.02] p-5">
+          <h2 ref={rateHeadingRef} tabIndex={-1} className="mb-1 font-bold text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400">折算规则（按次单价）</h2>
           <p className="mb-4 text-xs text-neutral-500">
             号在池后，按 cpamp 每日调用量折算积分：结算 = round(次数 × 单价)。单价可小数（如 <code>0.5</code>）。plan 填{' '}
             <code>*</code> 作该 provider 的兜底。改完点保存即时生效。改 <code>provider</code>/<code>plan</code> 需先删旧行再新增。
           </p>
           <div className="space-y-2">
-            <div className="grid grid-cols-[1fr_1fr_80px_1.4fr_auto_auto] gap-2 text-[11px] text-neutral-500">
+            <div className="hidden grid-cols-[1fr_1fr_80px_1.4fr_auto_auto] gap-2 text-[11px] text-neutral-500 sm:grid">
               <span>provider</span><span>plan</span><span>单价</span><span>标签</span><span>启用</span><span></span>
             </div>
             {rates.map((r) => (
-              <RateRow key={r.id} rate={r} onSave={saveRate} onDelete={() => delRate(r.id)} />
+              <RateRow key={r.id} rate={r} onSave={saveRate} onDelete={() => confirmRateDelete(r)} />
             ))}
             <RateRow onSave={saveRate} isNew />
           </div>
         </section>
 
         {/* 兑换项 */}
-        <section className="rounded-2xl border border-white/10 bg-white/[0.02] p-5">
-          <h2 className="mb-1 font-bold text-white">兑换项（商店）</h2>
+        <section className="min-w-0 rounded-2xl border border-white/10 bg-white/[0.02] p-5">
+          <h2 ref={itemHeadingRef} tabIndex={-1} className="mb-1 font-bold text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400">兑换项（商店）</h2>
           <p className="mb-4 text-xs text-neutral-500">用户用积分兑换。履约接口后续接小鸡毛，现为占位。</p>
+          {itemError && (
+            <p
+              data-testid="redeem-item-error"
+              role="alert"
+              aria-live="assertive"
+              className="mb-4 rounded-lg border border-rose-400/25 bg-rose-500/10 px-3 py-2 text-xs text-rose-200"
+            >
+              {itemError}
+            </p>
+          )}
           <div className="space-y-2">
-            <div className="grid grid-cols-[1.3fr_100px_1fr_1.4fr_auto_auto] gap-2 text-[11px] text-neutral-500">
+            <div className="hidden grid-cols-[1.3fr_100px_1fr_1.4fr_auto_auto] gap-2 text-[11px] text-neutral-500 sm:grid">
               <span>名称</span><span>积分价</span><span>类型</span><span>说明</span><span>启用</span><span></span>
             </div>
             {items.map((it) => (
-              <ItemRow key={it.id} item={it} onSave={saveItem} onDelete={() => delItem(it.id)} />
+              <ItemRow
+                key={it.id}
+                item={it}
+                onSave={saveItem}
+                onDelete={() => confirmItemDelete(it)}
+                saving={savingItemKeys.has(`item:${it.id}`)}
+              />
             ))}
-            <ItemRow onSave={saveItem} isNew />
+            <ItemRow onSave={saveItem} isNew saving={savingItemKeys.has('new')} />
           </div>
         </section>
 
         {/* CDK 库存导入（P4-R1）：选项 + 贴码 + 面额 → 导入；只回计数/库存，绝不回显已导入的码 */}
-        <section className="mt-8 rounded-2xl border border-white/10 bg-white/[0.02] p-5">
+        <section className="mt-8 min-w-0 rounded-2xl border border-white/10 bg-white/[0.02] p-5">
           <h2 className="mb-1 font-bold text-white">CDK 库存导入</h2>
           <p className="mb-4 text-xs text-neutral-500">
             给「CDK 发码」履约的兑换项预导入码（一行一码 / 逗号 / 空白分隔，跨批自动去重）。
@@ -435,9 +834,9 @@ export default function AdminPanel() {
           <p className="mb-4 text-xs text-neutral-500">
             当日已发 LDC 面额之和的上限（按服务器本地自然日重置）。0＝当日停发。非负整数。
           </p>
-          <div className="flex items-center gap-2">
+          <div className="flex min-w-0 flex-wrap items-center gap-2">
             <input
-              className={field + ' w-40'}
+              className={field + ' min-w-0 w-full sm:w-40'}
               type="number"
               min={0}
               value={quota}
@@ -454,7 +853,7 @@ export default function AdminPanel() {
         </section>
 
         {/* 信任等级门槛 & 限身份开关（P4-R2 §1）：关＝登录即可、不限等级；开则等级不足拒登录（不使已登录会话失效） */}
-        <section className="mt-8 rounded-2xl border border-white/10 bg-white/[0.02] p-5">
+        <section className="mt-8 min-w-0 rounded-2xl border border-white/10 bg-white/[0.02] p-5">
           <h2 className="mb-1 font-bold text-white">信任等级门槛</h2>
           <p className="mb-4 text-xs text-neutral-500">
             控制谁能登录贡献账号。关闭门槛＝登录即可、不限信任等级；开启则 linux.do 信任等级低于门槛者被拒。
@@ -471,7 +870,7 @@ export default function AdminPanel() {
               {gateEnabled ? '限信任等级' : '登录即可（不限）'}
             </label>
             <input
-              className={field + ' w-40' + (gateEnabled ? '' : ' opacity-40')}
+              className={field + ' min-w-0 w-full sm:w-40' + (gateEnabled ? '' : ' opacity-40')}
               type="number"
               min={0}
               value={minTrust}
@@ -489,15 +888,15 @@ export default function AdminPanel() {
         </section>
 
         {/* 结算参数（P4-R2 §3.3）：结算时刻＝午夜后延迟分钟数，缺省 10（00:10）。时区随服务器不可配 */}
-        <section className="mt-8 rounded-2xl border border-white/10 bg-white/[0.02] p-5">
+        <section className="mt-8 min-w-0 rounded-2xl border border-white/10 bg-white/[0.02] p-5">
           <h2 className="mb-1 font-bold text-white">结算参数</h2>
           <p className="mb-4 text-xs text-neutral-500">
             每日结算前一自然日的用量。结算时刻＝午夜后延迟多少分钟再结（吸收迟到落账），缺省 <code>10</code>（即 00:10）。
             范围 0–1439 分钟。<span className="text-amber-300/80">时区随服务器，不可配。</span>
           </p>
-          <div className="flex items-center gap-2">
+          <div className="flex min-w-0 flex-wrap items-center gap-2">
             <input
-              className={field + ' w-40'}
+              className={field + ' min-w-0 w-full sm:w-40'}
               type="number"
               min={0}
               max={1439}
@@ -516,14 +915,14 @@ export default function AdminPanel() {
         </section>
 
         {/* 入池优先级（对接-R2b §2.5/§7.1）：贡献号入池即设的全局优先级，cpamp 数字越大越优先 */}
-        <section className="mt-8 rounded-2xl border border-white/10 bg-white/[0.02] p-5">
+        <section className="mt-8 min-w-0 rounded-2xl border border-white/10 bg-white/[0.02] p-5">
           <h2 className="mb-1 font-bold text-white">入池优先级</h2>
           <p className="mb-4 text-xs text-neutral-500">
             贡献账号入池时统一设置的优先级，缺省 <code>10</code>，数值越大越优先被调用（号主越先赚分）。非负整数。
           </p>
-          <div className="flex items-center gap-2">
+          <div className="flex min-w-0 flex-wrap items-center gap-2">
             <input
-              className={field + ' w-40'}
+              className={field + ' min-w-0 w-full sm:w-40'}
               type="number"
               min={0}
               value={poolPriority}
@@ -540,10 +939,12 @@ export default function AdminPanel() {
         </section>
 
         {/* 审计日志（P4-R1，§7.3）：只读倒序。old/new 为脱敏摘要，查看不泄敏感值 */}
-        <section className="mt-8 rounded-2xl border border-white/10 bg-white/[0.02] p-5">
+        <section className="mt-8 min-w-0 rounded-2xl border border-white/10 bg-white/[0.02] p-5">
           <div className="mb-1 flex items-center justify-between">
             <h2 className="font-bold text-white">审计日志</h2>
             <button
+              type="button"
+              data-testid="refresh-audit"
               onClick={loadAudit}
               className="rounded-lg border border-white/10 bg-white/5 px-2.5 py-1 text-xs hover:bg-white/10"
             >
@@ -553,37 +954,48 @@ export default function AdminPanel() {
           <p className="mb-4 text-xs text-neutral-500">
             配置写操作留痕（操作人 / 时间 / 动作 / 目标 / 旧→新）。最新 50 条，倒序。
           </p>
-          <div className="space-y-1.5">
-            <div className="grid grid-cols-[130px_130px_1.2fr_1.4fr_2fr] gap-2 text-[11px] text-neutral-500">
-              <span>时间</span><span>操作人</span><span>动作</span><span>目标</span><span>旧 → 新</span>
-            </div>
-            {audit.length === 0 && <p className="py-2 text-xs text-neutral-600">暂无留痕</p>}
-            {audit.map((a) => (
-              <div
-                key={a.id}
-                className="grid grid-cols-[130px_130px_1.2fr_1.4fr_2fr] items-start gap-2 border-t border-white/5 py-1.5 text-[11px] text-neutral-300"
-              >
-                <span className="text-neutral-500">{new Date(a.createdAt).toLocaleString('zh-CN')}</span>
-                <span title={a.actorType}>
-                  {a.actorLabel}
-                  {a.actorId != null && <span className="text-neutral-500"> #{a.actorId}</span>}
-                </span>
-                <span className="font-mono text-emerald-300/80">{a.action}</span>
-                <span className="break-all text-neutral-400">{a.target}</span>
-                <span className="break-all text-neutral-400">
-                  <span className="text-rose-300/70">{a.oldValue ?? '—'}</span>
-                  <span className="text-neutral-600"> → </span>
-                  <span className="text-emerald-300/70">{a.newValue ?? '—'}</span>
-                </span>
+          {auditError && (
+            <p
+              data-testid="audit-load-error"
+              role="alert"
+              className="mb-4 rounded-lg border border-rose-400/25 bg-rose-500/10 px-3 py-2 text-xs text-rose-200"
+            >
+              {auditError}
+            </p>
+          )}
+          <div data-testid="audit-table-scroll" className="max-w-full overflow-x-auto">
+            <div className="min-w-[760px] space-y-1.5">
+              <div className="grid grid-cols-[130px_130px_1.2fr_1.4fr_2fr] gap-2 text-[11px] text-neutral-500">
+                <span>时间</span><span>操作人</span><span>动作</span><span>目标</span><span>旧 → 新</span>
               </div>
-            ))}
+              {audit.length === 0 && <p className="py-2 text-xs text-neutral-600">暂无留痕</p>}
+              {audit.map((a) => (
+                <div
+                  key={a.id}
+                  className="grid grid-cols-[130px_130px_1.2fr_1.4fr_2fr] items-start gap-2 border-t border-white/5 py-1.5 text-[11px] text-neutral-300"
+                >
+                  <span className="text-neutral-500">{new Date(a.createdAt).toLocaleString('zh-CN')}</span>
+                  <span title={a.actorType}>
+                    {a.actorLabel}
+                    {a.actorId != null && <span className="text-neutral-500"> #{a.actorId}</span>}
+                  </span>
+                  <span className="font-mono text-emerald-300/80">{a.action}</span>
+                  <span className="break-all text-neutral-400">{a.target}</span>
+                  <span className="break-all text-neutral-400">
+                    <span className="text-rose-300/70">{a.oldValue ?? '—'}</span>
+                    <span className="text-neutral-600"> → </span>
+                    <span className="text-emerald-300/70">{a.newValue ?? '—'}</span>
+                  </span>
+                </div>
+              ))}
+            </div>
           </div>
         </section>
 
         {/* 待人工复核（P4-R3，§7.4）：needs_review 号的人工出口。重试→转回首检队列；终止→停用（不删行、不碰结算表） */}
-        <section className="mt-8 rounded-2xl border border-white/10 bg-white/[0.02] p-5">
+        <section className="mt-8 min-w-0 rounded-2xl border border-white/10 bg-white/[0.02] p-5">
           <div className="mb-1 flex items-center justify-between">
-            <h2 className="font-bold text-white">待人工复核</h2>
+            <h2 ref={reviewHeadingRef} tabIndex={-1} className="font-bold text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400">待人工复核</h2>
             <button
               onClick={loadReview}
               className="rounded-lg border border-white/10 bg-white/5 px-2.5 py-1 text-xs hover:bg-white/10"
@@ -596,41 +1008,49 @@ export default function AdminPanel() {
             未入过池→转回首检队列重查；已入过池→直接回池、交由巡检复核（不重走首检，保住历史结算与唯一键）。
             <b>终止</b>放弃并停用（保留记录、不影响已有结算）。
           </p>
-          <div className="space-y-1.5">
+          <div data-testid="review-table-scroll" className="max-w-full overflow-x-auto">
+            <div className="min-w-[620px] space-y-1.5">
             <div className="grid grid-cols-[130px_110px_80px_1fr_auto] gap-2 text-[11px] text-neutral-500">
               <span>提交时间</span><span>用户</span><span>provider</span><span>account</span><span>操作</span>
             </div>
             {review.length === 0 && <p className="py-2 text-xs text-neutral-600">暂无待复核</p>}
-            {review.map((r) => (
+              {review.map((r) => (
               <div
                 key={r.id}
                 className="grid grid-cols-[130px_110px_80px_1fr_auto] items-center gap-2 border-t border-white/5 py-1.5 text-[11px] text-neutral-300"
               >
                 <span className="text-neutral-500">{new Date(r.createdAt).toLocaleString('zh-CN')}</span>
-                <span>{r.username || <span className="text-neutral-500">#{r.linuxdoId}</span>}</span>
+                <span className="min-w-0 break-all [overflow-wrap:anywhere]">
+                  {r.username || <span className="text-neutral-500">#{r.linuxdoId}</span>}
+                </span>
                 <span className="text-neutral-400">{r.provider}</span>
                 <span className="break-all text-neutral-400">{r.accountId}</span>
-                <div className="flex gap-1">
+                <div className="flex min-w-max gap-1">
                   <button
-                    onClick={() => doReview(r.id, 'retry')}
+                    type="button"
+                    onClick={() => confirmReviewAction(r, 'retry')}
+                    aria-label={`重试人工复核 ${r.provider} ${r.accountId}`}
                     className="rounded-lg bg-[var(--brand)]/20 px-2.5 py-1 text-xs font-medium text-[var(--brand-bright)] hover:bg-[var(--brand)]/30"
                   >
                     重试
                   </button>
                   <button
-                    onClick={() => doReview(r.id, 'terminate')}
+                    type="button"
+                    onClick={() => confirmReviewAction(r, 'terminate')}
+                    aria-label={`终止人工复核 ${r.provider} ${r.accountId}`}
                     className="rounded-lg bg-rose-500/10 px-2.5 py-1 text-xs text-rose-300 hover:bg-rose-500/20"
                   >
                     终止
                   </button>
                 </div>
               </div>
-            ))}
+              ))}
+            </div>
           </div>
         </section>
 
         {/* 贡献记录（P4-R3，§6.146）：全局倒序只读。脱敏——不含 email/reward_code。积分＝该号累计发分 */}
-        <section className="mt-8 rounded-2xl border border-white/10 bg-white/[0.02] p-5">
+        <section className="mt-8 min-w-0 rounded-2xl border border-white/10 bg-white/[0.02] p-5">
           <div className="mb-1 flex items-center justify-between">
             <h2 className="font-bold text-white">贡献记录</h2>
             <button
@@ -641,30 +1061,34 @@ export default function AdminPanel() {
             </button>
           </div>
           <p className="mb-4 text-xs text-neutral-500">用户贡献的账号（最新 50 条，倒序）。积分＝该号累计发分。</p>
-          <div className="space-y-1.5">
+          <div data-testid="contributions-table-scroll" className="max-w-full overflow-x-auto">
+            <div className="min-w-[760px] space-y-1.5">
             <div className="grid grid-cols-[120px_100px_70px_60px_80px_1fr_56px] gap-2 text-[11px] text-neutral-500">
               <span>时间</span><span>用户</span><span>provider</span><span>套餐</span><span>状态</span><span>account</span><span>积分</span>
             </div>
             {contributions.length === 0 && <p className="py-2 text-xs text-neutral-600">暂无贡献</p>}
-            {contributions.map((c) => (
+              {contributions.map((c) => (
               <div
                 key={c.id}
                 className="grid grid-cols-[120px_100px_70px_60px_80px_1fr_56px] items-center gap-2 border-t border-white/5 py-1.5 text-[11px] text-neutral-300"
               >
                 <span className="text-neutral-500">{new Date(c.createdAt).toLocaleString('zh-CN')}</span>
-                <span>{c.username || <span className="text-neutral-500">#{c.linuxdoId}</span>}</span>
+                <span className="min-w-0 break-all [overflow-wrap:anywhere]">
+                  {c.username || <span className="text-neutral-500">#{c.linuxdoId}</span>}
+                </span>
                 <span className="text-neutral-400">{c.provider}</span>
                 <span className="text-neutral-400">{c.plan}</span>
                 <span className="font-mono text-neutral-400">{c.verifyStatus}</span>
                 <span className="break-all text-neutral-400">{c.accountId}</span>
                 <span className="text-emerald-300/80">{c.points}</span>
               </div>
-            ))}
+              ))}
+            </div>
           </div>
         </section>
 
         {/* 每日结算记录（P4-R3，§6.146）：全局倒序只读。用户/归属由 LEFT JOIN 取 */}
-        <section className="mt-8 rounded-2xl border border-white/10 bg-white/[0.02] p-5">
+        <section className="mt-8 min-w-0 rounded-2xl border border-white/10 bg-white/[0.02] p-5">
           <div className="mb-1 flex items-center justify-between">
             <h2 className="font-bold text-white">每日结算记录</h2>
             <button
@@ -675,30 +1099,34 @@ export default function AdminPanel() {
             </button>
           </div>
           <p className="mb-4 text-xs text-neutral-500">按日折算的结算流水（最新 50 条，倒序）。积分＝round(次数 × 单价)。</p>
-          <div className="space-y-1.5">
+          <div data-testid="settlements-table-scroll" className="max-w-full overflow-x-auto">
+            <div className="min-w-[780px] space-y-1.5">
             <div className="grid grid-cols-[100px_100px_70px_1fr_56px_56px_130px] gap-2 text-[11px] text-neutral-500">
               <span>日期</span><span>用户</span><span>provider</span><span>account</span><span>次数</span><span>积分</span><span>结算时刻</span>
             </div>
             {settlements.length === 0 && <p className="py-2 text-xs text-neutral-600">暂无结算</p>}
-            {settlements.map((s) => (
+              {settlements.map((s) => (
               <div
                 key={s.id}
                 className="grid grid-cols-[100px_100px_70px_1fr_56px_56px_130px] items-center gap-2 border-t border-white/5 py-1.5 text-[11px] text-neutral-300"
               >
                 <span className="text-neutral-400">{s.date}</span>
-                <span>{s.username || <span className="text-neutral-500">#{s.linuxdoId ?? '—'}</span>}</span>
+                <span className="min-w-0 break-all [overflow-wrap:anywhere]">
+                  {s.username || <span className="text-neutral-500">#{s.linuxdoId ?? '—'}</span>}
+                </span>
                 <span className="text-neutral-400">{s.provider}</span>
                 <span className="break-all text-neutral-400">{s.accountId}</span>
                 <span className="text-neutral-400">{s.callCount}</span>
                 <span className="text-emerald-300/80">{s.points}</span>
                 <span className="text-neutral-500">{new Date(s.settledAt).toLocaleString('zh-CN')}</span>
               </div>
-            ))}
+              ))}
+            </div>
           </div>
         </section>
 
         {/* 兑换记录（P4-R3，§6.146）：全局倒序只读。🔴 §8——后端已脱敏，绝不含 result（CDK 码），故无「码」列 */}
-        <section className="mt-8 rounded-2xl border border-white/10 bg-white/[0.02] p-5">
+        <section className="mt-8 min-w-0 rounded-2xl border border-white/10 bg-white/[0.02] p-5">
           <div className="mb-1 flex items-center justify-between">
             <h2 className="font-bold text-white">兑换记录</h2>
             <button
@@ -711,27 +1139,76 @@ export default function AdminPanel() {
           <p className="mb-4 text-xs text-neutral-500">
             用户兑换流水（最新 50 条，倒序）。安全起见<b>不显示兑换码</b>（码仅号主本人可在前台找回）。
           </p>
-          <div className="space-y-1.5">
+          <div data-testid="redemptions-table-scroll" className="max-w-full overflow-x-auto">
+            <div className="min-w-[560px] space-y-1.5">
             <div className="grid grid-cols-[130px_110px_1fr_64px_90px] gap-2 text-[11px] text-neutral-500">
               <span>时间</span><span>用户</span><span>商品</span><span>花费</span><span>状态</span>
             </div>
             {redemptions.length === 0 && <p className="py-2 text-xs text-neutral-600">暂无兑换</p>}
-            {redemptions.map((r) => (
+              {redemptions.map((r) => (
               <div
                 key={r.id}
                 className="grid grid-cols-[130px_110px_1fr_64px_90px] items-center gap-2 border-t border-white/5 py-1.5 text-[11px] text-neutral-300"
               >
                 <span className="text-neutral-500">{new Date(r.createdAt).toLocaleString('zh-CN')}</span>
-                <span>{r.username || <span className="text-neutral-500">#{r.linuxdoId}</span>}</span>
+                <span className="min-w-0 break-all [overflow-wrap:anywhere]">
+                  {r.username || <span className="text-neutral-500">#{r.linuxdoId}</span>}
+                </span>
                 <span className="break-all text-neutral-400">{r.itemName}</span>
                 <span className="text-neutral-400">{r.cost}</span>
                 <span className="font-mono text-neutral-400">{r.status}</span>
               </div>
-            ))}
+              ))}
+            </div>
           </div>
         </section>
       </div>
+      {confirmation && (
+        <ConfirmDialog
+          request={confirmation}
+          onClose={() => setConfirmation(null)}
+          onConfirm={confirmation.run}
+          fallbackFocus={confirmation.fallbackFocus}
+        />
+      )}
     </main>
+  )
+}
+
+function ServiceStatusCard({
+  testId,
+  title,
+  subtitle,
+  result,
+}: {
+  testId: string
+  title: string
+  subtitle: string
+  result: ServiceProbeResult
+}) {
+  const presentation =
+    result.state === 'available'
+      ? { symbol: '✓', label: '可用', cls: 'border-emerald-400/25 bg-emerald-500/10 text-emerald-200' }
+      : result.state === 'unavailable'
+        ? { symbol: '!', label: '不可用', cls: 'border-rose-400/25 bg-rose-500/10 text-rose-200' }
+        : result.state === 'unknown'
+          ? { symbol: '?', label: '未知', cls: 'border-amber-300/25 bg-amber-400/10 text-amber-100' }
+          : { symbol: '…', label: '检查中', cls: 'border-white/15 bg-white/5 text-neutral-300' }
+
+  return (
+    <div data-testid={testId} role="status" aria-live="polite" aria-atomic="true" className="rounded-xl border border-white/10 bg-black/15 p-3">
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <h3 className="mono text-xs font-bold uppercase tracking-wide text-white">{title}</h3>
+          <p className="mt-0.5 text-[11px] text-neutral-500">{subtitle}</p>
+        </div>
+        <span className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-xs font-semibold ${presentation.cls}`}>
+          <span aria-hidden="true" className="font-black">{presentation.symbol}</span>
+          {presentation.label}
+        </span>
+      </div>
+      <p className="mt-2 text-xs text-neutral-400">{result.summary}</p>
+    </div>
   )
 }
 
@@ -790,9 +1267,13 @@ function CdkImport({
   }
 
   return (
-    <div className="space-y-3">
+    <div className="min-w-0 space-y-3">
       <div className="flex flex-wrap items-center gap-2">
-        <select className={field} value={itemId} onChange={(e) => setItemId(Number(e.target.value))}>
+        <select
+          className={field + ' min-w-0 w-full max-w-full sm:w-auto'}
+          value={itemId}
+          onChange={(e) => setItemId(Number(e.target.value))}
+        >
           <option value={0}>选择兑换项…</option>
           {items.map((i) => (
             <option key={i.id} value={i.id}>
@@ -803,7 +1284,7 @@ function CdkImport({
           ))}
         </select>
         <input
-          className={field + ' w-32'}
+          className={field + ' min-w-0 w-full sm:w-32'}
           type="number"
           min={1}
           value={faceValue}
@@ -817,14 +1298,14 @@ function CdkImport({
           导入
         </button>
         {stats && (
-          <span className="text-xs text-neutral-500">
+          <span className="min-w-0 break-words text-xs text-neutral-500">
             库存：可用 <b className="text-emerald-300">{stats.available}</b> / 已发 {stats.issued} / 作废{' '}
             {stats.void}
           </span>
         )}
       </div>
       <textarea
-        className={field + ' h-28 w-full font-mono'}
+        className={field + ' h-28 min-w-0 w-full max-w-full font-mono'}
         value={codes}
         onChange={(e) => setCodes(e.target.value)}
         placeholder="一行一码，或用逗号 / 空格分隔"
@@ -851,21 +1332,27 @@ function RuleRow({
   const [enabled, setEnabled] = useState((rule?.enabled ?? 1) !== 0)
 
   return (
-    <div className="grid grid-cols-[1fr_1fr_80px_1.4fr_auto_auto] items-center gap-2">
-      <input className={field} value={provider} onChange={(e) => setProvider(e.target.value)} placeholder="codex" />
-      <input className={field} value={plan} onChange={(e) => setPlan(e.target.value)} placeholder="plus / *" />
-      <input className={field} type="number" value={points} onChange={(e) => setPoints(Number(e.target.value))} />
-      <input className={field} value={label} onChange={(e) => setLabel(e.target.value)} placeholder="标签" />
+    <div className="grid min-w-0 grid-cols-1 items-center gap-2 sm:grid-cols-[1fr_1fr_80px_1.4fr_auto_auto]">
+      <input className={field + ' min-w-0 w-full'} value={provider} onChange={(e) => setProvider(e.target.value)} placeholder="codex" />
+      <input className={field + ' min-w-0 w-full'} value={plan} onChange={(e) => setPlan(e.target.value)} placeholder="plus / *" />
+      <input className={field + ' min-w-0 w-full'} type="number" value={points} onChange={(e) => setPoints(Number(e.target.value))} />
+      <input className={field + ' min-w-0 w-full'} value={label} onChange={(e) => setLabel(e.target.value)} placeholder="标签" />
       <input type="checkbox" checked={enabled} onChange={(e) => setEnabled(e.target.checked)} className="h-4 w-4 accent-emerald-500" />
-      <div className="flex gap-1">
+      <div className="flex flex-wrap gap-1">
         <button
+          type="button"
           onClick={() => onSave({ provider, plan, points, label, enabled: enabled ? 1 : 0 })}
           className="rounded-lg bg-[var(--brand)]/20 px-2.5 py-1.5 text-xs font-medium text-[var(--brand-bright)] hover:bg-[var(--brand)]/30"
         >
           {isNew ? '新增' : '保存'}
         </button>
         {onDelete && (
-          <button onClick={onDelete} className="rounded-lg bg-rose-500/10 px-2.5 py-1.5 text-xs text-rose-300 hover:bg-rose-500/20">
+          <button
+            type="button"
+            onClick={onDelete}
+            aria-label={`删除发分规则 ${provider} ${plan}`}
+            className="rounded-lg bg-rose-500/10 px-2.5 py-1.5 text-xs text-rose-300 hover:bg-rose-500/20"
+          >
             删
           </button>
         )}
@@ -893,23 +1380,29 @@ function RateRow({
   const [enabled, setEnabled] = useState((rate?.enabled ?? 1) !== 0)
 
   return (
-    <div className="grid grid-cols-[1fr_1fr_80px_1.4fr_auto_auto] items-center gap-2">
+    <div className="grid min-w-0 grid-cols-1 items-center gap-2 sm:grid-cols-[1fr_1fr_80px_1.4fr_auto_auto]">
       {/* 存量行 provider/plan 禁改（P4-R2 codex 复审 P2）：upsert 按 (provider,plan) 键，改键＝插新行、旧行仍
           enabled 计价。改档口径＝先删旧行再新增（唯 isNew 行可编辑键）。置灰样式与信任门槛 disabled 输入一致。 */}
-      <input className={field + (isNew ? '' : ' opacity-40')} value={provider} onChange={(e) => setProvider(e.target.value)} placeholder="codex" disabled={!isNew} />
-      <input className={field + (isNew ? '' : ' opacity-40')} value={plan} onChange={(e) => setPlan(e.target.value)} placeholder="plus / *" disabled={!isNew} />
-      <input className={field} type="number" step={0.1} min={0} value={pointsPerCall} onChange={(e) => setPointsPerCall(Number(e.target.value))} />
-      <input className={field} value={label} onChange={(e) => setLabel(e.target.value)} placeholder="标签" />
+      <input className={field + ' min-w-0 w-full' + (isNew ? '' : ' opacity-40')} value={provider} onChange={(e) => setProvider(e.target.value)} placeholder="codex" disabled={!isNew} />
+      <input className={field + ' min-w-0 w-full' + (isNew ? '' : ' opacity-40')} value={plan} onChange={(e) => setPlan(e.target.value)} placeholder="plus / *" disabled={!isNew} />
+      <input className={field + ' min-w-0 w-full'} type="number" step={0.1} min={0} value={pointsPerCall} onChange={(e) => setPointsPerCall(Number(e.target.value))} />
+      <input className={field + ' min-w-0 w-full'} value={label} onChange={(e) => setLabel(e.target.value)} placeholder="标签" />
       <input type="checkbox" checked={enabled} onChange={(e) => setEnabled(e.target.checked)} className="h-4 w-4 accent-emerald-500" />
-      <div className="flex gap-1">
+      <div className="flex flex-wrap gap-1">
         <button
+          type="button"
           onClick={() => onSave({ provider, plan, pointsPerCall, label, enabled: enabled ? 1 : 0 })}
           className="rounded-lg bg-[var(--brand)]/20 px-2.5 py-1.5 text-xs font-medium text-[var(--brand-bright)] hover:bg-[var(--brand)]/30"
         >
           {isNew ? '新增' : '保存'}
         </button>
         {onDelete && (
-          <button onClick={onDelete} className="rounded-lg bg-rose-500/10 px-2.5 py-1.5 text-xs text-rose-300 hover:bg-rose-500/20">
+          <button
+            type="button"
+            onClick={onDelete}
+            aria-label={`删除折算规则 ${provider} ${plan}`}
+            className="rounded-lg bg-rose-500/10 px-2.5 py-1.5 text-xs text-rose-300 hover:bg-rose-500/20"
+          >
             删
           </button>
         )}
@@ -923,32 +1416,62 @@ function ItemRow({
   onSave,
   onDelete,
   isNew,
+  saving,
 }: {
   item?: RedeemItem
-  onSave: (it: Partial<RedeemItem>) => void
+  onSave: (it: Partial<RedeemItem>, rowKey: string, idempotencyKey?: string) => Promise<boolean>
   onDelete?: () => void
   isNew?: boolean
+  saving: boolean
 }) {
   const [name, setName] = useState(item?.name ?? '')
   const [cost, setCost] = useState(item?.cost ?? 0)
   const [kind, setKind] = useState(item?.kind ?? 'timed_quota')
-  const [fulfillment, setFulfillment] = useState(item?.fulfillment ?? 'placeholder')
+  const [fulfillment, setFulfillment] = useState<'placeholder' | 'cdk'>(item?.fulfillment ?? 'placeholder')
   const [perUserLimit, setPerUserLimit] = useState(item?.perUserLimit ?? 0)
   const [description, setDescription] = useState(item?.description ?? '')
   const [enabled, setEnabled] = useState((item?.enabled ?? 1) !== 0)
+  const createIntentKey = useRef<string | null>(null)
+
+  const changed = () => {
+    if (isNew) createIntentKey.current = null
+  }
+
+  const submit = async () => {
+    const rowKey = item ? `item:${item.id}` : 'new'
+    if (isNew && !createIntentKey.current) createIntentKey.current = crypto.randomUUID()
+    const saved = await onSave(
+      { id: item?.id, name, cost, kind, fulfillment, perUserLimit, description, sort: item?.sort ?? 0, enabled: enabled ? 1 : 0 },
+      rowKey,
+      isNew ? createIntentKey.current ?? undefined : undefined,
+    )
+    if (saved && isNew) {
+      setName('')
+      setCost(0)
+      setKind('timed_quota')
+      setFulfillment('placeholder')
+      setPerUserLimit(0)
+      setDescription('')
+      setEnabled(true)
+      createIntentKey.current = null
+    }
+  }
 
   return (
-    <div className="grid grid-cols-[1.2fr_80px_1fr_1fr_72px_1.2fr_auto_auto] items-center gap-2">
-      <input className={field} value={name} onChange={(e) => setName(e.target.value)} placeholder="名称" />
-      <input className={field} type="number" value={cost} onChange={(e) => setCost(Number(e.target.value))} />
-      <select className={field} value={kind} onChange={(e) => setKind(e.target.value)}>
+    <div
+      data-testid={isNew ? 'redeem-item-new-row' : `redeem-item-row-${item?.id}`}
+      className="grid min-w-0 grid-cols-1 items-center gap-2 sm:grid-cols-[1.2fr_80px_1fr_1fr_72px_1.2fr_auto_auto]"
+    >
+      <input className={field + ' min-w-0 w-full'} value={name} disabled={saving} onChange={(e) => { changed(); setName(e.target.value) }} placeholder="名称" />
+      <input className={field + ' min-w-0 w-full'} type="number" value={cost} disabled={saving} onChange={(e) => { changed(); setCost(Number(e.target.value)) }} />
+      <select className={field + ' min-w-0 w-full'} value={kind} disabled={saving} onChange={(e) => { changed(); setKind(e.target.value) }}>
         {KINDS.map((k) => (
           <option key={k.v} value={k.v}>
             {k.t}
           </option>
         ))}
       </select>
-      <select className={field} value={fulfillment} onChange={(e) => setFulfillment(e.target.value)} title="履约类型">
+      <select className={field + ' min-w-0 w-full'} value={fulfillment} disabled={saving} onChange={(e) => { changed(); setFulfillment(e.target.value as 'placeholder' | 'cdk') }} title="履约类型">
         {FULFILLMENTS.map((f) => (
           <option key={f.v} value={f.v}>
             {f.t}
@@ -956,27 +1479,34 @@ function ItemRow({
         ))}
       </select>
       <input
-        className={field}
+        className={field + ' min-w-0 w-full'}
         type="number"
         min={0}
         value={perUserLimit}
-        onChange={(e) => setPerUserLimit(Number(e.target.value))}
+        disabled={saving}
+        onChange={(e) => { changed(); setPerUserLimit(Number(e.target.value)) }}
         title="每人限购（0=不限）"
         placeholder="限购"
       />
-      <input className={field} value={description} onChange={(e) => setDescription(e.target.value)} placeholder="说明" />
-      <input type="checkbox" checked={enabled} onChange={(e) => setEnabled(e.target.checked)} className="h-4 w-4 accent-emerald-500" />
-      <div className="flex gap-1">
+      <input className={field + ' min-w-0 w-full'} value={description} disabled={saving} onChange={(e) => { changed(); setDescription(e.target.value) }} placeholder="说明" />
+      <input type="checkbox" checked={enabled} disabled={saving} onChange={(e) => { changed(); setEnabled(e.target.checked) }} className="h-4 w-4 accent-emerald-500" />
+      <div className="flex flex-wrap gap-1">
         <button
-          onClick={() =>
-            onSave({ id: item?.id, name, cost, kind, fulfillment, perUserLimit, description, sort: item?.sort ?? 0, enabled: enabled ? 1 : 0 })
-          }
-          className="rounded-lg bg-[var(--brand)]/20 px-2.5 py-1.5 text-xs font-medium text-[var(--brand-bright)] hover:bg-[var(--brand)]/30"
+          type="button"
+          data-testid="redeem-item-save"
+          onClick={() => void submit()}
+          disabled={saving}
+          className="rounded-lg bg-[var(--brand)]/20 px-2.5 py-1.5 text-xs font-medium text-[var(--brand-bright)] hover:bg-[var(--brand)]/30 disabled:cursor-not-allowed disabled:opacity-50"
         >
-          {isNew ? '新增' : '保存'}
+          {saving ? '保存中…' : isNew ? '新增' : '保存'}
         </button>
         {onDelete && (
-          <button onClick={onDelete} className="rounded-lg bg-rose-500/10 px-2.5 py-1.5 text-xs text-rose-300 hover:bg-rose-500/20">
+          <button
+            type="button"
+            onClick={onDelete}
+            aria-label={`删除兑换项 ${name}`}
+            className="rounded-lg bg-rose-500/10 px-2.5 py-1.5 text-xs text-rose-300 hover:bg-rose-500/20"
+          >
             删
           </button>
         )}

@@ -37,7 +37,7 @@ export default function Leaderboard({ refreshKey, meId }: { refreshKey: number; 
   const showMeRow = me && me.points > 0 && !meInList
 
   return (
-    <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-6">
+    <div className="min-w-0 rounded-2xl border border-white/10 bg-white/[0.03] p-6">
       <h3 className="mb-4 flex items-center gap-2 font-bold text-white">
         <TrophyIcon size={18} weight="fill" className="text-[var(--brand-bright)]" />
         贡献排行榜
@@ -63,7 +63,7 @@ export default function Leaderboard({ refreshKey, meId }: { refreshKey: number; 
                     : 'hover:bg-white/5'
                 }`}
               >
-                <div className="flex items-center gap-3">
+                <div className="min-w-0 flex items-center gap-3">
                   <span className="flex w-6 justify-center">
                     {i < 3 ? (
                       <MedalIcon size={18} weight="fill" color={MEDAL_COLOR[i]} />
@@ -71,7 +71,7 @@ export default function Leaderboard({ refreshKey, meId }: { refreshKey: number; 
                       <span className="mono text-xs text-neutral-500">{i + 1}</span>
                     )}
                   </span>
-                  <span className={`text-sm ${isMe ? 'font-semibold text-white' : 'text-neutral-200'}`}>
+                  <span className={`min-w-0 truncate text-sm ${isMe ? 'font-semibold text-white' : 'text-neutral-200'}`}>
                     @{e.username}
                     {isMe && <span className="ml-1.5 text-[10px] text-[var(--brand-bright)]">你</span>}
                   </span>

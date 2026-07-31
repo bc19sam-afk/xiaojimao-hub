@@ -23,17 +23,17 @@ export default function StatCards({ list, balance }: { list: Contribution[]; bal
   ]
 
   return (
-    <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+    <div className="grid min-w-0 grid-cols-2 gap-3 sm:grid-cols-4">
       {stats.map((s) => (
         <div
           key={s.label}
-          className="flex items-center gap-3 rounded-2xl border border-white/10 bg-white/[0.03] px-4 py-3.5"
+          className="min-w-0 flex items-center gap-3 rounded-2xl border border-white/10 bg-white/[0.03] px-4 py-3.5"
         >
           <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-white/5">
             <s.Icon size={18} weight="bold" className={s.color} />
           </div>
           <div className="min-w-0">
-            <div className={`mono text-xl font-black leading-none ${s.color}`}>{s.value}</div>
+            <div className={`mono max-w-full break-all text-lg font-black leading-tight sm:text-xl ${s.color}`}>{s.value}</div>
             <div className="mt-1 truncate text-xs text-neutral-500">{s.label}</div>
           </div>
         </div>

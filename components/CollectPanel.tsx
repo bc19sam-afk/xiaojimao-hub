@@ -134,7 +134,7 @@ export default function CollectPanel({ onDone }: { onDone: () => void }) {
   }
 
   return (
-    <div className="rounded-2xl border border-[var(--brand)]/25 bg-white/[0.03] p-6 shadow-[0_0_50px_-18px_rgba(16,163,127,0.45)]">
+    <div className="min-w-0 rounded-2xl border border-[var(--brand)]/25 bg-white/[0.03] p-4 shadow-[0_0_50px_-18px_rgba(16,163,127,0.45)] sm:p-6">
       <div className="mb-1 flex items-center gap-2">
         <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-400/15 px-2.5 py-1 text-xs font-semibold text-emerald-300">
           <GiftIcon size={14} weight="fill" /> 验证通过按类型发积分
@@ -143,15 +143,19 @@ export default function CollectPanel({ onDone }: { onDone: () => void }) {
       <h2 className="mt-3 text-lg font-black text-white sm:text-2xl">贡献账号，赚积分兑好礼</h2>
 
       {/* provider 选择 */}
-      <div className="mt-4 grid grid-cols-3 gap-2">
+      <div className="mt-4 grid grid-cols-1 gap-2 sm:grid-cols-3">
         {PROVIDERS.map((p) => (
           <button
             key={p.id}
+            type="button"
+            data-provider-option={p.id}
+            aria-label={`${p.name} ${p.sub}`}
+            aria-pressed={provider === p.id}
             onClick={() => {
               setProvider(p.id)
               reset()
             }}
-            className={`rounded-xl border px-2 py-2.5 text-center transition ${
+            className={`min-w-0 rounded-xl border px-3 py-2.5 text-center transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400 ${
               provider === p.id
                 ? 'border-[var(--brand)]/50 bg-[var(--brand)]/10'
                 : 'border-white/10 bg-white/[0.02] hover:bg-white/5'
@@ -160,7 +164,7 @@ export default function CollectPanel({ onDone }: { onDone: () => void }) {
             <div className={`text-sm font-semibold ${provider === p.id ? 'text-white' : 'text-neutral-300'}`}>
               {p.name}
             </div>
-            <div className="mt-0.5 text-[10px] text-neutral-500">{p.sub}</div>
+            <div className="mt-0.5 whitespace-normal break-words text-[10px] leading-relaxed text-neutral-500">{p.sub}</div>
           </button>
         ))}
       </div>

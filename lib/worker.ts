@@ -1,6 +1,4 @@
 import path from 'node:path'
-import { checkPooledHealth, processPending } from './collect'
-import { settleDailyUsage } from './settle'
 import { dailyBackupIfDue, parseBackupKeep } from './backup'
 import { env } from './env'
 
@@ -15,6 +13,46 @@ import { env } from './env'
 // ============================================================================
 
 let started = false
+type WorkerTasks = {
+  processPending: typeof import('./collect').processPending
+  checkPooledHealth: typeof import('./collect').checkPooledHealth
+  settleDailyUsage: typeof import('./settle').settleDailyUsage
+}
+let loadedTasks: WorkerTasks | undefined
+let readinessWarningShown = false
+
+async function loadReadyWorkerTasks(): Promise<WorkerTasks | undefined> {
+  try {
+    // Fresh-connection gate first: collect/settle both depend on the resident DB singleton and
+    // must not be imported until the canonical schema and write probe pass.
+    const { assertReadinessDatabase } = await import('./readiness-probe')
+    await assertReadinessDatabase()
+    readinessWarningShown = false
+  } catch {
+    if (!readinessWarningShown) {
+      console.error('[worker] 数据库尚未就绪（后台巡检等待恢复）')
+      readinessWarningShown = true
+    }
+    return undefined
+  }
+
+  if (loadedTasks) return loadedTasks
+  try {
+    const collect = await import('./collect')
+    const settle = await import('./settle')
+    loadedTasks = {
+      processPending: collect.processPending,
+      checkPooledHealth: collect.checkPooledHealth,
+      settleDailyUsage: settle.settleDailyUsage,
+    }
+    return loadedTasks
+  } catch {
+    // lib/db uses a retryable lazy connection, so a DB race here cannot poison module loading;
+    // any unrelated module failure remains isolated from liveness and is reported without details.
+    console.error('[worker] 后台模块加载失败（本轮跳过）')
+    return undefined
+  }
+}
 
 // ===== 每日自动备份（P6-R2，见 lib/backup.ts 的防 churn 说明）=====
 // 备份路径口径与 scripts/backup.ts 逐字对齐（同一套 env 默认值），保证手动/自动两条入口写同一个目录。
@@ -175,6 +213,10 @@ export function startWorker() {
   started = true
 
   const tick = async () => {
+    const tasks = await loadReadyWorkerTasks()
+    if (!tasks) return
+    const { processPending, checkPooledHealth, settleDailyUsage } = tasks
+
     // 本轮三段（首检/存活巡检/结算）是否全部没抛——dead-man 心跳的前提：有段抛错就不 ping，
     // 让外部服务在约定超时后告警。备份段（第四段）不计入：备份失败该单独告警，不该把
     // 「收号链路正常」的信号也一起掐掉（会掩盖真正的主链路故障判断）。
