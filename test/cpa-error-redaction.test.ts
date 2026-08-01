@@ -15,6 +15,7 @@ import assert from 'node:assert/strict'
 
 let cpa: typeof import('../lib/cpa.ts').cpa
 let CPA_UNAVAILABLE: string
+let isAuthFileUploadOutcomeUnknown: typeof import('../lib/cpa.ts').isAuthFileUploadOutcomeUnknown
 
 // 桩响应体里塞「像密钥/内部路径的原文」，断言它绝不出现在对外 message
 const LEAK = 'INTERNAL cpamp secret path /etc/xxx tok_leak'
@@ -40,6 +41,7 @@ before(async () => {
   const mod = await import('../lib/cpa.ts')
   cpa = mod.cpa
   CPA_UNAVAILABLE = mod.CPA_UNAVAILABLE
+  isAuthFileUploadOutcomeUnknown = mod.isAuthFileUploadOutcomeUnknown
 })
 
 // ① req()：cpamp 500 响应原文不进 Error.message，抛中性常量
@@ -86,6 +88,7 @@ test('② 上传失败脱敏：cpamp auth-files 500 响应原文不透传，抛�
   const err = captured.error
   assert.ok(err, '应抛错')
   assert.equal(err.message, CPA_UNAVAILABLE)
+  assert.equal(isAuthFileUploadOutcomeUnknown(err), true, 'auth-file POST 后失败必须标记为结果未知')
   assert.ok(!err.message.includes('tok_leak'), '不含响应体原文')
   assert.ok(!err.message.includes('500'), '不含状态码')
   assert.deepEqual(signaled.sort(), ['token', 'upload'], 'RT exchange 与 auth-file upload 都必须带 AbortSignal')
@@ -126,6 +129,7 @@ test('④ 保留业务提示：RT 无效仍给「Refresh Token 无效或已过�
   assert.ok(err, '应抛错')
   assert.ok(err.message.includes('Refresh Token'), '业务提示保留')
   assert.notEqual(err.message, CPA_UNAVAILABLE)
+  assert.equal(isAuthFileUploadOutcomeUnknown(err), false, 'token exchange 明确拒绝发生在上传前')
 })
 
 test('⑤ redirect OAuth 瞬态 4xx 保持可重试；明确 status=error 才标记 terminal', async () => {

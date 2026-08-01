@@ -2,6 +2,8 @@ import { randomBytes } from 'crypto'
 import { setTimeout as sleep } from 'node:timers/promises'
 import {
   cpa,
+  CPA_UNAVAILABLE,
+  isAuthFileUploadOutcomeUnknown,
   MAX_OAUTH_FINISH_DURATION_MS,
   type AuthFile,
   type CpaClient,
@@ -139,6 +141,7 @@ const OAUTH_OPERATION_BUSY_ERROR = '授权会话正在处理中，请稍后重�
 const OAUTH_SESSION_CREATE_ERROR = '授权会话创建失败，请重新发起授权'
 const OAUTH_START_LEASE_TTL_MS = 60_000
 const RT_PROVIDER_LEASE_TTL_MS = DEFAULT_OUTBOUND_TIMEOUT_MS * 3 + 60_000
+const RT_FINALIZATION_TTL_MS = DEFAULT_OUTBOUND_TIMEOUT_MS + 60_000
 const OAUTH_REDIRECT_TTL_MS = 15 * 60_000
 const OAUTH_DEVICE_MAX_TTL_SECONDS = 30 * 60
 // 覆盖 redirect finish 的最坏外呼上界、随后 isolate 的一次外呼，以及 60s 调度/本地处理余量。
@@ -429,17 +432,21 @@ export async function ingestRT(user: SessionUser, rt: string): Promise<CollectRe
   // 单写者合同：本应用内所有会创建 auth-file 的 producer 必须共享 provider lease。OAuth 会话已
   // 持有长租约；RT 也先抢同一 codex 租约，避免它在 OAuth 快照后并发落文件并被错认归属。
   const leaseToken = randomBytes(24).toString('hex')
+  let leaseCreatedAt = 0
+  let leaseExpiresAt = 0
   let acquired = false
   for (const delayMs of OAUTH_LEASE_RETRY_DELAYS_MS) {
     if (delayMs > 0) await sleep(delayMs)
     const now = Date.now()
     db.cleanupOAuthSessions(now)
+    leaseCreatedAt = now
+    leaseExpiresAt = now + RT_PROVIDER_LEASE_TTL_MS
     acquired = db.acquireOAuthProviderLease({
       provider: 'codex',
       linuxdoId: user.id,
       leaseToken,
       now,
-      expiresAt: now + RT_PROVIDER_LEASE_TTL_MS,
+      expiresAt: leaseExpiresAt,
     })
     if (acquired) break
   }
@@ -448,13 +455,53 @@ export async function ingestRT(user: SessionUser, rt: string): Promise<CollectRe
     return { ok: false, code: error.code, error: error.message }
   }
 
+  let retainLeaseUntilExpiry = false
   try {
     const known = db.accountIdsFor('codex') // RT 仅 codex
     const result = await cpa.ingestRefreshToken(rt, known)
+    if (result.duplicate) return duplicateIngest()
+    // realClient 的 non-duplicate 正常返回只可能发生在 auth-file POST 成功之后；即使返回形状
+    // 意外残缺，也按「文件可能已落地」保留 fence，而不是释放后让 OAuth 误认晚到文件。
+    retainLeaseUntilExpiry = true
+    if (!result.accountId) return missingIngestIdentity()
+
+    const finalizationNow = Date.now()
+    const finalizationExpiresAt = Math.max(
+      leaseExpiresAt,
+      finalizationNow + RT_FINALIZATION_TTL_MS,
+    )
+    // ingestRefreshToken 正常返回即证明 auth-file POST 成功；从此任何 generation CAS/隔离/DB
+    // 未知结果都不能按旧 token 主动放租，必须让当前有界 fence 自然到期或由原子 finalizer 删除。
+    if (!db.beginRTFinalization({
+      provider: 'codex',
+      linuxdoId: user.id,
+      leaseToken,
+      leaseCreatedAt,
+      expectedExpiresAt: leaseExpiresAt,
+      now: finalizationNow,
+      finalizationExpiresAt,
+    })) {
+      throw new Error(CPA_UNAVAILABLE)
+    }
     await isolate(result.authFileName)
-    return recordIngest(user, 'codex', result, 'rt')
+    const contribution = buildContribution(user, 'codex', result, 'rt')
+    const finalized = db.finalizeRTIngest({
+      provider: 'codex',
+      linuxdoId: user.id,
+      leaseToken,
+      leaseCreatedAt,
+      expectedExpiresAt: finalizationExpiresAt,
+      now: Date.now(),
+      contribution,
+    })
+    if (finalized.status === 'stale') throw new Error(CPA_UNAVAILABLE)
+    if (finalized.status === 'duplicate') return duplicateIngest()
+    return { ok: true, contribution }
+  } catch (error) {
+    if (isAuthFileUploadOutcomeUnknown(error)) retainLeaseUntilExpiry = true
+    throw error
   } finally {
-    db.releaseOAuthProviderLease('codex', leaseToken)
+    if (!retainLeaseUntilExpiry) db.releaseOAuthProviderLease('codex', leaseToken)
   }
 }
 

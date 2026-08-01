@@ -274,6 +274,24 @@ function authHeaders(extra?: Record<string, string>): Record<string, string> {
 // cpamp HTTP 报错对外统一中性文案（§8）：绝不把状态码/响应体/内部 API 路径透传前端。
 // 出站层日志只保留固定 service/operation、错误类别与状态码，不记录 URL 或响应体。
 export const CPA_UNAVAILABLE = '账号服务暂时不可用，请稍后重试'
+export const INVALID_REFRESH_TOKEN_ERROR = 'Refresh Token 无效或已过期'
+
+// auth-file POST 已进入出站层后，timeout/network/HTTP 失败都不能证明服务端未落文件。
+// 用固定类型把「结果未知」带回 collect 层，让 provider fence 保留到有界 expiry；不携带原始错误。
+export class AuthFileUploadOutcomeUnknownError extends Error {
+  readonly name = 'AuthFileUploadOutcomeUnknownError'
+
+  constructor() {
+    super(CPA_UNAVAILABLE)
+  }
+}
+
+export function isAuthFileUploadOutcomeUnknown(
+  error: unknown,
+): error is AuthFileUploadOutcomeUnknownError {
+  return error instanceof AuthFileUploadOutcomeUnknownError
+}
+
 function oauthTerminal(message = '授权失败'): Error {
   return Object.assign(new Error(message), { oauthTerminal: true })
 }
@@ -640,7 +658,7 @@ const realClient: CpaClient = {
         error.kind === 'http' &&
         (error.status === 400 || error.status === 401)
       ) {
-        throw new Error('Refresh Token 无效或已过期')
+        throw new Error(INVALID_REFRESH_TOKEN_ERROR)
       }
       throw new Error(CPA_UNAVAILABLE)
     }
@@ -665,8 +683,11 @@ const realClient: CpaClient = {
         { method: 'POST', headers: authHeaders(), body: form },
         { service: 'cpa', operation: 'auth_file_upload' },
       )
-    } catch {
-      throw new Error(CPA_UNAVAILABLE)
+    } catch (error) {
+      if (error instanceof OutboundRequestError) {
+        throw new AuthFileUploadOutcomeUnknownError()
+      }
+      throw error
     }
     return { accountId, email, plan: 'unknown', authFileName: fileName, duplicate: false }
   },

@@ -13,6 +13,8 @@ let db: typeof import('../lib/db.ts').db
 let collect: typeof import('../lib/collect.ts')
 let cpa: CpaClient
 let maxOAuthFinishDurationMs: number
+let cpaUnavailable: string
+let AuthFileUploadOutcomeUnknownError: typeof import('../lib/cpa.ts').AuthFileUploadOutcomeUnknownError
 let tmpDir: string
 let dbPath: string
 let originalCpa: Pick<
@@ -47,6 +49,13 @@ function oauthContribution(
     rewardNote: '',
     createdAt: now,
     updatedAt: now,
+  }
+}
+
+function rtContribution(linuxdoId: number, accountId: string): Contribution {
+  return {
+    ...oauthContribution(linuxdoId, 'codex', accountId),
+    method: 'rt',
   }
 }
 
@@ -137,6 +146,8 @@ before(async () => {
   const cpaModule = await import('../lib/cpa.ts')
   cpa = cpaModule.cpa
   maxOAuthFinishDurationMs = cpaModule.MAX_OAUTH_FINISH_DURATION_MS
+  cpaUnavailable = cpaModule.CPA_UNAVAILABLE
+  AuthFileUploadOutcomeUnknownError = cpaModule.AuthFileUploadOutcomeUnknownError
   db.getOAuthSnapshot('bootstrap') // force lazy openDb() so MOCK migration finishes before raw cleanup connections
   originalCpa = {
     startOAuth: cpa.startOAuth,
@@ -989,6 +1000,240 @@ test('single-writer contract holds the RT lease through upload and blocks OAuth 
   const oauth = await collect.startOAuth(user(127), 'codex')
   assert.equal(oauth.state, 'after-rt-state')
   assert.equal(oauthStarts, 1)
+})
+
+test('ambiguous RT auth-file upload retains a bounded provider fence with zero isolation or writes', async () => {
+  let rtUploads = 0
+  let oauthStarts = 0
+  let isolateCalls = 0
+  cpa.ingestRefreshToken = async () => {
+    rtUploads++
+    throw new AuthFileUploadOutcomeUnknownError()
+  }
+  cpa.listAuthFiles = async () => []
+  cpa.startOAuth = async () => {
+    oauthStarts++
+    return { state: 'must-not-start-after-ambiguous-rt', url: 'https://example.test/oauth', flow: 'redirect' }
+  }
+  cpa.setDisabled = async () => {
+    isolateCalls++
+  }
+
+  const error = await collect.ingestRT(user(128), 'refresh-token-ambiguous').then(
+    () => null,
+    (caught) => caught as Error,
+  )
+
+  assert.equal(error?.message, cpaUnavailable)
+  assert.equal(rtUploads, 1)
+  assert.equal(isolateCalls, 0)
+  assert.equal(db.balance(128), 0)
+  const raw = rawDb()
+  const lease = raw.prepare(
+    `SELECT lease_token AS leaseToken, linuxdo_id AS linuxdoId,
+            created_at AS createdAt, expires_at AS expiresAt
+     FROM oauth_provider_leases WHERE provider='codex'`,
+  ).get() as { leaseToken: string; linuxdoId: number; createdAt: number; expiresAt: number }
+  const contribution = raw.prepare('SELECT COUNT(*) AS n FROM contributions').get() as { n: number }
+  raw.close()
+  assert.equal(lease.linuxdoId, 128)
+  assert.ok(lease.expiresAt > Date.now(), 'ambiguous upload fence must remain active but bounded')
+  assert.equal(contribution.n, 0)
+
+  await assert.rejects(
+    () => collect.startOAuth(user(129), 'codex'),
+    (caught: unknown) =>
+      typeof caught === 'object' &&
+      caught !== null &&
+      'code' in caught &&
+      (caught as { code?: unknown }).code === 'PROVIDER_BUSY',
+  )
+  assert.equal(oauthStarts, 0, 'a successor OAuth must stop before CPA while the ambiguous RT fence is active')
+  assert.equal(
+    db.acquireOAuthProviderLease({
+      provider: 'codex',
+      linuxdoId: 130,
+      leaseToken: 'before-ambiguous-expiry',
+      now: lease.expiresAt - 1,
+      expiresAt: lease.expiresAt + 60_000,
+    }),
+    false,
+  )
+  assert.equal(
+    db.acquireOAuthProviderLease({
+      provider: 'codex',
+      linuxdoId: 130,
+      leaseToken: 'at-ambiguous-expiry',
+      now: lease.expiresAt,
+      expiresAt: lease.expiresAt + 60_000,
+    }),
+    true,
+  )
+})
+
+test('late RT upload results revalidate the exact provider lease generation before isolation', async () => {
+  const mutations = ['token', 'owner', 'created-at', 'expiry'] as const
+
+  for (const [index, mutation] of mutations.entries()) {
+    clearOAuthState()
+    let rtUploads = 0
+    let isolateCalls = 0
+    let releaseUpload!: () => void
+    const uploadBarrier = new Promise<void>((resolve) => {
+      releaseUpload = resolve
+    })
+    const accountId = `late-rt-${mutation}`
+    cpa.ingestRefreshToken = async () => {
+      rtUploads++
+      await uploadBarrier
+      return {
+        accountId,
+        email: '',
+        plan: 'plus',
+        authFileName: `codex-${accountId}.json`,
+        duplicate: false,
+      }
+    }
+    cpa.setDisabled = async () => {
+      isolateCalls++
+    }
+
+    const linuxdoId = 140 + index
+    const pending = collect.ingestRT(user(linuxdoId), `refresh-token-${mutation}`)
+    await waitUntil(() => rtUploads === 1)
+
+    const raw = rawDb()
+    const lease = raw.prepare(
+      `SELECT lease_token AS leaseToken, linuxdo_id AS linuxdoId,
+              created_at AS createdAt, expires_at AS expiresAt
+       FROM oauth_provider_leases WHERE provider='codex'`,
+    ).get() as { leaseToken: string; linuxdoId: number; createdAt: number; expiresAt: number }
+    if (mutation === 'token') {
+      raw.prepare("UPDATE oauth_provider_leases SET lease_token='replacement-token' WHERE provider='codex'").run()
+    } else if (mutation === 'owner') {
+      raw.prepare('UPDATE oauth_provider_leases SET linuxdo_id=? WHERE provider=?').run(999, 'codex')
+    } else if (mutation === 'created-at') {
+      raw.prepare('UPDATE oauth_provider_leases SET created_at=? WHERE provider=?').run(lease.createdAt + 1, 'codex')
+    } else {
+      raw.prepare('UPDATE oauth_provider_leases SET expires_at=? WHERE provider=?').run(lease.expiresAt + 1, 'codex')
+    }
+    raw.close()
+
+    releaseUpload()
+    const error = await pending.then(() => null, (caught) => caught as Error)
+    assert.equal(error?.message, cpaUnavailable, mutation)
+    assert.equal(isolateCalls, 0, `${mutation}: stale RT must stop before isolation`)
+    assert.equal(db.balance(linuxdoId), 0, mutation)
+    const verify = rawDb()
+    const contribution = verify.prepare(
+      'SELECT COUNT(*) AS n FROM contributions WHERE account_id=?',
+    ).get(accountId) as { n: number }
+    const retained = verify.prepare(
+      `SELECT lease_token AS leaseToken, linuxdo_id AS linuxdoId,
+              created_at AS createdAt, expires_at AS expiresAt
+       FROM oauth_provider_leases WHERE provider='codex'`,
+    ).get() as { leaseToken: string; linuxdoId: number; createdAt: number; expiresAt: number }
+    verify.close()
+    assert.equal(contribution.n, 0, mutation)
+    if (mutation === 'token') assert.equal(retained.leaseToken, 'replacement-token')
+    if (mutation === 'owner') assert.equal(retained.linuxdoId, 999)
+    if (mutation === 'created-at') assert.equal(retained.createdAt, lease.createdAt + 1)
+    if (mutation === 'expiry') assert.equal(retained.expiresAt, lease.expiresAt + 1)
+  }
+})
+
+test('RT finalization rechecks the exact lease after isolation and rolls back contribution writes', async () => {
+  let isolateCalls = 0
+  let releaseIsolate!: () => void
+  const isolateBarrier = new Promise<void>((resolve) => {
+    releaseIsolate = resolve
+  })
+  cpa.ingestRefreshToken = async () => ({
+    accountId: 'rt-stale-during-isolate',
+    email: '',
+    plan: 'plus',
+    authFileName: 'codex-rt-stale-during-isolate.json',
+    duplicate: false,
+  })
+  cpa.setDisabled = async () => {
+    isolateCalls++
+    await isolateBarrier
+  }
+
+  const pending = collect.ingestRT(user(150), 'refresh-token-stale-during-isolate')
+  await waitUntil(() => isolateCalls === 1)
+  const raw = rawDb()
+  const active = raw.prepare(
+    `SELECT expires_at AS expiresAt FROM oauth_provider_leases WHERE provider='codex'`,
+  ).get() as { expiresAt: number }
+  raw.prepare(
+    `UPDATE oauth_provider_leases
+     SET lease_token='replacement-after-isolate', linuxdo_id=999, created_at=created_at+1, expires_at=?
+     WHERE provider='codex'`,
+  ).run(active.expiresAt + 60_000)
+  raw.close()
+
+  releaseIsolate()
+  const error = await pending.then(() => null, (caught) => caught as Error)
+  assert.equal(error?.message, cpaUnavailable)
+  assert.equal(db.balance(150), 0)
+  const verify = rawDb()
+  const contribution = verify.prepare(
+    "SELECT COUNT(*) AS n FROM contributions WHERE account_id='rt-stale-during-isolate'",
+  ).get() as { n: number }
+  const replacement = verify.prepare(
+    `SELECT lease_token AS leaseToken, linuxdo_id AS linuxdoId
+     FROM oauth_provider_leases WHERE provider='codex'`,
+  ).get() as { leaseToken: string; linuxdoId: number }
+  verify.close()
+  assert.equal(contribution.n, 0)
+  assert.deepEqual({ ...replacement }, { leaseToken: 'replacement-after-isolate', linuxdoId: 999 })
+})
+
+test('atomic RT finalizer rejects an expired exact generation with zero contribution writes', () => {
+  const leaseToken = 'rt-expired-finalizer-token'
+  assert.equal(
+    db.acquireOAuthProviderLease({
+      provider: 'codex',
+      linuxdoId: 151,
+      leaseToken,
+      now: 100,
+      expiresAt: 200,
+    }),
+    true,
+  )
+  assert.equal(
+    db.beginRTFinalization({
+      provider: 'codex',
+      linuxdoId: 151,
+      leaseToken,
+      leaseCreatedAt: 100,
+      expectedExpiresAt: 200,
+      now: 110,
+      finalizationExpiresAt: 300,
+    }),
+    true,
+  )
+
+  assert.deepEqual(
+    db.finalizeRTIngest({
+      provider: 'codex',
+      linuxdoId: 151,
+      leaseToken,
+      leaseCreatedAt: 100,
+      expectedExpiresAt: 300,
+      now: 300,
+      contribution: rtContribution(151, 'rt-expired-finalizer-account'),
+    }),
+    { status: 'stale' },
+  )
+  const raw = rawDb()
+  const contribution = raw.prepare(
+    "SELECT COUNT(*) AS n FROM contributions WHERE account_id='rt-expired-finalizer-account'",
+  ).get() as { n: number }
+  raw.close()
+  assert.equal(contribution.n, 0)
+  assert.equal(db.balance(151), 0)
 })
 
 test('atomic OAuth ingest revalidates operation token, provider lease, and hard expiry with zero writes', () => {

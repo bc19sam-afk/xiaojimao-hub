@@ -112,6 +112,31 @@ export type OAuthIngestFinalizationResult =
   | { status: 'cancelled' }
   | { status: 'stale' }
 
+export interface RTLeaseFinalizationClaim {
+  provider: string
+  linuxdoId: number
+  leaseToken: string
+  leaseCreatedAt: number
+  expectedExpiresAt: number
+  now: number
+  finalizationExpiresAt: number
+}
+
+export interface RTIngestFinalization {
+  provider: string
+  linuxdoId: number
+  leaseToken: string
+  leaseCreatedAt: number
+  expectedExpiresAt: number
+  now: number
+  contribution: Contribution
+}
+
+export type RTIngestFinalizationResult =
+  | { status: 'committed' }
+  | { status: 'duplicate' }
+  | { status: 'stale' }
+
 const DB_PATH = process.env.DB_PATH || path.join(process.cwd(), 'data', 'app.db')
 
 interface DbFileIdentity {
@@ -1168,6 +1193,99 @@ export const db = {
     return conn
       .prepare('DELETE FROM oauth_provider_leases WHERE provider=? AND lease_token=?')
       .run(provider, leaseToken).changes === 1
+  },
+
+  // RT 上传成功后、isolate 前的 generation CAS。外部 await 期间 lease 的 token/owner/created/expiry
+  // 任一变化都表示本请求已失去因果所有权；只允许精确旧 generation 延长到覆盖 isolate 的有界窗口。
+  beginRTFinalization(input: RTLeaseFinalizationClaim): boolean {
+    if (
+      !input.provider ||
+      !input.leaseToken ||
+      input.expectedExpiresAt <= input.now ||
+      input.finalizationExpiresAt < input.expectedExpiresAt
+    ) return false
+    return conn
+      .prepare(
+        `UPDATE oauth_provider_leases
+         SET expires_at=?
+         WHERE provider=? AND lease_token=? AND linuxdo_id=?
+           AND created_at=? AND expires_at=? AND expires_at>?`,
+      )
+      .run(
+        input.finalizationExpiresAt,
+        input.provider,
+        input.leaseToken,
+        input.linuxdoId,
+        input.leaseCreatedAt,
+        input.expectedExpiresAt,
+        input.now,
+      ).changes === 1
+  },
+
+  // isolate 后的 RT 唯一提交点。一个短事务内再次核验精确 lease generation 与 active expiry，
+  // 再原子插 contribution、清本人 rejection 并释放本 generation；stale 时零 DB mutation。
+  finalizeRTIngest(input: RTIngestFinalization): RTIngestFinalizationResult {
+    if (
+      !input.provider ||
+      !input.leaseToken ||
+      input.contribution.method !== 'rt' ||
+      input.contribution.provider !== input.provider ||
+      input.contribution.linuxdoId !== input.linuxdoId
+    ) return { status: 'stale' }
+
+    conn.exec('BEGIN IMMEDIATE')
+    try {
+      const lease = conn
+        .prepare(
+          `SELECT 1 FROM oauth_provider_leases
+           WHERE provider=? AND lease_token=? AND linuxdo_id=?
+             AND created_at=? AND expires_at=? AND expires_at>?`,
+        )
+        .get(
+          input.provider,
+          input.leaseToken,
+          input.linuxdoId,
+          input.leaseCreatedAt,
+          input.expectedExpiresAt,
+          input.now,
+        )
+      if (!lease) {
+        conn.exec('COMMIT')
+        return { status: 'stale' }
+      }
+
+      const inserted = insertContribution(input.contribution)
+      if (inserted) {
+        conn
+          .prepare('DELETE FROM rejections WHERE linuxdo_id=? AND provider=? AND account_id=?')
+          .run(input.linuxdoId, input.provider, input.contribution.accountId)
+      }
+
+      const released = conn
+        .prepare(
+          `DELETE FROM oauth_provider_leases
+           WHERE provider=? AND lease_token=? AND linuxdo_id=?
+             AND created_at=? AND expires_at=? AND expires_at>?`,
+        )
+        .run(
+          input.provider,
+          input.leaseToken,
+          input.linuxdoId,
+          input.leaseCreatedAt,
+          input.expectedExpiresAt,
+          input.now,
+        )
+      if (released.changes !== 1) {
+        conn.exec('ROLLBACK')
+        return { status: 'stale' }
+      }
+
+      conn.exec('COMMIT')
+      return { status: inserted ? 'committed' : 'duplicate' }
+    } catch (error) {
+      conn.exec('ROLLBACK')
+      throw error
+    }
   },
 
   // CPA start 返回 state 后才落会话。短事务内重新核验租约仍属于发起者且未过期，再 INSERT；
