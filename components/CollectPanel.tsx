@@ -2,10 +2,25 @@
 
 import { useEffect, useRef, useState } from 'react'
 import { GiftIcon, CaretRightIcon, KeyIcon, ArrowSquareOutIcon } from '@phosphor-icons/react'
+import { oauthClientDisposition, shouldClearOAuthSession, type OAuthErrorCode } from '@/lib/oauth-protocol'
 import { OpenAIMark } from './OpenAIMark'
 
 type Toast = { title: string; desc: string; ok: boolean } | null
 type Provider = 'codex' | 'claude' | 'grok'
+type OAuthSession = {
+  provider: Provider
+  url: string
+  state: string
+  flow: 'redirect' | 'device'
+  userCode?: string
+  expiresAt: number
+}
+type OAuthApiError = {
+  code: OAuthErrorCode
+  message: string
+  retryable: boolean
+  retryAfterMs?: number
+}
 
 const PROVIDERS: { id: Provider; name: string; sub: string }[] = [
   { id: 'codex', name: 'ChatGPT', sub: 'Plus / Pro / Team / K12' },
@@ -19,48 +34,108 @@ const inputCls =
 export default function CollectPanel({ onDone }: { onDone: () => void }) {
   const [provider, setProvider] = useState<Provider>('codex')
   const [busy, setBusy] = useState(false)
-  const [session, setSession] = useState<{ url: string; state: string; flow: 'redirect' | 'device'; userCode?: string } | null>(null)
+  const [session, setSession] = useState<OAuthSession | null>(null)
   const [callback, setCallback] = useState('')
   const [advanced, setAdvanced] = useState(false)
   const [rt, setRt] = useState('')
   const [toast, setToast] = useState<Toast>(null)
-  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const pollRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const onDoneRef = useRef(onDone)
 
-  const reset = () => {
+  useEffect(() => {
+    onDoneRef.current = onDone
+  }, [onDone])
+
+  const clearLocalSession = () => {
     setSession(null)
     setCallback('')
-    if (pollRef.current) clearInterval(pollRef.current)
+    if (pollRef.current) clearTimeout(pollRef.current)
     pollRef.current = null
   }
+
+  function apiError(payload: unknown): OAuthApiError | null {
+    if (!payload || typeof payload !== 'object' || !('error' in payload)) return null
+    const error = (payload as { error?: unknown }).error
+    if (!error || typeof error !== 'object') return null
+    const candidate = error as Partial<OAuthApiError>
+    if (typeof candidate.code !== 'string' || typeof candidate.message !== 'string') return null
+    return candidate as OAuthApiError
+  }
+
+  useEffect(() => {
+    if (session?.provider === provider) return
+    let active = true
+    void (async () => {
+      try {
+        const res = await fetch(`/api/collect/oauth/session?provider=${encodeURIComponent(provider)}`, {
+          cache: 'no-store',
+        })
+        const payload = await res.json().catch(() => ({}))
+        if (!active || !res.ok) return
+        setSession(payload.session ?? null)
+        setCallback('')
+      } catch {
+        // 恢复失败不伪造本地会话；用户仍可稍后重试或重新选择 provider。
+      }
+    })()
+    return () => {
+      active = false
+    }
+  }, [provider, session?.provider])
 
   // device 流程：自动轮询
   useEffect(() => {
     if (!session || session.flow !== 'device') return
-    pollRef.current = setInterval(async () => {
+    let stopped = false
+    const schedule = (delayMs: number) => {
+      if (stopped) return
+      pollRef.current = setTimeout(poll, Math.max(250, delayMs))
+    }
+    const poll = async () => {
       try {
         const res = await fetch('/api/collect/oauth/check', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ provider, state: session.state }),
+          body: JSON.stringify({ provider: session.provider, state: session.state }),
         })
-        const d = await res.json().catch(() => ({}))
-        if (d.done) {
-          reset()
-          if (d.error) setToast({ title: '授权失败', desc: d.error, ok: false })
-          else {
-            setToast({ title: '授权成功！', desc: d.message, ok: true })
-            onDone()
+        const payload = await res.json().catch(() => ({}))
+        if (stopped) return
+        if (res.status === 202) {
+          schedule(Number(payload.retryAfterMs) || 3000)
+          return
+        }
+        if (!res.ok) {
+          const error = apiError(payload)
+          const code = error?.code ?? 'CPA_UNAVAILABLE'
+          if (code === 'OAUTH_CANCELLED') {
+            setToast({ title: '已取消授权', desc: error?.message ?? '授权会话已取消', ok: true })
+          } else {
+            setToast({ title: '授权失败', desc: error?.message ?? '轮询失败，请稍后重试', ok: false })
           }
+          if (oauthClientDisposition(code) === 'clear') {
+            clearLocalSession()
+          } else {
+            schedule(error?.retryAfterMs ?? 3000)
+          }
+          return
+        }
+        if (payload.status === 'completed') {
+          clearLocalSession()
+          setToast({ title: '授权成功！', desc: payload.message, ok: true })
+          onDoneRef.current()
+          return
         }
       } catch {
-        /* 忽略单次轮询错误，继续 */
+        if (!stopped) schedule(3000)
       }
-    }, 3000)
-    return () => {
-      if (pollRef.current) clearInterval(pollRef.current)
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [session, provider])
+    schedule(3000)
+    return () => {
+      stopped = true
+      if (pollRef.current) clearTimeout(pollRef.current)
+      pollRef.current = null
+    }
+  }, [session])
 
   async function start() {
     setBusy(true)
@@ -71,9 +146,9 @@ export default function CollectPanel({ onDone }: { onDone: () => void }) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ provider }),
       })
-      const d = await res.json().catch(() => ({}))
-      if (!res.ok) throw new Error(d.error || '发起授权失败')
-      setSession({ url: d.url, state: d.state, flow: d.flow, userCode: d.userCode })
+      const payload = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(apiError(payload)?.message || '发起授权失败')
+      setSession(payload.session)
     } catch (e) {
       setToast({ title: '发起授权失败', desc: (e as Error).message, ok: false })
     } finally {
@@ -82,26 +157,59 @@ export default function CollectPanel({ onDone }: { onDone: () => void }) {
   }
 
   async function submitCallback() {
-    if (!callback.trim()) return
+    if (!callback.trim() || !session) return
     setBusy(true)
     try {
       const res = await fetch('/api/collect/oauth/finish', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ provider, redirect_url: callback.trim() }),
+        body: JSON.stringify({ provider: session.provider, redirect_url: callback.trim() }),
       })
-      const d = await res.json().catch(() => ({}))
-      if (res.status === 409) {
-        setToast({ title: '这个账号已贡献过', desc: '同一个账号只能贡献一次，换一个号试试。', ok: false })
-        reset()
+      const payload = await res.json().catch(() => ({}))
+      if (!res.ok) {
+        const error = apiError(payload)
+        const code = error?.code ?? 'CPA_UNAVAILABLE'
+        if (code === 'DUPLICATE_ACCOUNT') {
+          setToast({ title: '这个账号已贡献过', desc: '同一个账号只能贡献一次，换一个号试试。', ok: false })
+        } else if (code === 'OAUTH_CANCELLED') {
+          setToast({ title: '已取消授权', desc: error?.message ?? '授权会话已取消', ok: true })
+        } else {
+          setToast({ title: '提交失败', desc: error?.message ?? '提交失败', ok: false })
+        }
+        if (oauthClientDisposition(code) === 'clear') clearLocalSession()
         return
       }
-      if (!res.ok) throw new Error(d.error || '提交失败')
-      setToast({ title: '授权成功！', desc: d.message, ok: true })
-      reset()
-      onDone()
+      setToast({ title: '授权成功！', desc: payload.message, ok: true })
+      clearLocalSession()
+      onDoneRef.current()
     } catch (e) {
       setToast({ title: '提交失败', desc: (e as Error).message, ok: false })
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function cancelSession() {
+    if (!session) return
+    setBusy(true)
+    try {
+      const res = await fetch('/api/collect/oauth/cancel', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ provider: session.provider, state: session.state }),
+      })
+      const payload = await res.json().catch(() => ({}))
+      if (!res.ok) {
+        const error = apiError(payload)
+        const code = error?.code ?? 'CPA_UNAVAILABLE'
+        setToast({ title: '取消失败', desc: error?.message ?? '取消失败，请稍后重试', ok: false })
+        if (shouldClearOAuthSession(code)) clearLocalSession()
+        return
+      }
+      clearLocalSession()
+      setToast({ title: '已取消授权', desc: '本次授权会话已停止。', ok: true })
+    } catch {
+      setToast({ title: '取消失败', desc: '网络异常，请稍后重试', ok: false })
     } finally {
       setBusy(false)
     }
@@ -151,10 +259,7 @@ export default function CollectPanel({ onDone }: { onDone: () => void }) {
             data-provider-option={p.id}
             aria-label={`${p.name} ${p.sub}`}
             aria-pressed={provider === p.id}
-            onClick={() => {
-              setProvider(p.id)
-              reset()
-            }}
+            onClick={() => setProvider(p.id)}
             className={`min-w-0 rounded-xl border px-3 py-2.5 text-center transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400 ${
               provider === p.id
                 ? 'border-[var(--brand)]/50 bg-[var(--brand)]/10'
@@ -193,7 +298,8 @@ export default function CollectPanel({ onDone }: { onDone: () => void }) {
               授权后自动完成，请稍候…
             </div>
             <button
-              onClick={reset}
+              onClick={cancelSession}
+              disabled={busy}
               className="w-full rounded-xl border border-white/10 bg-white/5 px-4 py-2 text-sm text-neutral-300 transition hover:bg-white/10"
             >
               取消
@@ -231,7 +337,8 @@ export default function CollectPanel({ onDone }: { onDone: () => void }) {
                 {busy ? '提交中…' : '提交'}
               </button>
               <button
-                onClick={reset}
+                onClick={cancelSession}
+                disabled={busy}
                 className="rounded-xl border border-white/10 bg-white/5 px-4 py-2.5 text-sm text-neutral-300 transition hover:bg-white/10"
               >
                 取消

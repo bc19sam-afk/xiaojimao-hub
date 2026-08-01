@@ -45,6 +45,7 @@ test('安全会话生命周期：建立、claim、完成后 snapshot 与 provide
   assert.equal(db.createOAuthSession({
     state: 's1', fileNames: ['a.json', 'b.json'], linuxdoId: 1, provider: 'codex',
     leaseToken: 'lease-s1', createdAt: now, expiresAt: now + 60_000,
+    hardExpiresAt: now + 60_000, authorizationUrl: 'https://example.test/s1', flow: 'redirect',
   }), true)
   assert.deepEqual(db.getOAuthSnapshot('s1'), ['a.json', 'b.json']) // 往返
   const claim = db.claimOAuthSession({
@@ -52,6 +53,9 @@ test('安全会话生命周期：建立、claim、完成后 snapshot 与 provide
     now: now + 1, operationExpiresAt: now + 30_000,
   })
   assert.equal(claim.status, 'claimed')
+  assert.deepEqual(db.beginOAuthFinalization({
+    state: 's1', leaseToken: 'lease-s1', operationToken: 'op-s1', now: now + 2,
+  }), { status: 'finalizing' })
   assert.equal(db.completeOAuthSession('s1', 'lease-s1', 'op-s1'), true)
   assert.equal(db.getOAuthSnapshot('s1'), null)
   assert.equal(db.acquireOAuthProviderLease({
@@ -67,14 +71,16 @@ test('OAuth 会话清理：删过期 snapshot/lease，保留未过期会话', ()
   }), true)
   assert.equal(db.createOAuthSession({
     state: 'old', fileNames: ['x.json'], linuxdoId: 3, provider: 'claude', leaseToken: 'lease-old',
-    createdAt: 100, expiresAt: 150,
+    createdAt: 100, expiresAt: 150, hardExpiresAt: 150,
+    authorizationUrl: 'https://example.test/old', flow: 'redirect',
   }), true)
   assert.equal(db.acquireOAuthProviderLease({
     provider: 'grok', linuxdoId: 4, leaseToken: 'lease-fresh', now: 100, expiresAt: 300,
   }), true)
   assert.equal(db.createOAuthSession({
     state: 'fresh', fileNames: ['y.json'], linuxdoId: 4, provider: 'grok', leaseToken: 'lease-fresh',
-    createdAt: 100, expiresAt: 300,
+    createdAt: 100, expiresAt: 300, hardExpiresAt: 300,
+    authorizationUrl: 'https://example.test/fresh', flow: 'device', userCode: 'FRESH',
   }), true)
   db.cleanupOAuthSessions(200)
   assert.equal(db.getOAuthSnapshot('old'), null)

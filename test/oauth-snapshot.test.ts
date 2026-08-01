@@ -46,7 +46,7 @@ function seedOAuthSession(
   const now = Date.now()
   const leaseToken = `lease-${state}`
   assert.equal(
-    db.acquireOAuthProviderLease({ provider, linuxdoId, leaseToken, now, expiresAt: now + 60_000 }),
+    db.acquireOAuthProviderLease({ provider, linuxdoId, leaseToken, now, expiresAt: now + 900_000 }),
     true,
   )
   assert.equal(
@@ -57,7 +57,10 @@ function seedOAuthSession(
       provider,
       leaseToken,
       createdAt: now,
-      expiresAt: now + 60_000,
+      expiresAt: now + 900_000,
+      hardExpiresAt: now + 900_000,
+      authorizationUrl: `https://example.test/${state}`,
+      flow: provider === 'grok' ? 'device' : 'redirect',
     }),
     true,
   )

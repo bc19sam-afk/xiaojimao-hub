@@ -75,6 +75,7 @@ export interface StartResult {
   url: string
   flow: 'redirect' | 'device'
   userCode?: string
+  expiresIn?: number
 }
 // device 轮询结果
 export type CheckResult =
@@ -109,6 +110,7 @@ export interface DailyUsage {
 // 故判重必须按 provider 划界——调用方（collect.ts）负责按 provider 过滤后传入。
 export interface CpaClient {
   startOAuth(provider: ProviderId): Promise<StartResult>
+  cancelOAuth(state: string): Promise<{ cancelled: boolean }>
   // redirect 流程：提交回调 URL 完成。before＝授权前 auth-files 文件名快照（P1b-4 由 collect 层从
   // 按 state 持久化的快照读出后传入），交给 findNew 挡号池既有号（见 findNew 注释③）。
   finishOAuth(
@@ -139,6 +141,9 @@ export interface CpaClient {
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 const OAUTH_STATUS_MAX_POLLS = 15
 const OAUTH_STATUS_POLL_DELAY_MS = 1_000
+// CLIProxyAPI xAI waiter itself uses min(expires_in, 30 minutes); mirror that effective lifetime
+// for the actionable deadline. collect.ts then adds one full operation TTL as the late-save fence.
+const MAX_DEVICE_OAUTH_TTL_SECONDS = 30 * 60
 // redirect finish 的外呼最坏上界：callback + 每轮 status timeout/sleep + 最终 findNew 列表。
 // collect 层还会另加 isolate timeout 与余量，作为 operation fencing TTL。
 export const MAX_OAUTH_FINISH_DURATION_MS =
@@ -194,9 +199,18 @@ const mockClient: CpaClient = {
   async startOAuth(provider) {
     const state = hash('s' + Math.random())
     if (provider === 'grok') {
-      return { state, url: 'https://accounts.x.ai/oauth2/device?mock=1', flow: 'device', userCode: 'MOCK-' + state.slice(0, 4).toUpperCase() }
+      return {
+        state,
+        url: 'https://accounts.x.ai/oauth2/device?mock=1',
+        flow: 'device',
+        userCode: 'MOCK-' + state.slice(0, 4).toUpperCase(),
+        expiresIn: MAX_DEVICE_OAUTH_TTL_SECONDS,
+      }
     }
     return { state, url: `https://auth.openai.com/oauth/authorize?mock=1&state=${state}`, flow: 'redirect' }
+  },
+  async cancelOAuth() {
+    return { cancelled: true }
   },
   async finishOAuth(provider, redirectUrl) {
     // seed 取回调 URL：同一号重复提交幂等落同一 accountId（与真实语义一致）
@@ -296,6 +310,7 @@ function parseOAuthStart(value: unknown): StartResult {
   const url = value.url
   const rawFlow = value.flow
   const rawUserCode = value.user_code
+  const rawExpiresIn = value.expires_in
 
   if (!isNonEmptyString(state) || !isNonEmptyString(url) || !isHttpUrl(url)) {
     failCpaShape('oauth_start')
@@ -306,15 +321,40 @@ function parseOAuthStart(value: unknown): StartResult {
   if (rawUserCode !== undefined && !isNonEmptyString(rawUserCode)) {
     failCpaShape('oauth_start')
   }
+  if (
+    rawExpiresIn !== undefined &&
+    (typeof rawExpiresIn !== 'number' || !Number.isSafeInteger(rawExpiresIn) || rawExpiresIn <= 0)
+  ) {
+    failCpaShape('oauth_start')
+  }
 
   const flow = rawFlow === 'device' || (rawFlow === undefined && rawUserCode !== undefined)
     ? 'device'
     : 'redirect'
-  if ((flow === 'device' && rawUserCode === undefined) || (flow === 'redirect' && rawUserCode !== undefined)) {
+  if (
+    (flow === 'device' && (rawUserCode === undefined || rawExpiresIn === undefined)) ||
+    (flow === 'redirect' && (rawUserCode !== undefined || rawExpiresIn !== undefined))
+  ) {
     failCpaShape('oauth_start')
   }
 
-  return { state, url, flow, userCode: rawUserCode }
+  if (flow === 'device') {
+    return {
+      state,
+      url,
+      flow,
+      userCode: rawUserCode,
+      expiresIn: Math.min(Number(rawExpiresIn), MAX_DEVICE_OAUTH_TTL_SECONDS),
+    }
+  }
+  return { state, url, flow, userCode: undefined }
+}
+
+function parseOAuthCancellation(value: unknown): { cancelled: boolean } {
+  if (!isOAuthRecord(value) || value.status !== 'ok' || typeof value.cancelled !== 'boolean') {
+    failCpaShape('oauth_cancel')
+  }
+  return { cancelled: value.cancelled }
 }
 
 type OAuthStatusPayload = { status: 'ok' | 'wait' | 'error'; error?: string }
@@ -460,6 +500,12 @@ const realClient: CpaClient = {
   async startOAuth(provider) {
     const cp = CPA_PROVIDER[provider]
     return parseOAuthStart(await req('GET', `/v0/management/${cp}-auth-url?is_webui=true`))
+  },
+
+  async cancelOAuth(state) {
+    return parseOAuthCancellation(
+      await req('DELETE', `/v0/management/oauth-session?state=${encodeURIComponent(state)}`),
+    )
   },
 
   async finishOAuth(provider, redirectUrl, knownAccountIds, before) {

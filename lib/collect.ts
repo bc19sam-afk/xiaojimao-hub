@@ -4,19 +4,25 @@ import {
   cpa,
   MAX_OAUTH_FINISH_DURATION_MS,
   type AuthFile,
+  type CpaClient,
   type IngestResult,
   type ProbeResult,
   type ProviderId,
-  type StartResult,
 } from './cpa'
 import { db, shortAccountLabel, type Contribution, type ObservationKind } from './db'
 import { env } from './env'
 import { DEFAULT_OUTBOUND_TIMEOUT_MS } from './outbound-http'
+import {
+  oauthProtocolError,
+  type OAuthErrorCode,
+  type OAuthSessionView,
+} from './oauth-protocol'
 import type { SessionUser } from './session'
 
 type CollectResult =
   | { ok: true; contribution: Contribution }
-  | { ok: false; error: string }
+  | { ok: false; code: OAuthErrorCode; error: string }
+type OAuthFailureResult = Extract<CollectResult, { ok: false }>
 
 // 把一个已落号的结果记为贡献：pending，等巡检。
 function recordIngest(
@@ -29,11 +35,15 @@ function recordIngest(
   // 残缺号——这不是「重复」，用重复文案会误导用户。诚实提示重试即可（认不出身份的号进
   // needs_review + 人工录入 canonical ID 留待 P2；三家都有稳定字段后此处只剩残缺/异常号）。
   if (!result.accountId) {
-    return { ok: false, error: '未能确认到新授权的账号，请确认已完成授权后重试' }
+    return {
+      ok: false,
+      code: 'CPA_UNAVAILABLE',
+      error: '未能确认到新授权的账号，请确认已完成授权后重试',
+    }
   }
   // 真重复：拿到了 accountId，但该 (provider, accountId) 已被贡献过 / 池中已有。
   if (result.duplicate) {
-    return { ok: false, error: '这个号交过了，不能再交' }
+    return { ok: false, code: 'DUPLICATE_ACCOUNT', error: '这个号交过了，不能再交' }
   }
   const now = Date.now()
   const contribution: Contribution = {
@@ -55,7 +65,7 @@ function recordIngest(
     updatedAt: now,
   }
   const { duplicate } = db.insertUnique(contribution)
-  if (duplicate) return { ok: false, error: '这个号交过了，不能再交' }
+  if (duplicate) return { ok: false, code: 'DUPLICATE_ACCOUNT', error: '这个号交过了，不能再交' }
   // 修好重交成功入库 → 清掉**本人**该号旧退回记录，dashboard 的「未收下」提示随之消失（codex xhigh 于 PR #18）
   db.clearRejections(contribution.linuxdoId, provider, contribution.accountId)
   return { ok: true, contribution }
@@ -87,9 +97,10 @@ function parseState(redirectUrl: string): string {
 // 仍必须通过 user/provider/lease 归属校验。生产没有无 state 例外。
 const SNAPSHOT_MISSING_ERROR = '授权会话已过期或已完成，请重新点击「发起授权」后再试'
 const OAUTH_OPERATION_BUSY_ERROR = '授权会话正在处理中，请稍后重试'
-const OAUTH_PROVIDER_BUSY_ERROR = '该类型已有授权正在进行，请稍后再试'
 const OAUTH_SESSION_CREATE_ERROR = '授权会话创建失败，请重新发起授权'
-const OAUTH_SESSION_TTL_MS = 3600_000
+const OAUTH_START_LEASE_TTL_MS = 60_000
+const OAUTH_REDIRECT_TTL_MS = 15 * 60_000
+const OAUTH_DEVICE_MAX_TTL_SECONDS = 30 * 60
 // 覆盖 redirect finish 的最坏外呼上界、随后 isolate 的一次外呼，以及 60s 调度/本地处理余量。
 export const OAUTH_OPERATION_TTL_MS =
   MAX_OAUTH_FINISH_DURATION_MS + DEFAULT_OUTBOUND_TIMEOUT_MS + 60_000
@@ -102,6 +113,7 @@ function isOAuthTerminalError(error: unknown): boolean {
 
 function claimOAuthOperation(user: SessionUser, provider: ProviderId, state: string) {
   const now = Date.now()
+  db.cleanupOAuthSessions(now)
   return db.claimOAuthSession({
     state,
     provider,
@@ -117,15 +129,63 @@ function claimOAuthOperation(user: SessionUser, provider: ProviderId, state: str
 // findNew 的 before，挡号池既有号（见 cpa.ts findNew 注释③）。此刻（授权前）池里还没本次将落的新号、
 // 且快照固定不变——retry 同 state 读同一快照不孤立、device 同样能读。空 state 不能建立安全会话，
 // 必须释放 provider lease 并失败。
-export async function startOAuth(user: SessionUser, provider: ProviderId): Promise<StartResult> {
+export function recoverOAuthSession(user: SessionUser, provider: ProviderId): OAuthSessionView | null {
+  const now = Date.now()
+  db.cleanupOAuthSessions(now)
+  return db.recoverOAuthSession(user.id, provider, now) as OAuthSessionView | null
+}
+
+export async function cancelOAuth(
+  user: SessionUser,
+  provider: ProviderId,
+  state: string,
+): Promise<{ status: 'cancelled' | 'conflict' | 'invalid' }> {
+  const now = Date.now()
+  db.cleanupOAuthSessions(now)
+  const local = db.cancelOAuthSession({ state, provider, linuxdoId: user.id, now })
+  if (local.status !== 'cancelled') return local
+  if (local.needsUpstreamCancel) {
+    let confirmed = false
+    try {
+      const upstream = await cpa.cancelOAuth(state)
+      confirmed = upstream.cancelled
+    } catch {
+      // 旧版 CPAMP 404、网络故障或畸形响应都不能证明远端 waiter 已停止；保留 fence 到 hard expiry。
+    }
+    if (confirmed) {
+      db.confirmOAuthCancellation({
+        state,
+        provider,
+        linuxdoId: user.id,
+        leaseToken: local.leaseToken,
+      })
+    }
+  }
+  return { status: 'cancelled' }
+}
+
+function oauthActionableTtlMs(result: Awaited<ReturnType<CpaClient['startOAuth']>>): number {
+  if (result.flow === 'redirect') return OAUTH_REDIRECT_TTL_MS
+  if (
+    typeof result.expiresIn !== 'number' ||
+    !Number.isSafeInteger(result.expiresIn) ||
+    result.expiresIn <= 0
+  ) {
+    throw new Error(OAUTH_SESSION_CREATE_ERROR)
+  }
+  return Math.min(result.expiresIn, OAUTH_DEVICE_MAX_TTL_SECONDS) * 1000
+}
+
+export async function startOAuth(user: SessionUser, provider: ProviderId): Promise<OAuthSessionView> {
   const leaseToken = randomBytes(24).toString('hex')
-  db.cleanupOAuthSessions(Date.now())
+  const recovered = recoverOAuthSession(user, provider)
+  if (recovered) return recovered
   let leaseExpiresAt = 0
   let acquired = false
   for (const delayMs of OAUTH_LEASE_RETRY_DELAYS_MS) {
     if (delayMs > 0) await sleep(delayMs)
     const now = Date.now()
-    leaseExpiresAt = now + OAUTH_SESSION_TTL_MS
+    leaseExpiresAt = now + OAUTH_START_LEASE_TTL_MS
     acquired = db.acquireOAuthProviderLease({
       provider,
       linuxdoId: user.id,
@@ -135,7 +195,11 @@ export async function startOAuth(user: SessionUser, provider: ProviderId): Promi
     })
     if (acquired) break
   }
-  if (!acquired) throw new Error(OAUTH_PROVIDER_BUSY_ERROR)
+  if (!acquired) {
+    const concurrentRecovery = recoverOAuthSession(user, provider)
+    if (concurrentRecovery) return concurrentRecovery
+    throw oauthProtocolError('PROVIDER_BUSY')
+  }
 
   try {
     // 快照必须先于 CPA start：否则极快完成的授权可能在 listAuthFiles 前已经落号，被误记为 before。
@@ -144,6 +208,8 @@ export async function startOAuth(user: SessionUser, provider: ProviderId): Promi
     const result = await cpa.startOAuth(provider)
     const state = result.state.trim()
     const createdAt = Date.now()
+    const expiresAt = createdAt + oauthActionableTtlMs(result)
+    const hardExpiresAt = expiresAt + OAUTH_OPERATION_TTL_MS
     if (
       !state ||
       !db.createOAuthSession({
@@ -153,16 +219,58 @@ export async function startOAuth(user: SessionUser, provider: ProviderId): Promi
         provider,
         leaseToken,
         createdAt,
-        expiresAt: leaseExpiresAt,
+        expiresAt,
+        hardExpiresAt,
+        authorizationUrl: result.url,
+        flow: result.flow,
+        userCode: result.userCode,
       })
     ) {
       throw new Error(OAUTH_SESSION_CREATE_ERROR)
     }
-    return result
+    return {
+      provider,
+      state,
+      url: result.url,
+      flow: result.flow,
+      userCode: result.userCode,
+      expiresAt,
+    }
   } catch (error) {
     db.releaseOAuthProviderLease(provider, leaseToken)
     throw error
   }
+}
+
+function invalidOAuthSession(): OAuthFailureResult {
+  return { ok: false, code: 'OAUTH_SESSION_INVALID', error: SNAPSHOT_MISSING_ERROR }
+}
+
+function cancelledOAuthSession(): OAuthFailureResult {
+  const error = oauthProtocolError('OAUTH_CANCELLED')
+  return { ok: false, code: error.code, error: error.message }
+}
+
+function settleOAuthThrown(
+  state: string,
+  claim: Extract<ReturnType<typeof claimOAuthOperation>, { status: 'claimed' }>,
+  error: unknown,
+): never {
+  const terminal = isOAuthTerminalError(error)
+  const gate = db.beginOAuthFinalization({
+    state,
+    leaseToken: claim.leaseToken,
+    operationToken: claim.operationToken,
+    now: Date.now(),
+  })
+  if (gate.status === 'cancelled') throw oauthProtocolError('OAUTH_CANCELLED')
+  if (gate.status !== 'finalizing') throw oauthProtocolError('OAUTH_SESSION_INVALID')
+  if (terminal) {
+    db.completeOAuthSession(state, claim.leaseToken, claim.operationToken)
+  } else {
+    db.releaseOAuthOperation(state, claim.leaseToken, claim.operationToken)
+  }
+  throw error
 }
 
 // —— redirect 流程：提交回调 URL ——
@@ -180,29 +288,35 @@ export async function finishOAuth(
     return recordIngest(user, provider, result, 'oauth')
   }
   const claim = claimOAuthOperation(user, provider, state)
-  if (claim.status === 'invalid') return { ok: false, error: SNAPSHOT_MISSING_ERROR }
-  if (claim.status === 'busy') return { ok: false, error: OAUTH_OPERATION_BUSY_ERROR }
-  try {
-    const result = await cpa.finishOAuth(provider, redirectUrl, known, new Set(claim.fileNames))
-    await isolate(result.authFileName)
-    const recorded = recordIngest(user, provider, result, 'oauth')
-    // accountId 为空仍可能只是 auth-file 尚未可见；只释放短 claim，保留会话供同 state 重试。
-    // 有 canonical accountId 的成功或重复才是可证明终态。
-    if (result.accountId) {
-      db.completeOAuthSession(state, claim.leaseToken, claim.operationToken)
-    } else {
-      db.releaseOAuthOperation(state, claim.leaseToken, claim.operationToken)
-    }
-    return recorded
-  } catch (error) {
-    // cpa.ts 对明确 OAuth 终态需标 oauthTerminal=true；网络/超时/DB 等瞬态只释放短 claim，保留会话重试。
-    if (isOAuthTerminalError(error)) {
-      db.completeOAuthSession(state, claim.leaseToken, claim.operationToken)
-    } else {
-      db.releaseOAuthOperation(state, claim.leaseToken, claim.operationToken)
-    }
-    throw error
+  if (claim.status === 'invalid') return invalidOAuthSession()
+  if (claim.status === 'cancelled') return cancelledOAuthSession()
+  if (claim.status === 'busy') {
+    return { ok: false, code: 'OPERATION_BUSY', error: OAUTH_OPERATION_BUSY_ERROR }
   }
+  let result: IngestResult
+  try {
+    result = await cpa.finishOAuth(provider, redirectUrl, known, new Set(claim.fileNames))
+  } catch (error) {
+    settleOAuthThrown(state, claim, error)
+  }
+  const gate = db.beginOAuthFinalization({
+    state,
+    leaseToken: claim.leaseToken,
+    operationToken: claim.operationToken,
+    now: Date.now(),
+  })
+  if (gate.status === 'cancelled') return cancelledOAuthSession()
+  if (gate.status !== 'finalizing') return invalidOAuthSession()
+  await isolate(result.authFileName)
+  const recorded = recordIngest(user, provider, result, 'oauth')
+  // accountId 为空仍可能只是 auth-file 尚未可见；只释放短 claim，保留会话供同 state 重试。
+  // 有 canonical accountId 的成功或重复才是可证明终态。
+  if (result.accountId) {
+    db.completeOAuthSession(state, claim.leaseToken, claim.operationToken)
+  } else {
+    db.releaseOAuthOperation(state, claim.leaseToken, claim.operationToken)
+  }
+  return recorded
 }
 
 // —— device 流程：轮询一次，ok 则落号 ——
@@ -210,37 +324,64 @@ export async function checkOAuth(
   user: SessionUser,
   provider: ProviderId,
   state: string,
-): Promise<{ done: true; result: CollectResult } | { done: false; error?: string }> {
+): Promise<
+  | { done: true; result: CollectResult }
+  | { done: false; code?: OAuthErrorCode; error?: string }
+> {
   const known = db.accountIdsFor(provider) // 仅当前 provider 的已知号
   const claim = claimOAuthOperation(user, provider, state)
-  if (claim.status === 'invalid') return { done: false, error: SNAPSHOT_MISSING_ERROR }
-  if (claim.status === 'busy') return { done: false, error: OAUTH_OPERATION_BUSY_ERROR }
-  try {
-    const r = await cpa.checkOAuth(provider, state, known, new Set(claim.fileNames))
-    if (r.status === 'error') {
-      db.completeOAuthSession(state, claim.leaseToken, claim.operationToken)
-      return { done: true, result: { ok: false, error: r.error } }
-    }
-    if (r.status !== 'ok') {
-      db.releaseOAuthOperation(state, claim.leaseToken, claim.operationToken)
-      return { done: false }
-    }
-    await isolate(r.ingest.authFileName)
-    const recorded = recordIngest(user, provider, r.ingest, 'oauth')
-    if (!r.ingest.accountId) {
-      db.releaseOAuthOperation(state, claim.leaseToken, claim.operationToken)
-      return { done: false, error: recorded.ok ? undefined : recorded.error }
-    }
-    db.completeOAuthSession(state, claim.leaseToken, claim.operationToken)
-    return { done: true, result: recorded }
-  } catch (error) {
-    if (isOAuthTerminalError(error)) {
-      db.completeOAuthSession(state, claim.leaseToken, claim.operationToken)
-    } else {
-      db.releaseOAuthOperation(state, claim.leaseToken, claim.operationToken)
-    }
-    throw error
+  if (claim.status === 'invalid') {
+    return { done: false, code: 'OAUTH_SESSION_INVALID', error: SNAPSHOT_MISSING_ERROR }
   }
+  if (claim.status === 'cancelled') {
+    const cancelled = cancelledOAuthSession()
+    return { done: false, code: cancelled.code, error: cancelled.error }
+  }
+  if (claim.status === 'busy') {
+    return { done: false, code: 'OPERATION_BUSY', error: OAUTH_OPERATION_BUSY_ERROR }
+  }
+  let r: Awaited<ReturnType<CpaClient['checkOAuth']>>
+  try {
+    r = await cpa.checkOAuth(provider, state, known, new Set(claim.fileNames))
+  } catch (error) {
+    settleOAuthThrown(state, claim, error)
+  }
+  const gate = db.beginOAuthFinalization({
+    state,
+    leaseToken: claim.leaseToken,
+    operationToken: claim.operationToken,
+    now: Date.now(),
+  })
+  if (gate.status === 'cancelled') {
+    const cancelled = cancelledOAuthSession()
+    return { done: false, code: cancelled.code, error: cancelled.error }
+  }
+  if (gate.status !== 'finalizing') {
+    return { done: false, code: 'OAUTH_SESSION_INVALID', error: SNAPSHOT_MISSING_ERROR }
+  }
+  if (r.status === 'error') {
+    db.completeOAuthSession(state, claim.leaseToken, claim.operationToken)
+    return {
+      done: true,
+      result: { ok: false, code: 'UPSTREAM_AUTH_REJECTED', error: r.error },
+    }
+  }
+  if (r.status !== 'ok') {
+    db.releaseOAuthOperation(state, claim.leaseToken, claim.operationToken)
+    return { done: false }
+  }
+  await isolate(r.ingest.authFileName)
+  const recorded = recordIngest(user, provider, r.ingest, 'oauth')
+  if (!r.ingest.accountId) {
+    db.releaseOAuthOperation(state, claim.leaseToken, claim.operationToken)
+    return {
+      done: false,
+      code: recorded.ok ? undefined : recorded.code,
+      error: recorded.ok ? undefined : recorded.error,
+    }
+  }
+  db.completeOAuthSession(state, claim.leaseToken, claim.operationToken)
+  return { done: true, result: recorded }
 }
 
 // —— 直贴 RT（仅 codex）——

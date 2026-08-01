@@ -334,6 +334,171 @@ test('provider options remain fully visible and keyboard operable at mobile and 
   await expect(grok).toHaveAttribute('aria-pressed', 'true')
 })
 
+test('OAuth panel applies structured duplicate, busy, expired, cancelled, and pending behavior', async ({ page }) => {
+  test.setTimeout(60_000)
+
+  type TestErrorCode =
+    | 'DUPLICATE_ACCOUNT'
+    | 'OPERATION_BUSY'
+    | 'TRANSITION_CONFLICT'
+    | 'OAUTH_CANCELLED'
+    | 'OAUTH_SESSION_INVALID'
+
+  const errors: Record<TestErrorCode, { status: number; message: string; retryable: boolean }> = {
+    DUPLICATE_ACCOUNT: { status: 409, message: '这个账号已贡献过', retryable: false },
+    OPERATION_BUSY: { status: 409, message: '授权会话正在处理中，请稍后重试', retryable: true },
+    TRANSITION_CONFLICT: { status: 409, message: '授权会话正在完成，暂时无法取消', retryable: true },
+    OAUTH_CANCELLED: { status: 410, message: '授权会话已取消', retryable: false },
+    OAUTH_SESSION_INVALID: { status: 410, message: '授权会话无效或已过期', retryable: false },
+  }
+  const fulfillError = async (route: Route, code: TestErrorCode, retryAfterMs?: number) => {
+    const error = errors[code]
+    await route.fulfill({
+      status: error.status,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        ok: false,
+        error: {
+          code,
+          message: error.message,
+          retryable: error.retryable,
+          ...(retryAfterMs === undefined ? {} : { retryAfterMs }),
+        },
+      }),
+    })
+  }
+
+  await page.route('**/api/collect/oauth/session*', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ ok: true, session: null }),
+    })
+  })
+
+  let startSequence = 0
+  await page.route('**/api/collect/oauth/start', async (route) => {
+    const body = route.request().postDataJSON() as { provider?: 'codex' | 'claude' | 'grok' }
+    const provider = body.provider ?? 'codex'
+    startSequence += 1
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        ok: true,
+        session: {
+          provider,
+          state: `${provider}-state-${startSequence}`,
+          url: `https://example.test/${provider}/${startSequence}`,
+          flow: provider === 'grok' ? 'device' : 'redirect',
+          ...(provider === 'grok' ? { userCode: 'DEVICE-CODE' } : {}),
+          expiresAt: Date.now() + 900_000,
+        },
+      }),
+    })
+  })
+
+  let finishCode: Extract<
+    TestErrorCode,
+    'DUPLICATE_ACCOUNT' | 'OPERATION_BUSY' | 'OAUTH_CANCELLED' | 'OAUTH_SESSION_INVALID'
+  > =
+    'DUPLICATE_ACCOUNT'
+  await page.route('**/api/collect/oauth/finish', async (route) => {
+    await fulfillError(route, finishCode, finishCode === 'OPERATION_BUSY' ? 1500 : undefined)
+  })
+
+  let cancelSucceeds = false
+  await page.route('**/api/collect/oauth/cancel', async (route) => {
+    if (cancelSucceeds) {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ ok: true, status: 'cancelled' }),
+      })
+      return
+    }
+    await fulfillError(route, 'TRANSITION_CONFLICT', 1000)
+  })
+
+  let checkCalls = 0
+  await page.route('**/api/collect/oauth/check', async (route) => {
+    checkCalls += 1
+    if (checkCalls === 1) {
+      await route.fulfill({
+        status: 202,
+        contentType: 'application/json',
+        body: JSON.stringify({ ok: true, status: 'pending', retryAfterMs: 1500 }),
+      })
+      return
+    }
+    if (checkCalls === 2) {
+      await fulfillError(route, 'OPERATION_BUSY', 1500)
+      return
+    }
+    await fulfillError(route, 'OAUTH_CANCELLED')
+  })
+
+  await login(page)
+
+  const authorizeChatGpt = page.getByRole('button', { name: /授权 ChatGPT 账号/ })
+  const callback = page.getByPlaceholder('http://localhost:1455/auth/callback?code=...&state=...')
+
+  await authorizeChatGpt.click()
+  await expect(callback).toBeVisible()
+  await page.getByRole('button', { name: '取消', exact: true }).click()
+  await expect(page.getByText(errors.TRANSITION_CONFLICT.message, { exact: true })).toBeVisible()
+  await expect(callback).toBeVisible()
+
+  cancelSucceeds = true
+  await page.getByRole('button', { name: '取消', exact: true }).click()
+  await expect(page.getByText('已取消授权', { exact: true })).toBeVisible()
+  await expect(authorizeChatGpt).toBeVisible()
+
+  await authorizeChatGpt.click()
+  await callback.fill('http://localhost:1455/auth/callback?code=one&state=duplicate')
+  finishCode = 'DUPLICATE_ACCOUNT'
+  await page.getByRole('button', { name: '提交', exact: true }).click()
+  await expect(page.getByText('这个账号已贡献过', { exact: true })).toBeVisible()
+  await expect(authorizeChatGpt).toBeVisible()
+
+  await authorizeChatGpt.click()
+  await callback.fill('http://localhost:1455/auth/callback?code=two&state=busy')
+  finishCode = 'OPERATION_BUSY'
+  await page.getByRole('button', { name: '提交', exact: true }).click()
+  await expect(page.getByText(errors.OPERATION_BUSY.message, { exact: true })).toBeVisible()
+  await expect(callback).toBeVisible()
+
+  finishCode = 'OAUTH_CANCELLED'
+  await page.getByRole('button', { name: '提交', exact: true }).click()
+  await expect(page.getByText(errors.OAUTH_CANCELLED.message, { exact: true })).toBeVisible()
+  await expect(authorizeChatGpt).toBeVisible()
+
+  await authorizeChatGpt.click()
+  await callback.fill('http://localhost:1455/auth/callback?code=three&state=expired')
+  finishCode = 'OAUTH_SESSION_INVALID'
+  await page.getByRole('button', { name: '提交', exact: true }).click()
+  await expect(page.getByText(errors.OAUTH_SESSION_INVALID.message, { exact: true })).toBeVisible()
+  await expect(authorizeChatGpt).toBeVisible()
+
+  await page.getByRole('button', { name: 'Grok SuperGrok' }).click()
+  const authorizeGrok = page.getByRole('button', { name: /授权 Grok 账号/ })
+  await authorizeGrok.click()
+  await expect(page.getByText('DEVICE-CODE', { exact: true })).toBeVisible()
+
+  await expect.poll(() => checkCalls).toBe(1)
+  await expect(page.getByText('DEVICE-CODE', { exact: true })).toBeVisible()
+  await expect.poll(() => checkCalls).toBe(2)
+  await expect(page.getByText(errors.OPERATION_BUSY.message, { exact: true })).toBeVisible()
+  await expect(page.getByText('DEVICE-CODE', { exact: true })).toBeVisible()
+  await expect.poll(() => checkCalls).toBe(3)
+  await expect(page.getByText(errors.OAUTH_CANCELLED.message, { exact: true })).toBeVisible()
+  await expect(authorizeGrok).toBeVisible()
+
+  const settledCalls = checkCalls
+  await page.waitForTimeout(1750)
+  expect(checkCalls).toBe(settledCalls)
+})
+
 test('Playwright web server listens only on loopback', async ({ request }) => {
   expect((await request.get('/login')).status()).toBe(200)
   const addresses = externalIpv4Addresses()

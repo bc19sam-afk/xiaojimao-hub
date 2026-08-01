@@ -46,12 +46,18 @@ test('CPA OAuth start accepts only valid redirect/device response contracts', as
       },
     },
     {
-      payload: { state: 'device-state', url: 'https://auth.example/device', user_code: 'ABCD-EFGH' },
+      payload: {
+        state: 'device-state',
+        url: 'https://auth.example/device',
+        user_code: 'ABCD-EFGH',
+        expires_in: 1200,
+      },
       expected: {
         state: 'device-state',
         url: 'https://auth.example/device',
         flow: 'device',
         userCode: 'ABCD-EFGH',
+        expiresIn: 1200,
       },
     },
     {
@@ -60,12 +66,14 @@ test('CPA OAuth start accepts only valid redirect/device response contracts', as
         url: 'http://device.example/activate',
         flow: 'device',
         user_code: 'CODE-1234',
+        expires_in: 3600,
       },
       expected: {
         state: 'explicit-device',
         url: 'http://device.example/activate',
         flow: 'device',
         userCode: 'CODE-1234',
+        expiresIn: 1800,
       },
     },
   ]
@@ -90,6 +98,12 @@ test('CPA OAuth start rejects missing, mistyped, invalid-URL, and invalid flow/u
     { state: 's', url: LEAK_URL, flow: 'redirect', user_code: 'unexpected' },
     { state: 's', url: LEAK_URL, flow: 'device' },
     { state: 's', url: LEAK_URL, user_code: 123 },
+    { state: 's', url: LEAK_URL, user_code: 'CODE' },
+    { state: 's', url: LEAK_URL, user_code: 'CODE', expires_in: 0 },
+    { state: 's', url: LEAK_URL, user_code: 'CODE', expires_in: -1 },
+    { state: 's', url: LEAK_URL, user_code: 'CODE', expires_in: 1.5 },
+    { state: 's', url: LEAK_URL, user_code: 'CODE', expires_in: '1800' },
+    { state: 's', url: LEAK_URL, flow: 'redirect', expires_in: 1800 },
   ]
 
   for (const payload of malformed) {
@@ -101,6 +115,43 @@ test('CPA OAuth start rejects missing, mistyped, invalid-URL, and invalid flow/u
     assert.equal(result.logs.includes(LEAK_BODY), false)
     assert.equal(result.logs.includes('test-management-key'), false)
   }
+})
+
+test('CPA OAuth cancellation validates the exact management response contract', async () => {
+  const observed: Array<{ url: string; method?: string }> = []
+  for (const cancelled of [true, false]) {
+    globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
+      observed.push({ url: String(url), method: init?.method })
+      return jsonResponse({ status: 'ok', cancelled })
+    }) as typeof fetch
+    assert.deepEqual(await cpa.cancelOAuth('opaque state'), { cancelled })
+  }
+
+  assert.deepEqual(observed.map((request) => request.method), ['DELETE', 'DELETE'])
+  assert.ok(observed.every((request) => request.url.endsWith('/v0/management/oauth-session?state=opaque%20state')))
+
+  for (const payload of [
+    null,
+    {},
+    { status: 'ok' },
+    { status: 'error', cancelled: false },
+    { status: 'ok', cancelled: 'true' },
+  ]) {
+    globalThis.fetch = (async () => jsonResponse(payload)) as typeof fetch
+    const result = await capture(() => cpa.cancelOAuth('secret-state'))
+    assert.equal(result.error?.message, CPA_UNAVAILABLE, `payload must fail closed: ${JSON.stringify(payload)}`)
+    assert.match(result.logs, /cpa\.oauth_cancel invalid_shape/)
+    assert.equal(result.logs.includes('secret-state'), false)
+    assert.equal(result.logs.includes('test-management-key'), false)
+  }
+})
+
+test('CPA OAuth cancellation treats a missing upstream route as unconfirmed', async () => {
+  globalThis.fetch = (async () => new Response('', { status: 404 })) as typeof fetch
+  const result = await capture(() => cpa.cancelOAuth('legacy-state'))
+  assert.equal(result.error?.message, CPA_UNAVAILABLE)
+  assert.match(result.logs, /cpa\.management_delete http status=404/)
+  assert.equal(result.logs.includes('legacy-state'), false)
 })
 
 test('CPA OAuth status accepts only wait/ok/error and validates known field types', async () => {

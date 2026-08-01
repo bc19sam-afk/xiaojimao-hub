@@ -65,12 +65,36 @@ export interface OAuthSessionCreate {
   leaseToken: string
   createdAt: number
   expiresAt: number
+  hardExpiresAt: number
+  authorizationUrl: string
+  flow: 'redirect' | 'device'
+  userCode?: string
 }
 
 export type OAuthSessionClaim =
   | { status: 'claimed'; fileNames: string[]; leaseToken: string; operationToken: string }
   | { status: 'busy' }
+  | { status: 'cancelled' }
   | { status: 'invalid' }
+
+export interface OAuthSessionRecovery {
+  provider: string
+  state: string
+  url: string
+  flow: 'redirect' | 'device'
+  userCode?: string
+  expiresAt: number
+}
+
+export type OAuthSessionCancel =
+  | { status: 'cancelled'; leaseToken: string; needsUpstreamCancel: boolean }
+  | { status: 'conflict' }
+  | { status: 'invalid' }
+
+export type OAuthSessionFinalization =
+  | { status: 'finalizing' }
+  | { status: 'cancelled' }
+  | { status: 'stale' }
 
 const DB_PATH = process.env.DB_PATH || path.join(process.cwd(), 'data', 'app.db')
 
@@ -1130,7 +1154,13 @@ export const db = {
   // CPA start 返回 state 后才落会话。短事务内重新核验租约仍属于发起者且未过期，再 INSERT；
   // state 冲突不覆盖旧会话，返回 false 让调用方释放自己的租约并 fail closed。
   createOAuthSession(session: OAuthSessionCreate): boolean {
-    if (!session.state || session.expiresAt <= session.createdAt) return false
+    if (
+      !session.state ||
+      !session.authorizationUrl ||
+      session.expiresAt <= session.createdAt ||
+      session.hardExpiresAt < session.expiresAt ||
+      session.hardExpiresAt <= session.createdAt
+    ) return false
     conn.exec('BEGIN IMMEDIATE')
     try {
       const lease = conn
@@ -1143,12 +1173,30 @@ export const db = {
         conn.exec('COMMIT')
         return false
       }
+      const extended = conn
+        .prepare(
+          `UPDATE oauth_provider_leases
+           SET expires_at=?
+           WHERE provider=? AND lease_token=? AND linuxdo_id=? AND expires_at>?`,
+        )
+        .run(
+          session.hardExpiresAt,
+          session.provider,
+          session.leaseToken,
+          session.linuxdoId,
+          session.createdAt,
+        )
+      if (extended.changes !== 1) {
+        conn.exec('ROLLBACK')
+        return false
+      }
       const inserted = conn
         .prepare(
           `INSERT OR IGNORE INTO oauth_snapshots
            (state, file_names, created_at, linuxdo_id, provider, expires_at, lease_token,
-            operation_token, operation_expires_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL)`,
+            operation_token, operation_expires_at, authorization_url, flow, user_code,
+            status, hard_expires_at, cancelled_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, 'ACTIVE', ?, NULL)`,
         )
         .run(
           session.state,
@@ -1158,12 +1206,57 @@ export const db = {
           session.provider,
           session.expiresAt,
           session.leaseToken,
+          session.authorizationUrl,
+          session.flow,
+          session.userCode ?? null,
+          session.hardExpiresAt,
         )
       conn.exec('COMMIT')
       return inserted.changes === 1
     } catch (error) {
       conn.exec('ROLLBACK')
       throw error
+    }
+  },
+
+  // 刷新/切换页面时只恢复本人、同 provider、尚可观察且租约匹配的会话；绝不返回 fencing token。
+  recoverOAuthSession(linuxdoId: number, provider: string, now: number): OAuthSessionRecovery | null {
+    const row = conn
+      .prepare(
+        `SELECT s.state, s.authorization_url, s.flow, s.user_code, s.expires_at
+         FROM oauth_snapshots s
+         JOIN oauth_provider_leases l
+           ON l.provider=s.provider
+          AND l.lease_token=s.lease_token
+          AND l.linuxdo_id=s.linuxdo_id
+         WHERE s.linuxdo_id=? AND s.provider=?
+           AND s.status IN ('ACTIVE', 'CLAIMED', 'FINALIZING')
+           AND s.expires_at>? AND s.hard_expires_at>? AND l.expires_at>?
+         ORDER BY s.created_at DESC
+         LIMIT 1`,
+      )
+      .get(linuxdoId, provider, now, now, now) as unknown as
+      | {
+          state: string
+          authorization_url: string
+          flow: string
+          user_code: string | null
+          expires_at: number
+        }
+      | undefined
+    if (
+      !row ||
+      !row.state ||
+      !row.authorization_url ||
+      (row.flow !== 'redirect' && row.flow !== 'device')
+    ) return null
+    return {
+      provider,
+      state: row.state,
+      url: row.authorization_url,
+      flow: row.flow,
+      userCode: row.user_code ?? undefined,
+      expiresAt: row.expires_at,
     }
   },
 
@@ -1198,28 +1291,63 @@ export const db = {
     try {
       const row = conn
         .prepare(
-          `SELECT s.file_names, s.lease_token, s.operation_token, s.operation_expires_at
+          `SELECT s.file_names, s.lease_token, s.status, s.expires_at, s.hard_expires_at,
+                  s.operation_expires_at, l.lease_token AS active_lease_token
            FROM oauth_snapshots s
-           JOIN oauth_provider_leases l
+           LEFT JOIN oauth_provider_leases l
              ON l.provider=s.provider
             AND l.lease_token=s.lease_token
             AND l.linuxdo_id=s.linuxdo_id
+            AND l.expires_at>?
            WHERE s.state=?
              AND s.provider=?
              AND s.linuxdo_id=?
-             AND s.expires_at>?
-             AND l.expires_at>?
+             AND s.hard_expires_at>?
              AND s.lease_token IS NOT NULL`,
         )
-        .get(input.state, input.provider, input.linuxdoId, input.now, input.now) as unknown as
+        .get(
+          input.now,
+          input.state,
+          input.provider,
+          input.linuxdoId,
+          input.now,
+        ) as unknown as
         | {
             file_names: string
             lease_token: string
-            operation_token: string | null
+            status: string
+            expires_at: number
+            hard_expires_at: number
             operation_expires_at: number | null
+            active_lease_token: string | null
           }
         | undefined
       if (!row) {
+        conn.exec('COMMIT')
+        return { status: 'invalid' }
+      }
+      if (
+        row.status === 'CANCELLED' ||
+        row.status === 'CANCEL_PENDING' ||
+        row.status === 'CANCEL_CONFIRMED'
+      ) {
+        conn.exec('COMMIT')
+        return { status: 'cancelled' }
+      }
+      if (
+        (row.status === 'CLAIMED' || row.status === 'FINALIZING') &&
+        row.operation_expires_at != null &&
+        row.operation_expires_at > input.now
+      ) {
+        conn.exec('COMMIT')
+        return { status: 'busy' }
+      }
+      if (
+        row.status !== 'ACTIVE' ||
+        !row.active_lease_token ||
+        row.expires_at <= input.now ||
+        row.hard_expires_at < input.operationExpiresAt
+      ) {
         conn.exec('COMMIT')
         return { status: 'invalid' }
       }
@@ -1235,45 +1363,26 @@ export const db = {
         conn.exec('COMMIT')
         return { status: 'invalid' }
       }
-      if (
-        row.operation_token &&
-        row.operation_expires_at != null &&
-        row.operation_expires_at > input.now
-      ) {
-        conn.exec('COMMIT')
-        return { status: 'busy' }
-      }
       const claimed = conn
         .prepare(
           `UPDATE oauth_snapshots
-           SET operation_token=?, operation_expires_at=?, expires_at=MAX(expires_at, ?)
+           SET status='CLAIMED', operation_token=?, operation_expires_at=?
            WHERE state=? AND provider=? AND linuxdo_id=? AND lease_token=?
-             AND (operation_token IS NULL OR operation_expires_at IS NULL OR operation_expires_at<=?)`,
+             AND status='ACTIVE' AND expires_at>? AND hard_expires_at>=?`,
         )
         .run(
           input.operationToken,
-          input.operationExpiresAt,
           input.operationExpiresAt,
           input.state,
           input.provider,
           input.linuxdoId,
           row.lease_token,
           input.now,
+          input.operationExpiresAt,
         )
       if (claimed.changes !== 1) {
         conn.exec('ROLLBACK')
         return { status: 'busy' }
-      }
-      const leaseExtended = conn
-        .prepare(
-          `UPDATE oauth_provider_leases
-           SET expires_at=MAX(expires_at, ?)
-           WHERE provider=? AND lease_token=? AND linuxdo_id=?`,
-        )
-        .run(input.operationExpiresAt, input.provider, row.lease_token, input.linuxdoId)
-      if (leaseExtended.changes !== 1) {
-        conn.exec('ROLLBACK')
-        return { status: 'invalid' }
       }
       conn.exec('COMMIT')
       return {
@@ -1293,10 +1402,256 @@ export const db = {
     return conn
       .prepare(
         `UPDATE oauth_snapshots
-         SET operation_token=NULL, operation_expires_at=NULL
-         WHERE state=? AND lease_token=? AND operation_token=?`,
+         SET status='ACTIVE', operation_token=NULL, operation_expires_at=NULL
+         WHERE state=? AND lease_token=? AND operation_token=?
+           AND status IN ('CLAIMED', 'FINALIZING')`,
       )
       .run(state, leaseToken, operationToken).changes === 1
+  },
+
+  // 外部 await 返回后的唯一写闸门。只有仍持有 CLAIMED fencing token 的请求可进入 FINALIZING；
+  // CANCEL_PENDING/CANCEL_CONFIRMED/CANCELLED tombstone 优先返回 cancelled，绝不进入 isolate/入库。
+  // 上游 cancelled:true 与 auth-file 持久化并非原子；即使精确 operation token 已返回，也必须保留
+  // provider fence 到 hard expiry，避免迟到文件被后继会话误认成自己的新号。
+  beginOAuthFinalization(input: {
+    state: string
+    leaseToken: string
+    operationToken: string
+    now: number
+  }): OAuthSessionFinalization {
+    conn.exec('BEGIN IMMEDIATE')
+    try {
+      const row = conn
+        .prepare(
+          `SELECT s.provider, s.status, s.operation_expires_at, s.hard_expires_at,
+                  EXISTS (
+                    SELECT 1 FROM oauth_provider_leases l
+                    WHERE l.provider=s.provider AND l.lease_token=s.lease_token
+                      AND l.expires_at>?
+                  ) AS lease_active
+           FROM oauth_snapshots s
+           WHERE s.state=? AND s.lease_token=? AND s.operation_token=?`,
+        )
+        .get(input.now, input.state, input.leaseToken, input.operationToken) as unknown as
+        | {
+            provider: string
+            status: string
+            operation_expires_at: number | null
+            hard_expires_at: number | null
+            lease_active: number
+          }
+        | undefined
+      if (!row) {
+        conn.exec('COMMIT')
+        return { status: 'stale' }
+      }
+      if (
+        row.status === 'CANCEL_PENDING' ||
+        row.status === 'CANCEL_CONFIRMED' ||
+        row.status === 'CANCELLED'
+      ) {
+        if (row.status === 'CANCEL_PENDING') {
+          const cancelled = conn
+            .prepare(
+              `UPDATE oauth_snapshots SET status='CANCELLED'
+               WHERE state=? AND lease_token=? AND operation_token=? AND status='CANCEL_PENDING'`,
+            )
+            .run(input.state, input.leaseToken, input.operationToken)
+          if (cancelled.changes !== 1) {
+            conn.exec('ROLLBACK')
+            return { status: 'stale' }
+          }
+        }
+        if (row.status === 'CANCEL_CONFIRMED') {
+          const cancelled = conn
+            .prepare(
+              `UPDATE oauth_snapshots
+               SET operation_token=NULL, operation_expires_at=NULL
+               WHERE state=? AND lease_token=? AND operation_token=? AND status='CANCEL_CONFIRMED'`,
+            )
+            .run(input.state, input.leaseToken, input.operationToken)
+          if (cancelled.changes !== 1) {
+            conn.exec('ROLLBACK')
+            return { status: 'stale' }
+          }
+        }
+        conn.exec('COMMIT')
+        return { status: 'cancelled' }
+      }
+      if (
+        row.status !== 'CLAIMED' ||
+        row.lease_active !== 1 ||
+        row.operation_expires_at == null ||
+        row.operation_expires_at <= input.now ||
+        row.hard_expires_at == null ||
+        row.hard_expires_at <= input.now
+      ) {
+        conn.exec('COMMIT')
+        return { status: 'stale' }
+      }
+      const finalizing = conn
+        .prepare(
+          `UPDATE oauth_snapshots SET status='FINALIZING'
+           WHERE state=? AND lease_token=? AND operation_token=? AND status='CLAIMED'`,
+        )
+        .run(input.state, input.leaseToken, input.operationToken)
+      if (finalizing.changes !== 1) {
+        conn.exec('ROLLBACK')
+        return { status: 'stale' }
+      }
+      conn.exec('COMMIT')
+      return { status: 'finalizing' }
+    } catch (error) {
+      conn.exec('ROLLBACK')
+      throw error
+    }
+  },
+
+  cancelOAuthSession(input: {
+    state: string
+    provider: string
+    linuxdoId: number
+    now: number
+  }): OAuthSessionCancel {
+    if (!input.state) return { status: 'invalid' }
+    conn.exec('BEGIN IMMEDIATE')
+    try {
+      const row = conn
+        .prepare(
+          `SELECT s.flow, s.status, s.lease_token, s.hard_expires_at,
+                  EXISTS (
+                    SELECT 1 FROM oauth_provider_leases l
+                    WHERE l.provider=s.provider AND l.lease_token=s.lease_token
+                      AND l.linuxdo_id=s.linuxdo_id AND l.expires_at>?
+                  ) AS lease_active
+           FROM oauth_snapshots s
+           WHERE s.state=? AND s.provider=? AND s.linuxdo_id=?`,
+        )
+        .get(input.now, input.state, input.provider, input.linuxdoId) as unknown as
+        | {
+            flow: string | null
+            status: string | null
+            lease_token: string | null
+            hard_expires_at: number | null
+            lease_active: number
+          }
+        | undefined
+      if (
+        !row ||
+        !row.lease_token ||
+        row.hard_expires_at == null ||
+        row.hard_expires_at <= input.now ||
+        (row.flow !== 'redirect' && row.flow !== 'device')
+      ) {
+        conn.exec('COMMIT')
+        return { status: 'invalid' }
+      }
+      if (
+        row.status === 'CANCELLED' ||
+        row.status === 'CANCEL_PENDING' ||
+        row.status === 'CANCEL_CONFIRMED'
+      ) {
+        conn.exec('COMMIT')
+        return {
+          status: 'cancelled',
+          leaseToken: row.lease_token,
+          needsUpstreamCancel: row.status !== 'CANCEL_CONFIRMED' && row.lease_active === 1,
+        }
+      }
+      if (row.status === 'FINALIZING') {
+        conn.exec('COMMIT')
+        return { status: 'conflict' }
+      }
+      if (row.status === 'CLAIMED') {
+        if (row.lease_active !== 1) {
+          conn.exec('COMMIT')
+          return { status: 'invalid' }
+        }
+        const pending = conn
+          .prepare(
+            `UPDATE oauth_snapshots SET status='CANCEL_PENDING', cancelled_at=?
+             WHERE state=? AND provider=? AND linuxdo_id=? AND status='CLAIMED'`,
+          )
+          .run(input.now, input.state, input.provider, input.linuxdoId)
+        if (pending.changes !== 1) {
+          conn.exec('ROLLBACK')
+          return { status: 'conflict' }
+        }
+        conn.exec('COMMIT')
+        return { status: 'cancelled', leaseToken: row.lease_token, needsUpstreamCancel: true }
+      }
+      if (row.status !== 'ACTIVE' || row.lease_active !== 1) {
+        conn.exec('COMMIT')
+        return { status: 'invalid' }
+      }
+      const cancelled = conn
+        .prepare(
+          `UPDATE oauth_snapshots SET status='CANCELLED', cancelled_at=?
+           WHERE state=? AND provider=? AND linuxdo_id=? AND status='ACTIVE'`,
+        )
+        .run(input.now, input.state, input.provider, input.linuxdoId)
+      if (cancelled.changes !== 1) {
+        conn.exec('ROLLBACK')
+        return { status: 'conflict' }
+      }
+      conn.exec('COMMIT')
+      return { status: 'cancelled', leaseToken: row.lease_token, needsUpstreamCancel: true }
+    } catch (error) {
+      conn.exec('ROLLBACK')
+      throw error
+    }
+  },
+
+  // 本地 tombstone 必须先落，再等待上游取消。cancelled:true 只记为 CANCEL_CONFIRMED；上游 waiter
+  // 的 pending 检查与 auth-file 保存之间仍有窄竞态，因此空闲和在途会话都保留 provider fence 到
+  // hard expiry。cancelled:false、取消失败或旧版 404 同样不缩短该窗口。
+  confirmOAuthCancellation(input: {
+    state: string
+    provider: string
+    linuxdoId: number
+    leaseToken: string
+  }): boolean {
+    if (!input.state || !input.provider || !input.leaseToken) return false
+    conn.exec('BEGIN IMMEDIATE')
+    try {
+      const row = conn
+        .prepare(
+          `SELECT status FROM oauth_snapshots
+           WHERE state=? AND provider=? AND linuxdo_id=? AND lease_token=?
+             AND status IN ('CANCEL_PENDING', 'CANCEL_CONFIRMED', 'CANCELLED')`,
+        )
+        .get(input.state, input.provider, input.linuxdoId, input.leaseToken) as unknown as
+        | { status: string }
+        | undefined
+      if (!row) {
+        conn.exec('COMMIT')
+        return false
+      }
+      if (row.status === 'CANCEL_PENDING' || row.status === 'CANCELLED') {
+        const confirmed = conn
+          .prepare(
+            `UPDATE oauth_snapshots SET status='CANCEL_CONFIRMED'
+             WHERE state=? AND provider=? AND linuxdo_id=? AND lease_token=?
+               AND status=?`,
+          )
+          .run(
+            input.state,
+            input.provider,
+            input.linuxdoId,
+            input.leaseToken,
+            row.status,
+          )
+        if (confirmed.changes !== 1) {
+          conn.exec('ROLLBACK')
+          return false
+        }
+      }
+      conn.exec('COMMIT')
+      return true
+    } catch (error) {
+      conn.exec('ROLLBACK')
+      throw error
+    }
   },
 
   // 成功或明确终态同时释放 session 与其 provider lease。先按三 token 读 provider，再在同一短事务
@@ -1307,7 +1662,7 @@ export const db = {
       const row = conn
         .prepare(
           `SELECT provider FROM oauth_snapshots
-           WHERE state=? AND lease_token=? AND operation_token=?`,
+           WHERE state=? AND lease_token=? AND operation_token=? AND status='FINALIZING'`,
         )
         .get(state, leaseToken, operationToken) as unknown as { provider: string } | undefined
       if (!row) {
@@ -1316,7 +1671,8 @@ export const db = {
       }
       const deleted = conn
         .prepare(
-          'DELETE FROM oauth_snapshots WHERE state=? AND lease_token=? AND operation_token=?',
+          `DELETE FROM oauth_snapshots
+           WHERE state=? AND lease_token=? AND operation_token=? AND status='FINALIZING'`,
         )
         .run(state, leaseToken, operationToken)
       if (deleted.changes !== 1) {
@@ -1334,12 +1690,43 @@ export const db = {
     }
   },
 
-  // start 顺带做过期清理。NULL legacy snapshot 直接清除；有效请求由 1h session TTL 与短 operation
-  // TTL 保护，崩溃/放弃后最终自动释放。没有 snapshot 的 start-in-flight 租约只按自身 TTL 清理。
+  // start/claim 顺带做过期清理。进行中的 claim/cancel/finalize 在 operation_expires_at 前绝不删除；
+  // 超时 claim 可回 ACTIVE，未知结果的取消/FINALIZING 超时 fail closed 到 CANCELLED。无论 redirect/device，
+  // 所有取消结果都保留 provider fence 到 hard expiry；只有明确 terminal/success 的完成路径立即释放。
   cleanupOAuthSessions(now: number): void {
     conn.exec('BEGIN IMMEDIATE')
     try {
-      conn.prepare('DELETE FROM oauth_snapshots WHERE expires_at IS NULL OR expires_at<=?').run(now)
+      conn.prepare(
+        `UPDATE oauth_snapshots
+         SET status='ACTIVE', operation_token=NULL, operation_expires_at=NULL
+         WHERE status='CLAIMED' AND operation_expires_at<=? AND hard_expires_at>?`,
+      ).run(now, now)
+      conn.prepare(
+        `UPDATE oauth_snapshots
+         SET status='CANCELLED', operation_token=NULL, operation_expires_at=NULL
+         WHERE status IN ('CANCEL_PENDING', 'FINALIZING')
+           AND operation_expires_at<=?`,
+      ).run(now)
+      conn.prepare(
+        `UPDATE oauth_snapshots
+         SET operation_token=NULL, operation_expires_at=NULL
+         WHERE status='CANCEL_CONFIRMED' AND operation_expires_at<=?`,
+      ).run(now)
+      // A timeout/worker crash leaves no proof that the upstream callback has stopped.
+      // Keep that fence until hard expiry; only confirmed terminal/success paths release early.
+      conn.prepare(
+        `DELETE FROM oauth_provider_leases
+         WHERE EXISTS (
+           SELECT 1 FROM oauth_snapshots s
+           WHERE s.provider=oauth_provider_leases.provider
+             AND s.lease_token=oauth_provider_leases.lease_token
+             AND (s.hard_expires_at IS NULL OR s.hard_expires_at<=?)
+         )`,
+      ).run(now)
+      conn.prepare(
+        `DELETE FROM oauth_snapshots
+         WHERE hard_expires_at IS NULL OR status IS NULL OR hard_expires_at<=?`,
+      ).run(now)
       conn.prepare('DELETE FROM oauth_provider_leases WHERE expires_at<=?').run(now)
       conn.exec('COMMIT')
     } catch (error) {

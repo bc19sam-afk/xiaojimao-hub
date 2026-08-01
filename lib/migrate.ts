@@ -533,6 +533,25 @@ export const migrations: Migration[] = [
       `)
     },
   },
+  {
+    version: 15,
+    // migration 015（release hardening review）：OAuth 恢复元数据与显式 fencing 生命周期。
+    // 新列保持 nullable，使 v14 前遗留行继续 fail closed；只有新建会话会写完整元数据并进入 ACTIVE。
+    up(db) {
+      db.exec('ALTER TABLE oauth_snapshots ADD COLUMN authorization_url TEXT')
+      db.exec('ALTER TABLE oauth_snapshots ADD COLUMN flow TEXT')
+      db.exec('ALTER TABLE oauth_snapshots ADD COLUMN user_code TEXT')
+      db.exec('ALTER TABLE oauth_snapshots ADD COLUMN status TEXT')
+      db.exec('ALTER TABLE oauth_snapshots ADD COLUMN hard_expires_at INTEGER')
+      db.exec('ALTER TABLE oauth_snapshots ADD COLUMN cancelled_at INTEGER')
+      db.exec(`
+        CREATE INDEX idx_oauth_snapshots_owner_provider
+          ON oauth_snapshots(linuxdo_id, provider, status);
+        CREATE INDEX idx_oauth_snapshots_hard_expires
+          ON oauth_snapshots(hard_expires_at);
+      `)
+    },
+  },
 ]
 
 // 代码所知的最新 schema 版本（从 migrations 数组派生，勿手写）
