@@ -49,6 +49,29 @@ export interface Contribution {
   pooledAt?: number
 }
 
+export interface OAuthProviderLease {
+  provider: string
+  linuxdoId: number
+  leaseToken: string
+  now: number
+  expiresAt: number
+}
+
+export interface OAuthSessionCreate {
+  state: string
+  fileNames: string[]
+  linuxdoId: number
+  provider: string
+  leaseToken: string
+  createdAt: number
+  expiresAt: number
+}
+
+export type OAuthSessionClaim =
+  | { status: 'claimed'; fileNames: string[]; leaseToken: string; operationToken: string }
+  | { status: 'busy' }
+  | { status: 'invalid' }
+
 const DB_PATH = process.env.DB_PATH || path.join(process.cwd(), 'data', 'app.db')
 
 interface DbFileIdentity {
@@ -1076,18 +1099,75 @@ export const db = {
     }
   },
 
-  // ===== OAuth 授权快照（P1b-4：按 state 持久化跨请求）=====
-  // startOAuth 授权前拍 auth-files 文件名快照并按 state 存；finishOAuth/checkOAuth 读同一份作
-  // findNew 的 before（挡号池既有号）；成功入库后删；过期清理。file_names 以 JSON 数组存。
-  setOAuthSnapshot(state: string, fileNames: string[]): void {
-    conn
+  // ===== OAuth 会话与 provider 级租约（migration 014）=====
+  // 单条 UPSERT 原子抢占：有效租约存在时不覆盖；仅 expires_at <= now 的旧租约可被新 fencing token
+  // 替换。同 provider 串行、不同 provider 的主键不同，可独立推进。所有 await 都在调用方事务外。
+  acquireOAuthProviderLease(lease: OAuthProviderLease): boolean {
+    if (!lease.provider || !lease.leaseToken || lease.expiresAt <= lease.now) return false
+    const result = conn
       .prepare(
-        `INSERT INTO oauth_snapshots (state, file_names, created_at) VALUES (?,?,?)
-         ON CONFLICT(state) DO UPDATE SET file_names=excluded.file_names, created_at=excluded.created_at`,
+        `INSERT INTO oauth_provider_leases
+           (provider, lease_token, linuxdo_id, created_at, expires_at)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(provider) DO UPDATE SET
+           lease_token=excluded.lease_token,
+           linuxdo_id=excluded.linuxdo_id,
+           created_at=excluded.created_at,
+           expires_at=excluded.expires_at
+         WHERE oauth_provider_leases.expires_at <= excluded.created_at`,
       )
-      .run(state, JSON.stringify(fileNames), Date.now())
+      .run(lease.provider, lease.leaseToken, lease.linuxdoId, lease.now, lease.expiresAt)
+    return result.changes === 1
   },
-  // 无记录返回 null；JSON 解析失败也返回 null（调用方 ?? [] 降级为空 before＝仍安全）
+
+  // 只按 provider + fencing token 释放。过期的旧请求即使晚到，也删不掉后来者的新租约。
+  releaseOAuthProviderLease(provider: string, leaseToken: string): boolean {
+    return conn
+      .prepare('DELETE FROM oauth_provider_leases WHERE provider=? AND lease_token=?')
+      .run(provider, leaseToken).changes === 1
+  },
+
+  // CPA start 返回 state 后才落会话。短事务内重新核验租约仍属于发起者且未过期，再 INSERT；
+  // state 冲突不覆盖旧会话，返回 false 让调用方释放自己的租约并 fail closed。
+  createOAuthSession(session: OAuthSessionCreate): boolean {
+    if (!session.state || session.expiresAt <= session.createdAt) return false
+    conn.exec('BEGIN IMMEDIATE')
+    try {
+      const lease = conn
+        .prepare(
+          `SELECT 1 FROM oauth_provider_leases
+           WHERE provider=? AND lease_token=? AND linuxdo_id=? AND expires_at>?`,
+        )
+        .get(session.provider, session.leaseToken, session.linuxdoId, session.createdAt)
+      if (!lease) {
+        conn.exec('COMMIT')
+        return false
+      }
+      const inserted = conn
+        .prepare(
+          `INSERT OR IGNORE INTO oauth_snapshots
+           (state, file_names, created_at, linuxdo_id, provider, expires_at, lease_token,
+            operation_token, operation_expires_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL)`,
+        )
+        .run(
+          session.state,
+          JSON.stringify(session.fileNames),
+          session.createdAt,
+          session.linuxdoId,
+          session.provider,
+          session.expiresAt,
+          session.leaseToken,
+        )
+      conn.exec('COMMIT')
+      return inserted.changes === 1
+    } catch (error) {
+      conn.exec('ROLLBACK')
+      throw error
+    }
+  },
+
+  // 诊断/测试只读：不参与安全判定。安全消费必须走 claimOAuthSession 的 user/provider/lease 校验。
   getOAuthSnapshot(state: string): string[] | null {
     const r = conn.prepare('SELECT file_names FROM oauth_snapshots WHERE state=?').get(state) as unknown as
       | { file_names: string }
@@ -1099,12 +1179,173 @@ export const db = {
       return null
     }
   },
-  deleteOAuthSnapshot(state: string): void {
-    conn.prepare('DELETE FROM oauth_snapshots WHERE state=?').run(state)
+
+  // finish/check 进入 CPA 前的短 operation claim。JOIN 同时核验 snapshot 与 provider lease：
+  // user/provider/state/expiry/lease 任一不匹配（含 migration 014 前的 NULL legacy 行）均 invalid；
+  // 尚未过期的 operation_token 表示同一 state 正在被另一个请求消费，返回 busy 而不触 CPA。
+  claimOAuthSession(input: {
+    state: string
+    provider: string
+    linuxdoId: number
+    operationToken: string
+    now: number
+    operationExpiresAt: number
+  }): OAuthSessionClaim {
+    if (!input.state || !input.operationToken || input.operationExpiresAt <= input.now) {
+      return { status: 'invalid' }
+    }
+    conn.exec('BEGIN IMMEDIATE')
+    try {
+      const row = conn
+        .prepare(
+          `SELECT s.file_names, s.lease_token, s.operation_token, s.operation_expires_at
+           FROM oauth_snapshots s
+           JOIN oauth_provider_leases l
+             ON l.provider=s.provider
+            AND l.lease_token=s.lease_token
+            AND l.linuxdo_id=s.linuxdo_id
+           WHERE s.state=?
+             AND s.provider=?
+             AND s.linuxdo_id=?
+             AND s.expires_at>?
+             AND l.expires_at>?
+             AND s.lease_token IS NOT NULL`,
+        )
+        .get(input.state, input.provider, input.linuxdoId, input.now, input.now) as unknown as
+        | {
+            file_names: string
+            lease_token: string
+            operation_token: string | null
+            operation_expires_at: number | null
+          }
+        | undefined
+      if (!row) {
+        conn.exec('COMMIT')
+        return { status: 'invalid' }
+      }
+      let fileNames: string[]
+      try {
+        const parsed = JSON.parse(row.file_names) as unknown
+        if (!Array.isArray(parsed) || !parsed.every((value) => typeof value === 'string')) {
+          conn.exec('COMMIT')
+          return { status: 'invalid' }
+        }
+        fileNames = parsed
+      } catch {
+        conn.exec('COMMIT')
+        return { status: 'invalid' }
+      }
+      if (
+        row.operation_token &&
+        row.operation_expires_at != null &&
+        row.operation_expires_at > input.now
+      ) {
+        conn.exec('COMMIT')
+        return { status: 'busy' }
+      }
+      const claimed = conn
+        .prepare(
+          `UPDATE oauth_snapshots
+           SET operation_token=?, operation_expires_at=?, expires_at=MAX(expires_at, ?)
+           WHERE state=? AND provider=? AND linuxdo_id=? AND lease_token=?
+             AND (operation_token IS NULL OR operation_expires_at IS NULL OR operation_expires_at<=?)`,
+        )
+        .run(
+          input.operationToken,
+          input.operationExpiresAt,
+          input.operationExpiresAt,
+          input.state,
+          input.provider,
+          input.linuxdoId,
+          row.lease_token,
+          input.now,
+        )
+      if (claimed.changes !== 1) {
+        conn.exec('ROLLBACK')
+        return { status: 'busy' }
+      }
+      const leaseExtended = conn
+        .prepare(
+          `UPDATE oauth_provider_leases
+           SET expires_at=MAX(expires_at, ?)
+           WHERE provider=? AND lease_token=? AND linuxdo_id=?`,
+        )
+        .run(input.operationExpiresAt, input.provider, row.lease_token, input.linuxdoId)
+      if (leaseExtended.changes !== 1) {
+        conn.exec('ROLLBACK')
+        return { status: 'invalid' }
+      }
+      conn.exec('COMMIT')
+      return {
+        status: 'claimed',
+        fileNames,
+        leaseToken: row.lease_token,
+        operationToken: input.operationToken,
+      }
+    } catch (error) {
+      conn.exec('ROLLBACK')
+      throw error
+    }
   },
-  // 删掉 created_at 早于 now-olderThanMs 的过期快照（startOAuth 顺带调用，防表无限增长）
-  cleanupOAuthSnapshots(olderThanMs: number): void {
-    conn.prepare('DELETE FROM oauth_snapshots WHERE created_at < ?').run(Date.now() - olderThanMs)
+
+  // wait/可重试故障只释放本次短 claim，保留 snapshot + provider lease 给同一会话下次继续。
+  releaseOAuthOperation(state: string, leaseToken: string, operationToken: string): boolean {
+    return conn
+      .prepare(
+        `UPDATE oauth_snapshots
+         SET operation_token=NULL, operation_expires_at=NULL
+         WHERE state=? AND lease_token=? AND operation_token=?`,
+      )
+      .run(state, leaseToken, operationToken).changes === 1
+  },
+
+  // 成功或明确终态同时释放 session 与其 provider lease。先按三 token 读 provider，再在同一短事务
+  // 删除；任何 stale token 不匹配都 no-op，不能影响替换后的新会话。
+  completeOAuthSession(state: string, leaseToken: string, operationToken: string): boolean {
+    conn.exec('BEGIN IMMEDIATE')
+    try {
+      const row = conn
+        .prepare(
+          `SELECT provider FROM oauth_snapshots
+           WHERE state=? AND lease_token=? AND operation_token=?`,
+        )
+        .get(state, leaseToken, operationToken) as unknown as { provider: string } | undefined
+      if (!row) {
+        conn.exec('COMMIT')
+        return false
+      }
+      const deleted = conn
+        .prepare(
+          'DELETE FROM oauth_snapshots WHERE state=? AND lease_token=? AND operation_token=?',
+        )
+        .run(state, leaseToken, operationToken)
+      if (deleted.changes !== 1) {
+        conn.exec('COMMIT')
+        return false
+      }
+      conn
+        .prepare('DELETE FROM oauth_provider_leases WHERE provider=? AND lease_token=?')
+        .run(row.provider, leaseToken)
+      conn.exec('COMMIT')
+      return true
+    } catch (error) {
+      conn.exec('ROLLBACK')
+      throw error
+    }
+  },
+
+  // start 顺带做过期清理。NULL legacy snapshot 直接清除；有效请求由 1h session TTL 与短 operation
+  // TTL 保护，崩溃/放弃后最终自动释放。没有 snapshot 的 start-in-flight 租约只按自身 TTL 清理。
+  cleanupOAuthSessions(now: number): void {
+    conn.exec('BEGIN IMMEDIATE')
+    try {
+      conn.prepare('DELETE FROM oauth_snapshots WHERE expires_at IS NULL OR expires_at<=?').run(now)
+      conn.prepare('DELETE FROM oauth_provider_leases WHERE expires_at<=?').run(now)
+      conn.exec('COMMIT')
+    } catch (error) {
+      conn.exec('ROLLBACK')
+      throw error
+    }
   },
 
   // ===== 首检退回记录（P2-R3，§3.2「告知用户登录失败/被封」）=====

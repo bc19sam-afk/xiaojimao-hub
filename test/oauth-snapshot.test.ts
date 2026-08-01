@@ -37,6 +37,32 @@ function authFile(over: Partial<AuthFile>): AuthFile {
   return { name: 'f.json', accountId: 'acc', email: '', plan: 'pro', disabled: true, provider: 'claude', ...over }
 }
 
+function seedOAuthSession(
+  linuxdoId: number,
+  provider: 'codex' | 'claude' | 'grok',
+  state: string,
+  fileNames: string[],
+): void {
+  const now = Date.now()
+  const leaseToken = `lease-${state}`
+  assert.equal(
+    db.acquireOAuthProviderLease({ provider, linuxdoId, leaseToken, now, expiresAt: now + 60_000 }),
+    true,
+  )
+  assert.equal(
+    db.createOAuthSession({
+      state,
+      fileNames,
+      linuxdoId,
+      provider,
+      leaseToken,
+      createdAt: now,
+      expiresAt: now + 60_000,
+    }),
+    true,
+  )
+}
+
 // 真实客户端 fetch 桩：auth-files GET 返回给定文件；oauth-callback / get-auth-status / 状态 PATCH 各自应答。
 // 返回一个读 auth-files GET 次数的取值器，用于断言 finishOAuth「非重新拍快照」（只应有一次 findNew 的 list）。
 function installFetch(files: unknown[]): () => number {
@@ -156,7 +182,7 @@ test('retry 安全：第二次 finishOAuth 读持久化快照 {poolA}（非重�
   const cbUrl = `https://app/callback?state=${state}`
 
   // 模拟 startOAuth 已按 state 存快照 {poolA}（授权前池里只有 poolA）
-  db.setOAuthSnapshot(state, ['anthropic-poolA.json'])
+  seedOAuthSession(uid, 'claude', state, ['anthropic-poolA.json'])
   // 「第一次授权落 newB 但入库前失败、未删快照」直接构造：快照仍在、池里已是 poolA + newB
   const listCalls = installFetch([
     { name: 'anthropic-poolA.json', provider: 'anthropic', account: 'acct-poolA' },
@@ -195,7 +221,7 @@ test('retry 对比：授权后重新拍快照（before 含 newB）会把 newB �
 test('device 覆盖：checkOAuth 读持久化快照 {poolC}，挡住池中 poolC、认新号 newD 入库', async () => {
   const uid = 4002
   const state = 'st-device-1'
-  db.setOAuthSnapshot(state, ['xai-poolC.json']) // startOAuth 授权前存的快照
+  seedOAuthSession(uid, 'grok', state, ['xai-poolC.json']) // startOAuth 授权前存的快照
   installFetch([
     { name: 'xai-poolC.json', provider: 'xai', account_id: 'acct-poolC' },
     { name: 'xai-newD.json', provider: 'xai', account_id: 'acct-newD' },
@@ -263,7 +289,7 @@ test('fail-closed：成功入库删快照后同 state 重试被拒绝，不退�
   const uid = 4005
   const state = 'st-consumed-1'
   const cbUrl = `https://app/callback?state=${state}`
-  db.setOAuthSnapshot(state, ['anthropic-poolA.json'])
+  seedOAuthSession(uid, 'claude', state, ['anthropic-poolA.json'])
   installFetch([
     { name: 'anthropic-poolA.json', provider: 'anthropic', account: 'acct-poolA' },
     { name: 'anthropic-newE.json', provider: 'anthropic', account: 'acct-newE' },

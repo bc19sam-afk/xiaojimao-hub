@@ -1,4 +1,9 @@
 import { env, redirectUri } from './env'
+import {
+  invalidOutboundShape,
+  outboundJson,
+  OutboundRequestError,
+} from './outbound-http'
 
 export interface LinuxDoUser {
   id: number
@@ -27,6 +32,14 @@ interface TokenResponse {
   [k: string]: unknown
 }
 
+export const LINUXDO_UNAVAILABLE = 'Linux.do 登录服务暂时不可用，请稍后重试'
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null
+}
+
 export async function exchangeCodeForToken(code: string): Promise<TokenResponse> {
   const basic = Buffer.from(
     `${env.linuxdo.clientId}:${env.linuxdo.clientSecret}`,
@@ -36,29 +49,80 @@ export async function exchangeCodeForToken(code: string): Promise<TokenResponse>
     code,
     redirect_uri: redirectUri,
   })
-  const res = await fetch(env.linuxdo.tokenUrl, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/x-www-form-urlencoded',
-      Accept: 'application/json',
-      Authorization: `Basic ${basic}`,
-    },
-    body,
-    cache: 'no-store',
-  })
-  if (!res.ok) {
-    throw new Error(`linuxdo token exchange failed: ${res.status} ${await res.text()}`)
+  let raw: unknown
+  try {
+    raw = await outboundJson(
+      env.linuxdo.tokenUrl,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Accept: 'application/json',
+          Authorization: `Basic ${basic}`,
+        },
+        body,
+        cache: 'no-store',
+      },
+      { service: 'linuxdo', operation: 'token_exchange' },
+    )
+  } catch (error) {
+    if (error instanceof OutboundRequestError) throw new Error(LINUXDO_UNAVAILABLE)
+    throw error
   }
-  return res.json()
+  const value = asRecord(raw)
+  if (!value || typeof value.access_token !== 'string' || !value.access_token.trim()) {
+    invalidOutboundShape('linuxdo', 'token_exchange')
+  }
+  return {
+    access_token: value.access_token.trim(),
+    token_type: typeof value.token_type === 'string' ? value.token_type : undefined,
+  }
 }
 
 export async function fetchLinuxDoUser(accessToken: string): Promise<LinuxDoUser> {
-  const res = await fetch(env.linuxdo.userinfoUrl, {
-    headers: { Authorization: `Bearer ${accessToken}`, Accept: 'application/json' },
-    cache: 'no-store',
-  })
-  if (!res.ok) {
-    throw new Error(`linuxdo userinfo failed: ${res.status} ${await res.text()}`)
+  let raw: unknown
+  try {
+    raw = await outboundJson(
+      env.linuxdo.userinfoUrl,
+      {
+        headers: { Authorization: `Bearer ${accessToken}`, Accept: 'application/json' },
+        cache: 'no-store',
+      },
+      { service: 'linuxdo', operation: 'userinfo' },
+    )
+  } catch (error) {
+    if (error instanceof OutboundRequestError) throw new Error(LINUXDO_UNAVAILABLE)
+    throw error
   }
-  return res.json()
+  const value = asRecord(raw)
+  const trust = value?.trust_level
+  // Linux.do 官方 OIDC discovery 声明 userinfo 支持 username/active/trust_level 等 claims：
+  // https://connect.linux.do/.well-known/openid-configuration
+  // 本项目再按既有持久身份契约要求正整数 id；真实接入前由 release checklist 的真登录验收确认。
+  const valid =
+    value !== null &&
+    typeof value.id === 'number' &&
+    Number.isSafeInteger(value.id) &&
+    value.id > 0 &&
+    typeof value.username === 'string' &&
+    value.username.trim().length > 0 &&
+    typeof trust === 'number' &&
+    Number.isSafeInteger(trust) &&
+    trust >= 0 &&
+    value.active !== false &&
+    (value.active === undefined || typeof value.active === 'boolean') &&
+    (value.name === undefined || typeof value.name === 'string') &&
+    (value.avatar_url === undefined || typeof value.avatar_url === 'string') &&
+    (value.avatar_template === undefined || typeof value.avatar_template === 'string')
+  if (!valid) invalidOutboundShape('linuxdo', 'userinfo')
+
+  return {
+    id: value.id as number,
+    username: (value.username as string).trim(),
+    trust_level: trust as number,
+    active: value.active as boolean | undefined,
+    name: value.name as string | undefined,
+    avatar_url: value.avatar_url as string | undefined,
+    avatar_template: value.avatar_template as string | undefined,
+  }
 }

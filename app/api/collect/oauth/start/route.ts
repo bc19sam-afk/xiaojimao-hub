@@ -13,7 +13,7 @@ export async function POST(req: NextRequest) {
   const provider = String(body.provider || 'codex') as ProviderId
   if (!VALID.includes(provider)) return NextResponse.json({ error: '不支持的类型' }, { status: 400 })
   try {
-    return NextResponse.json(await startOAuth(provider))
+    return NextResponse.json(await startOAuth(user, provider))
   } catch (e) {
     return NextResponse.json({ error: (e as Error).message || '发起授权失败' }, { status: 502 })
   }

@@ -1,7 +1,17 @@
 import { randomBytes } from 'crypto'
-import { cpa, type AuthFile, type IngestResult, type ProbeResult, type ProviderId, type StartResult } from './cpa'
+import { setTimeout as sleep } from 'node:timers/promises'
+import {
+  cpa,
+  MAX_OAUTH_FINISH_DURATION_MS,
+  type AuthFile,
+  type IngestResult,
+  type ProbeResult,
+  type ProviderId,
+  type StartResult,
+} from './cpa'
 import { db, shortAccountLabel, type Contribution, type ObservationKind } from './db'
 import { env } from './env'
+import { DEFAULT_OUTBOUND_TIMEOUT_MS } from './outbound-http'
 import type { SessionUser } from './session'
 
 type CollectResult =
@@ -73,22 +83,86 @@ function parseState(redirectUrl: string): string {
 
 // 真实模式下快照缺失的 fail-closed 拒绝语（codex xhigh 于 PR #10 指出：静默降级为空 before
 // ＝完全退化回抢注号池既有号的旧行为——响应丢失后的重试、快照过期、部署前发起的授权都会踩中）。
-// mock 模式不设此门：mock 的 finishOAuth/checkOAuth 走 mockCreate 不调 findNew，空 before 无害，
-// 且演示/测试常直接调 finishOAuth 不经 startOAuth。
+// MOCK 的 seed:// 无 state 直通仅保留给既有演示/判重测试；只要请求带 state（含 MOCK 正常 UI 流程），
+// 仍必须通过 user/provider/lease 归属校验。生产没有无 state 例外。
 const SNAPSHOT_MISSING_ERROR = '授权会话已过期或已完成，请重新点击「发起授权」后再试'
+const OAUTH_OPERATION_BUSY_ERROR = '授权会话正在处理中，请稍后重试'
+const OAUTH_PROVIDER_BUSY_ERROR = '该类型已有授权正在进行，请稍后再试'
+const OAUTH_SESSION_CREATE_ERROR = '授权会话创建失败，请重新发起授权'
+const OAUTH_SESSION_TTL_MS = 3600_000
+// 覆盖 redirect finish 的最坏外呼上界、随后 isolate 的一次外呼，以及 60s 调度/本地处理余量。
+export const OAUTH_OPERATION_TTL_MS =
+  MAX_OAUTH_FINISH_DURATION_MS + DEFAULT_OUTBOUND_TIMEOUT_MS + 60_000
+const OAUTH_LEASE_RETRY_DELAYS_MS = [0, 25, 75] as const
+
+function isOAuthTerminalError(error: unknown): boolean {
+  return typeof error === 'object' && error !== null &&
+    'oauthTerminal' in error && (error as { oauthTerminal?: unknown }).oauthTerminal === true
+}
+
+function claimOAuthOperation(user: SessionUser, provider: ProviderId, state: string) {
+  const now = Date.now()
+  return db.claimOAuthSession({
+    state,
+    provider,
+    linuxdoId: user.id,
+    operationToken: randomBytes(24).toString('hex'),
+    now,
+    operationExpiresAt: now + OAUTH_OPERATION_TTL_MS,
+  })
+}
 
 // —— 发起授权（provider 决定流程：redirect / device）——
 // P1b-4：授权前给 auth-files 拍文件名快照，按 state 持久化跨请求。finishOAuth/checkOAuth 读它作
 // findNew 的 before，挡号池既有号（见 cpa.ts findNew 注释③）。此刻（授权前）池里还没本次将落的新号、
-// 且快照固定不变——retry 同 state 读同一快照不孤立、device 同样能读。state 为空则跳过（降级空 before）。
-export async function startOAuth(provider: ProviderId): Promise<StartResult> {
-  const result = await cpa.startOAuth(provider)
-  if (result.state) {
-    const names = (await cpa.listAuthFiles()).map((f) => f.name).filter(Boolean)
-    db.setOAuthSnapshot(result.state, names)
-    db.cleanupOAuthSnapshots(3600_000) // 顺带清理 1h 前的过期快照
+// 且快照固定不变——retry 同 state 读同一快照不孤立、device 同样能读。空 state 不能建立安全会话，
+// 必须释放 provider lease 并失败。
+export async function startOAuth(user: SessionUser, provider: ProviderId): Promise<StartResult> {
+  const leaseToken = randomBytes(24).toString('hex')
+  db.cleanupOAuthSessions(Date.now())
+  let leaseExpiresAt = 0
+  let acquired = false
+  for (const delayMs of OAUTH_LEASE_RETRY_DELAYS_MS) {
+    if (delayMs > 0) await sleep(delayMs)
+    const now = Date.now()
+    leaseExpiresAt = now + OAUTH_SESSION_TTL_MS
+    acquired = db.acquireOAuthProviderLease({
+      provider,
+      linuxdoId: user.id,
+      leaseToken,
+      now,
+      expiresAt: leaseExpiresAt,
+    })
+    if (acquired) break
   }
-  return result
+  if (!acquired) throw new Error(OAUTH_PROVIDER_BUSY_ERROR)
+
+  try {
+    // 快照必须先于 CPA start：否则极快完成的授权可能在 listAuthFiles 前已经落号，被误记为 before。
+    // provider lease 已持久化，但此处及后续外部 await 均不持 SQLite 事务。
+    const names = (await cpa.listAuthFiles()).map((f) => f.name).filter(Boolean)
+    const result = await cpa.startOAuth(provider)
+    const state = result.state.trim()
+    const createdAt = Date.now()
+    if (
+      !state ||
+      !db.createOAuthSession({
+        state,
+        fileNames: names,
+        linuxdoId: user.id,
+        provider,
+        leaseToken,
+        createdAt,
+        expiresAt: leaseExpiresAt,
+      })
+    ) {
+      throw new Error(OAUTH_SESSION_CREATE_ERROR)
+    }
+    return result
+  } catch (error) {
+    db.releaseOAuthProviderLease(provider, leaseToken)
+    throw error
+  }
 }
 
 // —— redirect 流程：提交回调 URL ——
@@ -99,16 +173,36 @@ export async function finishOAuth(
 ): Promise<CollectResult> {
   const known = db.accountIdsFor(provider) // 仅当前 provider 的已知号（account_id 按 provider 独立）
   const state = parseState(redirectUrl)
-  const snapshot = state ? db.getOAuthSnapshot(state) : null
-  // fail-closed：真实模式下快照缺失（已消费/过期/部署前发起/无 state）→ 在 oauth-callback **之前**
-  // 拒绝——空 before 会退化回抢注号池既有号；若放行到 callback 后号已落、又必孤立。
-  if (!snapshot && !env.mock) return { ok: false, error: SNAPSHOT_MISSING_ERROR }
-  const before = new Set(snapshot ?? [])
-  const result = await cpa.finishOAuth(provider, redirectUrl, known, before)
-  await isolate(result.authFileName)
-  const recorded = recordIngest(user, provider, result, 'oauth')
-  if (recorded.ok && state) db.deleteOAuthSnapshot(state) // 入库成功才删——失败留快照给 retry 重读，不孤立
-  return recorded
+  // 保留 MOCK 测试/演示的 seed:// 直通能力；生产必有 callback state，且有 state 的 mock 流程也走完整归属校验。
+  if (env.mock && !state) {
+    const result = await cpa.finishOAuth(provider, redirectUrl, known, new Set())
+    await isolate(result.authFileName)
+    return recordIngest(user, provider, result, 'oauth')
+  }
+  const claim = claimOAuthOperation(user, provider, state)
+  if (claim.status === 'invalid') return { ok: false, error: SNAPSHOT_MISSING_ERROR }
+  if (claim.status === 'busy') return { ok: false, error: OAUTH_OPERATION_BUSY_ERROR }
+  try {
+    const result = await cpa.finishOAuth(provider, redirectUrl, known, new Set(claim.fileNames))
+    await isolate(result.authFileName)
+    const recorded = recordIngest(user, provider, result, 'oauth')
+    // accountId 为空仍可能只是 auth-file 尚未可见；只释放短 claim，保留会话供同 state 重试。
+    // 有 canonical accountId 的成功或重复才是可证明终态。
+    if (result.accountId) {
+      db.completeOAuthSession(state, claim.leaseToken, claim.operationToken)
+    } else {
+      db.releaseOAuthOperation(state, claim.leaseToken, claim.operationToken)
+    }
+    return recorded
+  } catch (error) {
+    // cpa.ts 对明确 OAuth 终态需标 oauthTerminal=true；网络/超时/DB 等瞬态只释放短 claim，保留会话重试。
+    if (isOAuthTerminalError(error)) {
+      db.completeOAuthSession(state, claim.leaseToken, claim.operationToken)
+    } else {
+      db.releaseOAuthOperation(state, claim.leaseToken, claim.operationToken)
+    }
+    throw error
+  }
 }
 
 // —— device 流程：轮询一次，ok 则落号 ——
@@ -118,17 +212,35 @@ export async function checkOAuth(
   state: string,
 ): Promise<{ done: true; result: CollectResult } | { done: false; error?: string }> {
   const known = db.accountIdsFor(provider) // 仅当前 provider 的已知号
-  const snapshot = state ? db.getOAuthSnapshot(state) : null
-  // fail-closed 同 finishOAuth：真实模式快照缺失即拒绝，绝不带空 before 去认号
-  if (!snapshot && !env.mock) return { done: false, error: SNAPSHOT_MISSING_ERROR }
-  const before = new Set(snapshot ?? [])
-  const r = await cpa.checkOAuth(provider, state, known, before)
-  if (r.status === 'error') return { done: false, error: r.error }
-  if (r.status !== 'ok') return { done: false }
-  await isolate(r.ingest.authFileName)
-  const recorded = recordIngest(user, provider, r.ingest, 'oauth')
-  if (recorded.ok && state) db.deleteOAuthSnapshot(state) // 入库成功才删
-  return { done: true, result: recorded }
+  const claim = claimOAuthOperation(user, provider, state)
+  if (claim.status === 'invalid') return { done: false, error: SNAPSHOT_MISSING_ERROR }
+  if (claim.status === 'busy') return { done: false, error: OAUTH_OPERATION_BUSY_ERROR }
+  try {
+    const r = await cpa.checkOAuth(provider, state, known, new Set(claim.fileNames))
+    if (r.status === 'error') {
+      db.completeOAuthSession(state, claim.leaseToken, claim.operationToken)
+      return { done: true, result: { ok: false, error: r.error } }
+    }
+    if (r.status !== 'ok') {
+      db.releaseOAuthOperation(state, claim.leaseToken, claim.operationToken)
+      return { done: false }
+    }
+    await isolate(r.ingest.authFileName)
+    const recorded = recordIngest(user, provider, r.ingest, 'oauth')
+    if (!r.ingest.accountId) {
+      db.releaseOAuthOperation(state, claim.leaseToken, claim.operationToken)
+      return { done: false, error: recorded.ok ? undefined : recorded.error }
+    }
+    db.completeOAuthSession(state, claim.leaseToken, claim.operationToken)
+    return { done: true, result: recorded }
+  } catch (error) {
+    if (isOAuthTerminalError(error)) {
+      db.completeOAuthSession(state, claim.leaseToken, claim.operationToken)
+    } else {
+      db.releaseOAuthOperation(state, claim.leaseToken, claim.operationToken)
+    }
+    throw error
+  }
 }
 
 // —— 直贴 RT（仅 codex）——

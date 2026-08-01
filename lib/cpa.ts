@@ -1,6 +1,13 @@
 import { readFileSync, writeFileSync, mkdirSync } from 'fs'
 import { join, dirname } from 'path'
 import { env } from './env'
+import {
+  DEFAULT_OUTBOUND_TIMEOUT_MS,
+  invalidOutboundShape,
+  outboundJson,
+  outboundOk,
+  OutboundRequestError,
+} from './outbound-http'
 
 // ============================================================================
 // CPA 客户端抽象层（多 provider：codex / claude / grok）
@@ -130,6 +137,14 @@ export interface CpaClient {
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
+const OAUTH_STATUS_MAX_POLLS = 15
+const OAUTH_STATUS_POLL_DELAY_MS = 1_000
+// redirect finish 的外呼最坏上界：callback + 每轮 status timeout/sleep + 最终 findNew 列表。
+// collect 层还会另加 isolate timeout 与余量，作为 operation fencing TTL。
+export const MAX_OAUTH_FINISH_DURATION_MS =
+  DEFAULT_OUTBOUND_TIMEOUT_MS +
+  OAUTH_STATUS_MAX_POLLS * (DEFAULT_OUTBOUND_TIMEOUT_MS + OAUTH_STATUS_POLL_DELAY_MS) +
+  DEFAULT_OUTBOUND_TIMEOUT_MS
 
 // ---------------------------------------------------------------------------
 // 模拟实现（文件持久化，模拟真实 CPA 的跨进程共享状态）
@@ -242,24 +257,51 @@ function api(path: string): string {
 function authHeaders(extra?: Record<string, string>): Record<string, string> {
   return { Authorization: `Bearer ${env.cpa.managementKey}`, ...extra }
 }
-// cpamp HTTP 报错对外统一中性文案（§8）：绝不把 cpamp 状态码/响应体/内部 API 路径透传前端。
-// 原文只进服务端日志（console.error）供排查——响应体是 cpamp **返回**的，不含我们**发出**的
-// RT/管理密钥/CDK（密钥在 Authorization 头、RT 在上传件里，都不在响应体）。
+// cpamp HTTP 报错对外统一中性文案（§8）：绝不把状态码/响应体/内部 API 路径透传前端。
+// 出站层日志只保留固定 service/operation、错误类别与状态码，不记录 URL 或响应体。
 export const CPA_UNAVAILABLE = '账号服务暂时不可用，请稍后重试'
-async function req(method: string, path: string, body?: unknown): Promise<unknown> {
+function oauthTerminal(message = '授权失败'): Error {
+  return Object.assign(new Error(message), { oauthTerminal: true })
+}
+
+async function req(
+  method: string,
+  path: string,
+  body?: unknown,
+): Promise<unknown> {
   const init: RequestInit = { method, headers: authHeaders(), cache: 'no-store' }
   if (body !== undefined) {
     init.headers = authHeaders({ 'Content-Type': 'application/json' })
     init.body = JSON.stringify(body)
   }
-  const res = await fetch(api(path), init)
-  const text = await res.text()
-  if (!res.ok) {
-    // 原文（状态码 + 响应体 + 内部路径）只进服务端日志，对外抛中性常量（§8）
-    console.error(`[cpa] ${method} ${path} ${res.status}`, text)
-    throw new Error(CPA_UNAVAILABLE)
+  try {
+    return await outboundJson(api(path), init, {
+      service: 'cpa',
+      operation: `management_${method.toLowerCase()}`,
+    })
+  } catch (error) {
+    if (error instanceof OutboundRequestError) {
+      throw new Error(CPA_UNAVAILABLE)
+    }
+    throw error
   }
-  return text ? JSON.parse(text) : {}
+}
+
+async function reqOk(method: string, path: string, body?: unknown): Promise<void> {
+  const init: RequestInit = { method, headers: authHeaders(), cache: 'no-store' }
+  if (body !== undefined) {
+    init.headers = authHeaders({ 'Content-Type': 'application/json' })
+    init.body = JSON.stringify(body)
+  }
+  try {
+    await outboundOk(api(path), init, {
+      service: 'cpa',
+      operation: `management_${method.toLowerCase()}`,
+    })
+  } catch (error) {
+    if (error instanceof OutboundRequestError) throw new Error(CPA_UNAVAILABLE)
+    throw error
+  }
 }
 
 interface RawFile {
@@ -367,17 +409,26 @@ const realClient: CpaClient = {
     // before＝授权前 auth-files 文件名快照（P1b-4：由 collect 层在 startOAuth 拍、按 state 持久化后读入
     // 传来）。快照拍于授权动作之前，findNew 只认快照外的新文件名，避免把号池既有号（不在 hub known、
     // 授权前就存在）误当成用户刚授权的新号（见 findNew 注释③）。持久化跨请求＝retry 读同一快照不孤立。
-    await req('POST', '/v0/management/oauth-callback', { provider: CPA_PROVIDER[provider], redirect_url: redirectUrl })
+    await reqOk('POST', '/v0/management/oauth-callback', {
+      provider: CPA_PROVIDER[provider],
+      redirect_url: redirectUrl,
+    })
     if (state) {
-      for (let i = 0; i < 15; i++) {
+      let completed = false
+      for (let i = 0; i < OAUTH_STATUS_MAX_POLLS; i++) {
         const s = await getAuthStatus(state)
-        if (s.status === 'ok') break
-        if (s.status === 'error') {
-          if (s.error) console.error('[cpa] get-auth-status error', s.error) // cpamp 原文留服务端排查，不透传（§8）
-          throw new Error('授权失败')
+        if (s.status === 'ok') {
+          completed = true
+          break
         }
-        await sleep(1000)
+        if (s.status === 'error') {
+          console.error('[cpa] oauth_status terminal_error')
+          throw oauthTerminal()
+        }
+        await sleep(OAUTH_STATUS_POLL_DELAY_MS)
       }
+      // 未到明确终态时不猜新文件；保留 collect 层 session/lease，让同一 state 可安全重试。
+      if (!completed) throw new Error('授权仍在处理中，请稍后重试')
     }
     return findNew(this, provider, known, before)
   },
@@ -385,7 +436,7 @@ const realClient: CpaClient = {
   async checkOAuth(provider, state, knownAccountIds, before) {
     const s = await getAuthStatus(state)
     if (s.status === 'error') {
-      if (s.error) console.error('[cpa] get-auth-status error', s.error) // cpamp 原文留服务端排查，不透传（§8）
+      console.error('[cpa] oauth_status terminal_error')
       return { status: 'error', error: '授权失败' }
     }
     if (s.status !== 'ok') return { status: 'wait' }
@@ -398,38 +449,68 @@ const realClient: CpaClient = {
 
   async ingestRefreshToken(rt, knownAccountIds) {
     const known = new Set(knownAccountIds)
-    const res = await fetch(OPENAI_TOKEN_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ grant_type: 'refresh_token', client_id: OPENAI_CLIENT_ID, refresh_token: rt, scope: 'openid profile email offline_access' }),
-    })
-    if (!res.ok) throw new Error(`Refresh Token 无效或已过期（${res.status}）`)
-    const tok = (await res.json()) as { access_token: string; id_token: string; refresh_token?: string }
+    let raw: unknown
+    try {
+      raw = await outboundJson(
+        OPENAI_TOKEN_URL,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ grant_type: 'refresh_token', client_id: OPENAI_CLIENT_ID, refresh_token: rt, scope: 'openid profile email offline_access' }),
+        },
+        { service: 'openai', operation: 'refresh_token' },
+      )
+    } catch (error) {
+      if (
+        error instanceof OutboundRequestError &&
+        error.kind === 'http' &&
+        (error.status === 400 || error.status === 401)
+      ) {
+        throw new Error('Refresh Token 无效或已过期')
+      }
+      throw new Error(CPA_UNAVAILABLE)
+    }
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error(CPA_UNAVAILABLE)
+    const tok = raw as { access_token?: unknown; id_token?: unknown; refresh_token?: unknown }
+    if (typeof tok.access_token !== 'string' || !tok.access_token || typeof tok.id_token !== 'string' || !tok.id_token) {
+      throw new Error(CPA_UNAVAILABLE)
+    }
     const { accountId, email } = parseIdToken(tok.id_token)
     if (!accountId) throw new Error('无法从令牌解析账号信息')
     if (known.has(accountId)) return { accountId, email, plan: 'unknown', authFileName: '', duplicate: true }
     const authFile = {
       type: 'codex', id_token: tok.id_token, access_token: tok.access_token,
-      refresh_token: tok.refresh_token ?? rt, account_id: accountId, email, last_refresh: new Date().toISOString(),
+      refresh_token: typeof tok.refresh_token === 'string' && tok.refresh_token ? tok.refresh_token : rt,
+      account_id: accountId, email, last_refresh: new Date().toISOString(),
     }
     const fileName = `codex-${accountId}.json`
     const form = new FormData()
     form.append('file', new Blob([JSON.stringify(authFile)], { type: 'application/json' }), fileName)
-    const up = await fetch(api('/v0/management/auth-files'), { method: 'POST', headers: authHeaders(), body: form })
-    if (!up.ok) {
-      // cpamp 上传响应原文只进服务端日志，对外抛中性常量（§8）。响应体不含我们上传的 RT/token。
-      console.error(`[cpa] POST /v0/management/auth-files ${up.status}`, await up.text())
+    try {
+      await outboundOk(
+        api('/v0/management/auth-files'),
+        { method: 'POST', headers: authHeaders(), body: form },
+        { service: 'cpa', operation: 'auth_file_upload' },
+      )
+    } catch {
       throw new Error(CPA_UNAVAILABLE)
     }
     return { accountId, email, plan: 'unknown', authFileName: fileName, duplicate: false }
   },
 
   async listAuthFiles() {
-    const data = (await req('GET', '/v0/management/auth-files')) as { files?: RawFile[] }
-    return (data.files ?? []).map(normFile)
+    const data = await req('GET', '/v0/management/auth-files')
+    if (!data || typeof data !== 'object' || Array.isArray(data) || !Array.isArray((data as { files?: unknown }).files)) {
+      try {
+        invalidOutboundShape('cpa', 'auth_files_list')
+      } catch {
+        throw new Error(CPA_UNAVAILABLE)
+      }
+    }
+    return ((data as { files: RawFile[] }).files).map(normFile)
   },
   async setDisabled(name, disabled) {
-    await req('PATCH', '/v0/management/auth-files/status', { name, disabled })
+    await reqOk('PATCH', '/v0/management/auth-files/status', { name, disabled })
   },
   async setPriority(name, priority) {
     // 端点/字段/生效链已按 CLIProxyAPI 上游 main 源码核对（对接-R2b codex 双通道复查）：
@@ -443,10 +524,10 @@ const realClient: CpaClient = {
     //     collectAvailableByPriority 按优先级分桶调度（数字越大越先，与 P0-A 记载闭环）。
     // ⚠️ 仍未对真实实例发过写，且线上 cpamp 版本可能滞后于上游 main——对接-R3 用一次性测试号
     //   实测后方可视为已验。本单 realClient 依旧不真调（全部验证走 MOCK）。
-    await req('PATCH', '/v0/management/auth-files/fields', { name, priority })
+    await reqOk('PATCH', '/v0/management/auth-files/fields', { name, priority })
   },
   async deleteAuthFile(name) {
-    await req('DELETE', `/v0/management/auth-files?name=${encodeURIComponent(name)}`)
+    await reqOk('DELETE', `/v0/management/auth-files?name=${encodeURIComponent(name)}`)
   },
   // 🔴 不变量（P6-R2 R7-P2③ + 对接-R3b）：**本函数只在 run.status === 'completed' 时正常返回**，
   //    没到可验证成功终态一律抛错。results 只是载荷：字段存在、空数组或非空数组都不能单独证明 run

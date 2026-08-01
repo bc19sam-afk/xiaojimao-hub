@@ -1,6 +1,5 @@
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
-import { setTimeout as sleep } from 'node:timers/promises'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -36,28 +35,48 @@ after(() => {
   fs.rmSync(tmpDir, { recursive: true, force: true })
 })
 
-// 快照生命周期：set/get 往返、UPSERT 覆盖、空数组、delete 后为 null、缺失键为 null
-test('快照生命周期：set/get 往返、UPSERT 覆盖、delete 后为 null、缺失键为 null', () => {
+// 安全会话生命周期：租约 + snapshot 建立，operation claim 后按 fencing token 完成并释放。
+test('安全会话生命周期：建立、claim、完成后 snapshot 与 provider lease 一并释放', () => {
   assert.equal(db.getOAuthSnapshot('never'), null) // 缺失键 → null
-  db.setOAuthSnapshot('s1', ['a.json', 'b.json'])
+  const now = Date.now()
+  assert.equal(db.acquireOAuthProviderLease({
+    provider: 'codex', linuxdoId: 1, leaseToken: 'lease-s1', now, expiresAt: now + 60_000,
+  }), true)
+  assert.equal(db.createOAuthSession({
+    state: 's1', fileNames: ['a.json', 'b.json'], linuxdoId: 1, provider: 'codex',
+    leaseToken: 'lease-s1', createdAt: now, expiresAt: now + 60_000,
+  }), true)
   assert.deepEqual(db.getOAuthSnapshot('s1'), ['a.json', 'b.json']) // 往返
-  db.setOAuthSnapshot('s1', ['c.json']) // 同 state UPSERT 覆盖
-  assert.deepEqual(db.getOAuthSnapshot('s1'), ['c.json'])
-  db.setOAuthSnapshot('s2', []) // 空数组也能存/取
-  assert.deepEqual(db.getOAuthSnapshot('s2'), [])
-  db.deleteOAuthSnapshot('s1')
-  assert.equal(db.getOAuthSnapshot('s1'), null) // 删后为 null
-  assert.deepEqual(db.getOAuthSnapshot('s2'), []) // 不误删其它 key
+  const claim = db.claimOAuthSession({
+    state: 's1', provider: 'codex', linuxdoId: 1, operationToken: 'op-s1',
+    now: now + 1, operationExpiresAt: now + 30_000,
+  })
+  assert.equal(claim.status, 'claimed')
+  assert.equal(db.completeOAuthSession('s1', 'lease-s1', 'op-s1'), true)
+  assert.equal(db.getOAuthSnapshot('s1'), null)
+  assert.equal(db.acquireOAuthProviderLease({
+    provider: 'codex', linuxdoId: 2, leaseToken: 'lease-next', now: now + 2, expiresAt: now + 60_002,
+  }), true)
+  assert.equal(db.releaseOAuthProviderLease('codex', 'lease-next'), true)
 })
 
-// 快照清理：cleanupOAuthSnapshots 删过期、留新鲜
-test('快照清理：cleanupOAuthSnapshots 删过期、留新鲜', async () => {
-  db.setOAuthSnapshot('old', ['x.json'])
-  await sleep(200) // 拉开 created_at，让 old 远早于阈值
-  db.setOAuthSnapshot('fresh', ['y.json'])
-  // 删 100ms 前的：old(~200ms 前)删、fresh(~0ms)留。阈值放宽到 100ms（原 30ms 太紧）——fresh 到本行是
-  // 相邻同步两句、间隔本应微秒级，但 CI runner 负载/GC 停顿可使其 >30ms → fresh 被误判过期删掉（flaky）。
-  db.cleanupOAuthSnapshots(100)
+// 过期清理同时清 snapshot 与 lease，保留未过期的另一 provider 会话。
+test('OAuth 会话清理：删过期 snapshot/lease，保留未过期会话', () => {
+  assert.equal(db.acquireOAuthProviderLease({
+    provider: 'claude', linuxdoId: 3, leaseToken: 'lease-old', now: 100, expiresAt: 150,
+  }), true)
+  assert.equal(db.createOAuthSession({
+    state: 'old', fileNames: ['x.json'], linuxdoId: 3, provider: 'claude', leaseToken: 'lease-old',
+    createdAt: 100, expiresAt: 150,
+  }), true)
+  assert.equal(db.acquireOAuthProviderLease({
+    provider: 'grok', linuxdoId: 4, leaseToken: 'lease-fresh', now: 100, expiresAt: 300,
+  }), true)
+  assert.equal(db.createOAuthSession({
+    state: 'fresh', fileNames: ['y.json'], linuxdoId: 4, provider: 'grok', leaseToken: 'lease-fresh',
+    createdAt: 100, expiresAt: 300,
+  }), true)
+  db.cleanupOAuthSessions(200)
   assert.equal(db.getOAuthSnapshot('old'), null)
   assert.deepEqual(db.getOAuthSnapshot('fresh'), ['y.json'])
 })
@@ -65,7 +84,7 @@ test('快照清理：cleanupOAuthSnapshots 删过期、留新鲜', async () => {
 // mock 流程安全：startOAuth 存快照、finishOAuth 完成并清快照，全程不因快照读写报错
 test('mock 流程：startOAuth 存快照、finishOAuth 完成并清快照，不报错', async () => {
   const uid = 5001
-  const start = await collect.startOAuth('codex') // mock 返回 state；collect 授权前存快照
+  const start = await collect.startOAuth(user(uid), 'codex') // mock 返回 state；collect 授权前存快照
   assert.ok(start.state, 'mock startOAuth 应返回 state')
   assert.notEqual(db.getOAuthSnapshot(start.state), null) // 快照已存（mock 号池为空则存 []）
 

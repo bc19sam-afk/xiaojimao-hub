@@ -506,6 +506,33 @@ export const migrations: Migration[] = [
       `)
     },
   },
+  {
+    version: 14,
+    // migration 014（release hardening）：OAuth 会话归属与 provider 级持久租约。
+    // oauth_snapshots 的旧行没有用户/provider/租约信息，新增列故意保持 nullable：迁移不猜归属、
+    // 运行期 claim 会把这些 legacy 行视为无效并 fail closed。新写入必须填满这些列。
+    // oauth_provider_leases 以 provider 为主键，同一 provider 同时只有一个有效授权会话；
+    // lease_token 是 fencing token，所有释放都必须同时匹配 token，旧请求不能删掉后来者的租约。
+    up(db) {
+      db.exec('ALTER TABLE oauth_snapshots ADD COLUMN linuxdo_id INTEGER')
+      db.exec('ALTER TABLE oauth_snapshots ADD COLUMN provider TEXT')
+      db.exec('ALTER TABLE oauth_snapshots ADD COLUMN expires_at INTEGER')
+      db.exec('ALTER TABLE oauth_snapshots ADD COLUMN lease_token TEXT')
+      db.exec('ALTER TABLE oauth_snapshots ADD COLUMN operation_token TEXT')
+      db.exec('ALTER TABLE oauth_snapshots ADD COLUMN operation_expires_at INTEGER')
+      db.exec(`
+        CREATE TABLE oauth_provider_leases (
+          provider    TEXT PRIMARY KEY,
+          lease_token TEXT NOT NULL UNIQUE,
+          linuxdo_id  INTEGER NOT NULL,
+          created_at  INTEGER NOT NULL,
+          expires_at  INTEGER NOT NULL
+        );
+        CREATE INDEX idx_oauth_snapshots_expires ON oauth_snapshots(expires_at);
+        CREATE INDEX idx_oauth_leases_expires ON oauth_provider_leases(expires_at);
+      `)
+    },
+  },
 ]
 
 // 代码所知的最新 schema 版本（从 migrations 数组派生，勿手写）

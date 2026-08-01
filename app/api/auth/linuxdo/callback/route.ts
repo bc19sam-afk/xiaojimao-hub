@@ -32,8 +32,9 @@ export async function GET(req: NextRequest) {
     res.cookies.set(SESSION_COOKIE, jwt, sessionCookieOptions(isSecureRequest(req)))
     res.cookies.delete('ld_state')
     return res
-  } catch (e) {
-    console.error('[linuxdo callback]', e)
+  } catch {
+    // 外部错误只记固定分类；不得把 token、URL、响应体或原始异常带进日志。
+    console.error('[linuxdo] callback_failed')
     return fail('oauth')
   }
 }

@@ -585,7 +585,12 @@ test('只结算已过完自然日：昨天结算、今天与未来日不结', as
 test('MOCK 端到端：交号 → 入池 → 按日结算 → 余额增加、settlement 有笔、排行榜反映', async () => {
   const user: SessionUser = { id: 7041, username: 'e2e-user', trustLevel: 3 }
   // 交号（claude 走 redirect：mock 造号 + 记 contribution submitted）
-  const res = await collect.finishOAuth(user, 'claude', 'https://auth.example/cb?state=e2e-state')
+  const start = await collect.startOAuth(user, 'claude')
+  const res = await collect.finishOAuth(
+    user,
+    'claude',
+    `https://auth.example/cb?state=${encodeURIComponent(start.state)}`,
+  )
   if (!res.ok) throw new Error('交号应成功：' + res.error)
   const cid = res.contribution.id
   const accountId = res.contribution.accountId
