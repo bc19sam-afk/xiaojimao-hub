@@ -6,6 +6,7 @@ import {
   oauthCompletedResponse,
   oauthExceptionResponse,
   oauthFailureResponse,
+  parseOAuthRequestBody,
 } from '@/lib/oauth-route'
 
 const VALID: ProviderId[] = ['codex', 'claude', 'grok']
@@ -14,7 +15,9 @@ const VALID: ProviderId[] = ['codex', 'claude', 'grok']
 export async function POST(req: NextRequest) {
   const user = await getCurrentUser()
   if (!user) return oauthFailureResponse('AUTH_REQUIRED')
-  const body = await req.json().catch(() => ({}))
+  const parsed = await parseOAuthRequestBody(req)
+  if (!parsed.ok) return parsed.response
+  const body = parsed.body
   const provider = String(body.provider || 'codex') as ProviderId
   const url = String(body.redirect_url || '').trim()
   if (!VALID.includes(provider)) return oauthFailureResponse('UNSUPPORTED_PROVIDER')

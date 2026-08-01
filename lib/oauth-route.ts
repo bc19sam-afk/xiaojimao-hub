@@ -7,6 +7,27 @@ import {
   type OAuthSessionView,
 } from './oauth-protocol'
 
+export type OAuthRequestBody = Record<string, unknown>
+
+export type OAuthRequestBodyResult =
+  | { ok: true; body: OAuthRequestBody }
+  | { ok: false; response: NextResponse }
+
+export async function parseOAuthRequestBody(
+  request: Pick<Request, 'json'>,
+): Promise<OAuthRequestBodyResult> {
+  let body: unknown
+  try {
+    body = await request.json()
+  } catch {
+    return { ok: false, response: oauthFailureResponse('INVALID_REQUEST') }
+  }
+  if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+    return { ok: false, response: oauthFailureResponse('INVALID_REQUEST') }
+  }
+  return { ok: true, body: body as OAuthRequestBody }
+}
+
 export function oauthFailureResponse(code: OAuthErrorCode): NextResponse {
   const failure = oauthFailure(code)
   return NextResponse.json(failure.body, { status: failure.status })

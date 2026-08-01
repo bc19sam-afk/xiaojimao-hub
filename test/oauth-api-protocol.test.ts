@@ -2,6 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import path from 'node:path'
+import { NextRequest } from 'next/server'
 import {
   oauthClientDisposition,
   oauthErrorCode,
@@ -9,7 +10,11 @@ import {
   oauthPending,
   shouldClearOAuthSession,
 } from '../lib/oauth-protocol.ts'
-import { oauthFailureResponse, oauthPendingResponse } from '../lib/oauth-route.ts'
+import {
+  oauthFailureResponse,
+  oauthPendingResponse,
+  parseOAuthRequestBody,
+} from '../lib/oauth-route.ts'
 
 const root = process.cwd()
 
@@ -152,10 +157,66 @@ test('route helpers emit the exact HTTP status and JSON code consumed by the UI'
   })
 })
 
+test('OAuth request body parser rejects malformed and non-object JSON before startOAuth', async () => {
+  let startOAuthCalls = 0
+  const startOAuth = async () => {
+    startOAuthCalls++
+    return new Response(null, { status: 204 })
+  }
+
+  for (const [label, body] of [
+    ['malformed JSON', '{'],
+    ['null', 'null'],
+    ['array', '[]'],
+    ['string', '"codex"'],
+    ['number', '42'],
+    ['boolean', 'true'],
+  ] as const) {
+    const request = new NextRequest('http://localhost/api/collect/oauth/start', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body,
+    })
+    const parsed = await parseOAuthRequestBody(request)
+    const response = parsed.ok ? await startOAuth() : parsed.response
+
+    assert.equal(response.status, 400, label)
+    assert.deepEqual(await response.json(), oauthFailure('INVALID_REQUEST').body, label)
+  }
+
+  assert.equal(startOAuthCalls, 0, 'invalid JSON bodies must be rejected before startOAuth')
+})
+
+test('OAuth request body parser accepts only a non-null, non-array JSON object', async () => {
+  const request = new NextRequest('http://localhost/api/collect/oauth/start', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ provider: 'codex' }),
+  })
+  const parsed = await parseOAuthRequestBody(request)
+
+  assert.equal(parsed.ok, true)
+  if (parsed.ok) assert.deepEqual(parsed.body, { provider: 'codex' })
+})
+
 test('OAuth routes share the protocol helper and expose recovery plus idempotent cancellation', () => {
   for (const route of ['start', 'finish', 'check', 'session', 'cancel']) {
     const source = fs.readFileSync(path.join(root, `app/api/collect/oauth/${route}/route.ts`), 'utf8')
     assert.match(source, /oauthFailureResponse/)
+  }
+  for (const [route, operation] of [
+    ['start', 'startOAuth'],
+    ['check', 'checkOAuth'],
+    ['finish', 'finishOAuth'],
+    ['cancel', 'cancelOAuth'],
+  ] as const) {
+    const source = fs.readFileSync(path.join(root, `app/api/collect/oauth/${route}/route.ts`), 'utf8')
+    const parseAt = source.indexOf('await parseOAuthRequestBody(req)')
+    const operationAt = source.indexOf(`await ${operation}(`)
+    assert.ok(parseAt >= 0, `${route} must use the shared OAuth request body parser`)
+    assert.ok(operationAt > parseAt, `${route} must reject invalid bodies before ${operation}`)
+    assert.match(source, /if \(!parsed\.ok\) return parsed\.response/)
+    assert.doesNotMatch(source, /req\.json\(/)
   }
   const check = fs.readFileSync(path.join(root, 'app/api/collect/oauth/check/route.ts'), 'utf8')
   assert.match(check, /oauthPendingResponse/)
