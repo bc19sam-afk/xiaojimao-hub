@@ -7,6 +7,28 @@
 
 const mock = (process.env.MOCK ?? 'true') !== 'false'
 
+const MOCK_WORKER_INTERVAL_MS = 8_000
+const REAL_WORKER_INTERVAL_MS = 5 * 60_000
+const MIN_MOCK_WORKER_INTERVAL_MS = 1_000
+const MIN_REAL_WORKER_INTERVAL_MS = 30_000
+
+export function resolveWorkerIntervalMs(raw: string | undefined, isMock: boolean): number {
+  if (raw === undefined || raw.trim() === '') {
+    return isMock ? MOCK_WORKER_INTERVAL_MS : REAL_WORKER_INTERVAL_MS
+  }
+  if (!/^[1-9]\d*$/.test(raw)) {
+    throw new Error('[env] WORKER_INTERVAL_MS 必须是正十进制整数；已拒绝启动。')
+  }
+  const value = Number(raw)
+  const minimum = isMock ? MIN_MOCK_WORKER_INTERVAL_MS : MIN_REAL_WORKER_INTERVAL_MS
+  if (!Number.isSafeInteger(value) || value < minimum) {
+    throw new Error(
+      `[env] WORKER_INTERVAL_MS 过小或超出安全整数范围；${isMock ? 'MOCK' : '非 MOCK'} 模式最小值为 ${minimum}ms，已拒绝启动。`,
+    )
+  }
+  return value
+}
+
 // 会话密钥：生产必须是强随机（>=32 字符）。缺失/过短时——
 //   mock 本地开发：允许临时密钥（告警）；
 //   非 mock：拒绝启动。
@@ -102,8 +124,8 @@ export const env = {
   worker: {
     // 后台自动巡检开关。需常驻 Node 服务（next start 自托管），serverless 无效。
     enabled: (process.env.WORKER_ENABLED ?? 'true') !== 'false',
-    // 巡检间隔（毫秒）。mock 下 8s 便于演示；真实对接 cpamp 时应放大到分钟级。
-    intervalMs: Number(process.env.WORKER_INTERVAL_MS ?? '8000'),
+    // 未配置：mock 8s 便于演示；非 mock 5min，避免持续压 CPA。非空脏值/危险小值启动期拒绝。
+    intervalMs: resolveWorkerIntervalMs(process.env.WORKER_INTERVAL_MS, mock),
     // dead-man 心跳地址（可选，空＝关闭）。见 resolveHeartbeatUrl。
     heartbeatUrl: resolveHeartbeatUrl(),
   },

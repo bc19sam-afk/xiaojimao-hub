@@ -69,7 +69,7 @@ export default function DashboardShell({
     load()
   }, [load])
 
-  // 首检中的号 → 5s 快轮询（首检态几秒出结果）；有 pooled 号 → 30s 慢轮询——R3 的存活巡检会把
+  // 首检中的号 → 5s 快轮询（只刷新 UI；生产 worker 默认约 5 分钟一轮）；有 pooled 号 → 30s 慢轮询——R3 的存活巡检会把
   // pooled 背景转 stopped/needs_review、R2 按日结算也背景加分/改累计，不轮询则一直显示「在用」、
   // 余额/明细停更直到手动刷新（GitHub bot 于 PR #18 指出）。快慢并存时取快（5s）。
   useEffect(() => {
@@ -141,7 +141,6 @@ export default function DashboardShell({
               rejections={rejections}
               loading={loading}
               onReload={load}
-              onVerified={afterChange}
             />
           </div>
           <div className="min-w-0 space-y-6">

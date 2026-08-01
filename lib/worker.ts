@@ -9,7 +9,7 @@ import { env } from './env'
 //   健康 → 启用 + 发兑换码；坏号 → 淘汰。无需人工点「立即验证」。
 //
 // ⚠️ 依赖常驻 Node 进程（next start 自托管 / dev）。serverless（Vercel）不适用，
-//    那种环境要改用外部 cron 定时打 /api/verify-now。
+//    那种环境需另行设计受鉴权的调度入口；普通用户接口不能驱动全局巡检。
 // ============================================================================
 
 let started = false
@@ -135,9 +135,9 @@ export async function pingHeartbeat(
       return false
     }
     return true
-  } catch (e) {
-    // 🔴 §8：只记「失败」与错误对象，绝不回显心跳 URL（含 uuid 型密钥）
-    console.warn('[worker] 心跳发送失败（不影响巡检）：', e)
+  } catch {
+    // 🔴 §8：只记固定分类，绝不回显心跳 URL、响应体或原始异常。
+    console.warn('[worker] 心跳发送失败（不影响巡检）：network_or_timeout')
     return false
   } finally {
     clearTimeout(timer)

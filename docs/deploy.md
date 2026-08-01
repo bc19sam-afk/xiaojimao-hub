@@ -271,24 +271,47 @@ chmod 600 /secure/local-dir/backup-2026-07-26T01-00-00-a1b2c3.db /secure/local-d
 
 ```nginx
 server {
+    listen 80;
+    server_name hub.example.com;
+    return 301 https://hub.example.com$request_uri;  # 固定域名，不反射客户端 Host
+}
+
+server {
     listen 443 ssl http2;
     server_name hub.example.com;        # ← 你的域名
 
     ssl_certificate     /etc/letsencrypt/live/hub.example.com/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/hub.example.com/privkey.pem;
 
+    # 最小浏览器安全头；确认 HTTPS/证书续期稳定后再启用 HSTS。
+    add_header Strict-Transport-Security "max-age=15552000" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "DENY" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+
+    # 收紧慢请求与异常大 body；本项目不需要无限上传。
+    client_max_body_size 2m;
+    client_body_timeout 15s;
+    send_timeout 60s;
+
     location / {
         proxy_pass         http://127.0.0.1:3000;
         proxy_http_version 1.1;
-        proxy_set_header   Host              $host;
+        proxy_connect_timeout 5s;
+        proxy_send_timeout 60s;
+        # 覆盖 OAuth finish 的约 345s operation fence，避免慢 CPA 合法请求被反代提前截断。
+        proxy_read_timeout 360s;
+        proxy_set_header   Host              hub.example.com;
         proxy_set_header   X-Real-IP         $remote_addr;
         proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
         proxy_set_header   X-Forwarded-Proto $scheme;
         proxy_set_header   X-Forwarded-Host  hub.example.com;   # 钉死你的域名，别用 $host（默认/唯一 server 下 $host 兜底取客户端 Host 头，伪造照样透传）；TRUST_FORWARDED_HEADERS=true 时据此推断域名，见 §6.2
     }
 }
-# 80 端口重定向到 443（略）
 ```
+
+HSTS 会被浏览器记住；只在该域名已稳定提供 HTTPS、证书自动续期已验证后启用。示例故意不加
+`includeSubDomains`/`preload`，也不引入大型 CSP，避免把本项目之外的子域或现有前端资源一起锁死。
 
 ### 6.2 域名与 env 对齐
 

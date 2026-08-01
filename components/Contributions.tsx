@@ -1,6 +1,5 @@
 'use client'
 
-import { useState } from 'react'
 import { ArrowsClockwiseIcon, ShieldCheckIcon, WarningCircleIcon } from '@phosphor-icons/react'
 
 interface Contribution {
@@ -38,39 +37,17 @@ export default function Contributions({
   rejections = [],
   loading,
   onReload,
-  onVerified,
 }: {
   list: Contribution[]
   rejections?: Rejection[]
   loading: boolean
   onReload: () => void
-  onVerified: () => void
 }) {
-  const [verifying, setVerifying] = useState(false)
-
-  async function verifyNow() {
-    setVerifying(true)
-    try {
-      await fetch('/api/verify-now', { method: 'POST' })
-      onVerified()
-    } finally {
-      setVerifying(false)
-    }
-  }
-
   return (
     <div className="min-w-0 rounded-2xl border border-white/10 bg-white/[0.03] p-4 sm:p-6">
       <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
         <h3 className="font-bold text-white">我的贡献记录</h3>
         <div className="flex gap-2">
-          <button
-            onClick={verifyNow}
-            disabled={verifying}
-            className="inline-flex items-center gap-1.5 rounded-lg border border-emerald-400/30 bg-emerald-400/10 px-3 py-1.5 text-xs font-semibold text-emerald-300 transition hover:bg-emerald-400/20 disabled:opacity-50"
-          >
-            <ShieldCheckIcon size={14} weight="bold" />
-            {verifying ? '验证中…' : '立即验证'}
-          </button>
           <button
             onClick={onReload}
             className="inline-flex items-center gap-1.5 rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 text-xs text-neutral-300 transition hover:bg-white/10"

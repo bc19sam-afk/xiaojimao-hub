@@ -93,7 +93,7 @@ function spawnProbeServer(
       NEXT_RUNTIME: 'nodejs',
       MOCK: options.mock ? 'true' : 'false',
       WORKER_ENABLED: options.workerEnabled ? 'true' : 'false',
-      WORKER_INTERVAL_MS: String(options.workerIntervalMs ?? 8000),
+      WORKER_INTERVAL_MS: String(options.workerIntervalMs ?? (options.mock ? 8000 : 300000)),
       DB_PATH: dbPath,
       MOCK_CPA_PATH: options.mockCpaPath ?? path.join(dir, 'mock-cpa.json'),
       SESSION_SECRET: 'x'.repeat(64),
@@ -381,7 +381,7 @@ test('enabled worker retries readiness and starts a real collect tick after a br
     server = await spawnProbeServer(dbPath, {
       mock: true,
       workerEnabled: true,
-      workerIntervalMs: 100,
+      workerIntervalMs: 1_000,
       mockCpaPath,
     })
     const health = await fetch(`${server.baseUrl}/api/health`)
