@@ -12,7 +12,7 @@ export interface LinuxDoUser {
   trust_level?: number
   avatar_url?: string
   avatar_template?: string
-  active?: boolean
+  active: true
   [k: string]: unknown
 }
 
@@ -109,8 +109,7 @@ export async function fetchLinuxDoUser(accessToken: string): Promise<LinuxDoUser
     typeof trust === 'number' &&
     Number.isSafeInteger(trust) &&
     trust >= 0 &&
-    value.active !== false &&
-    (value.active === undefined || typeof value.active === 'boolean') &&
+    value.active === true &&
     (value.name === undefined || typeof value.name === 'string') &&
     (value.avatar_url === undefined || typeof value.avatar_url === 'string') &&
     (value.avatar_template === undefined || typeof value.avatar_template === 'string')
@@ -120,7 +119,7 @@ export async function fetchLinuxDoUser(accessToken: string): Promise<LinuxDoUser
     id: value.id as number,
     username: (value.username as string).trim(),
     trust_level: trust as number,
-    active: value.active as boolean | undefined,
+    active: true,
     name: value.name as string | undefined,
     avatar_url: value.avatar_url as string | undefined,
     avatar_template: value.avatar_template as string | undefined,

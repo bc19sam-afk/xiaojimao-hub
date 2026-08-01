@@ -1,9 +1,13 @@
 import { test, before } from 'node:test'
 import assert from 'node:assert/strict'
+import fs from 'node:fs'
+import path from 'node:path'
 
 let exchangeCodeForToken: typeof import('../lib/linuxdo.ts').exchangeCodeForToken
 let fetchLinuxDoUser: typeof import('../lib/linuxdo.ts').fetchLinuxDoUser
 let LINUXDO_UNAVAILABLE: string
+
+const root = path.resolve(import.meta.dirname, '..')
 
 const SECRET = 'linuxdo-secret-response token=abc /private/path'
 
@@ -81,7 +85,7 @@ test('Linux.do userinfo：合法最小身份通过并规整 username', async () 
   assert.equal(userinfoSignal, true, 'Linux.do userinfo 必须带 AbortSignal')
 })
 
-test('Linux.do userinfo：坏身份、非有限信任等级和 active=false 全部 fail-closed', async () => {
+test('Linux.do userinfo：坏身份、非有限信任等级和 active 非严格 true 全部 fail-closed', async () => {
   const invalid = [
     {},
     [],
@@ -93,7 +97,9 @@ test('Linux.do userinfo：坏身份、非有限信任等级和 active=false 全�
     { id: 1, username: 'u', trust_level: '3' },
     { id: 1, username: 'u', trust_level: -1 },
     { id: 1, username: 'u', trust_level: 1.5 },
+    { id: 1, username: 'u', trust_level: 1 },
     { id: 1, username: 'u', trust_level: 1, active: false },
+    { id: 1, username: 'u', trust_level: 1, active: null },
     { id: 1, username: 'u', trust_level: 1, active: 'yes' },
   ]
   for (const payload of invalid) {
@@ -106,6 +112,20 @@ test('Linux.do userinfo：坏身份、非有限信任等级和 active=false 全�
     assert.equal(result.error?.message, '外部服务请求失败')
     assert.match(result.logs, /linuxdo\.userinfo invalid_shape/)
   }
+})
+
+test('Linux.do callback：必须在 userinfo 严格校验后才签发 session cookie', () => {
+  const callback = fs.readFileSync(
+    path.join(root, 'app/api/auth/linuxdo/callback/route.ts'),
+    'utf8',
+  )
+  const profileAt = callback.indexOf('await fetchLinuxDoUser')
+  const signAt = callback.indexOf('await signSession')
+  const cookieAt = callback.indexOf('res.cookies.set(SESSION_COOKIE')
+
+  assert.ok(profileAt >= 0 && profileAt < signAt, 'userinfo 校验必须先于 session 签名')
+  assert.ok(signAt >= 0 && signAt < cookieAt, 'session cookie 必须只使用校验后的 profile')
+  assert.match(callback, /catch\s*\{[\s\S]*return fail\('oauth'\)/, 'userinfo 拒绝必须走失败分支')
 })
 
 test('Linux.do HTTP/坏 JSON 错误对外中性，日志不含 URL 或响应体', async () => {

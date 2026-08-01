@@ -264,6 +264,77 @@ function oauthTerminal(message = '授权失败'): Error {
   return Object.assign(new Error(message), { oauthTerminal: true })
 }
 
+function failCpaShape(operation: string): never {
+  try {
+    invalidOutboundShape('cpa', operation)
+  } catch {
+    throw new Error(CPA_UNAVAILABLE)
+  }
+}
+
+function isOAuthRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0
+}
+
+function isHttpUrl(value: string): boolean {
+  try {
+    const parsed = new URL(value)
+    return (parsed.protocol === 'http:' || parsed.protocol === 'https:') && parsed.hostname.length > 0
+  } catch {
+    return false
+  }
+}
+
+function parseOAuthStart(value: unknown): StartResult {
+  if (!isOAuthRecord(value)) failCpaShape('oauth_start')
+
+  const state = value.state
+  const url = value.url
+  const rawFlow = value.flow
+  const rawUserCode = value.user_code
+
+  if (!isNonEmptyString(state) || !isNonEmptyString(url) || !isHttpUrl(url)) {
+    failCpaShape('oauth_start')
+  }
+  if (rawFlow !== undefined && rawFlow !== 'redirect' && rawFlow !== 'device') {
+    failCpaShape('oauth_start')
+  }
+  if (rawUserCode !== undefined && !isNonEmptyString(rawUserCode)) {
+    failCpaShape('oauth_start')
+  }
+
+  const flow = rawFlow === 'device' || (rawFlow === undefined && rawUserCode !== undefined)
+    ? 'device'
+    : 'redirect'
+  if ((flow === 'device' && rawUserCode === undefined) || (flow === 'redirect' && rawUserCode !== undefined)) {
+    failCpaShape('oauth_start')
+  }
+
+  return { state, url, flow, userCode: rawUserCode }
+}
+
+type OAuthStatusPayload = { status: 'ok' | 'wait' | 'error'; error?: string }
+
+function parseOAuthStatus(value: unknown): OAuthStatusPayload {
+  if (!isOAuthRecord(value)) failCpaShape('oauth_status')
+  const status = value.status
+  const error = value.error
+  if (status !== 'ok' && status !== 'wait' && status !== 'error') {
+    failCpaShape('oauth_status')
+  }
+  if (error !== undefined && typeof error !== 'string') {
+    failCpaShape('oauth_status')
+  }
+  if (status !== 'error' && error !== undefined) {
+    failCpaShape('oauth_status')
+  }
+  return error === undefined ? { status } : { status, error }
+}
+
 async function req(
   method: string,
   path: string,
@@ -349,11 +420,8 @@ function parseIdToken(idToken: string): { accountId: string; email: string } {
   }
 }
 
-async function getAuthStatus(state: string): Promise<{ status: string; error?: string }> {
-  return (await req('GET', `/v0/management/get-auth-status?state=${encodeURIComponent(state)}`)) as {
-    status: string
-    error?: string
-  }
+async function getAuthStatus(state: string): Promise<OAuthStatusPayload> {
+  return parseOAuthStatus(await req('GET', `/v0/management/get-auth-status?state=${encodeURIComponent(state)}`))
 }
 // 授权完成后，找出**当前 provider** 新落的号。三重过滤：
 //   ① provider——绝不跨 provider 拿错号；识别不出 provider 的文件保守跳过；
@@ -391,11 +459,7 @@ export async function findNew(
 const realClient: CpaClient = {
   async startOAuth(provider) {
     const cp = CPA_PROVIDER[provider]
-    const data = (await req('GET', `/v0/management/${cp}-auth-url?is_webui=true`)) as {
-      state: string; url: string; flow?: string; user_code?: string
-    }
-    const flow: 'redirect' | 'device' = data.flow === 'device' || data.user_code ? 'device' : 'redirect'
-    return { state: data.state, url: data.url, flow, userCode: data.user_code }
+    return parseOAuthStart(await req('GET', `/v0/management/${cp}-auth-url?is_webui=true`))
   },
 
   async finishOAuth(provider, redirectUrl, knownAccountIds, before) {

@@ -11,6 +11,7 @@ const MOCK_WORKER_INTERVAL_MS = 8_000
 const REAL_WORKER_INTERVAL_MS = 5 * 60_000
 const MIN_MOCK_WORKER_INTERVAL_MS = 1_000
 const MIN_REAL_WORKER_INTERVAL_MS = 30_000
+const MAX_WORKER_INTERVAL_MS = 2_147_483_647
 
 export function resolveWorkerIntervalMs(raw: string | undefined, isMock: boolean): number {
   if (raw === undefined || raw.trim() === '') {
@@ -21,9 +22,9 @@ export function resolveWorkerIntervalMs(raw: string | undefined, isMock: boolean
   }
   const value = Number(raw)
   const minimum = isMock ? MIN_MOCK_WORKER_INTERVAL_MS : MIN_REAL_WORKER_INTERVAL_MS
-  if (!Number.isSafeInteger(value) || value < minimum) {
+  if (!Number.isSafeInteger(value) || value < minimum || value > MAX_WORKER_INTERVAL_MS) {
     throw new Error(
-      `[env] WORKER_INTERVAL_MS 过小或超出安全整数范围；${isMock ? 'MOCK' : '非 MOCK'} 模式最小值为 ${minimum}ms，已拒绝启动。`,
+      `[env] WORKER_INTERVAL_MS 过小或超出 Node 定时器范围；${isMock ? 'MOCK' : '非 MOCK'} 模式最小值为 ${minimum}ms，最大值为 ${MAX_WORKER_INTERVAL_MS}ms，已拒绝启动。`,
     )
   }
   return value

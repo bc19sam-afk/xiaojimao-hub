@@ -23,6 +23,15 @@ test('worker interval：非空脏值、非整数、非正、溢出和危险小�
   assert.equal(resolveWorkerIntervalMs('30000', false), 30000)
 })
 
+test('worker interval：不超过 Node 定时器的 32 位有符号上界', () => {
+  assert.equal(resolveWorkerIntervalMs('2147483647', true), 2_147_483_647)
+  assert.equal(resolveWorkerIntervalMs('2147483647', false), 2_147_483_647)
+  for (const raw of ['2147483648', '4294967295', String(Number.MAX_SAFE_INTEGER)]) {
+    assert.throws(() => resolveWorkerIntervalMs(raw, true), /WORKER_INTERVAL_MS/)
+    assert.throws(() => resolveWorkerIntervalMs(raw, false), /WORKER_INTERVAL_MS/)
+  }
+})
+
 test('verify-now：路由先做管理员守卫，普通 Dashboard 不再暴露全局验证入口', () => {
   const route = fs.readFileSync(path.join(root, 'app/api/verify-now/route.ts'), 'utf8')
   const contributions = fs.readFileSync(path.join(root, 'components/Contributions.tsx'), 'utf8')
