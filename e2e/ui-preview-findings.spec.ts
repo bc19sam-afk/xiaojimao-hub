@@ -335,9 +335,9 @@ test('provider options remain fully visible and keyboard operable at mobile and 
 })
 
 test('OAuth panel applies structured duplicate, busy, expired, cancelled, and pending behavior', async ({ page }) => {
-  // This single scenario deliberately walks every OAuth terminal/retry state. Aggregate GitHub runner
-  // and dev-server overhead can exceed a minute while all behavior assertions remain green.
-  test.setTimeout(120_000)
+  // This single scenario deliberately walks every OAuth terminal/retry and provider-switch state.
+  // Aggregate GitHub runner and dev-server overhead can exceed two minutes while assertions stay green.
+  test.setTimeout(240_000)
 
   type TestErrorCode =
     | 'DUPLICATE_ACCOUNT'
