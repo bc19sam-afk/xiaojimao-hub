@@ -24,11 +24,13 @@
 ## 当前进度
 
 - **P0–P5 已合并收官**：身份、收号、首检入池、按日计量发分、Dashboard、排行榜、CDK/LDC 商店、后台配置、审计与人工复核已完成。
-- **P6-R1 已合并**：Docker / Compose、非 root 运行、持久化卷、迁移前备份、schema 复核、日志轮转、存活检查与部署手册已完成。
+- **P6-R1 + P6-R2 已合并**：Docker / Compose、非 root 运行、持久化卷、迁移前备份、readiness + DB 探活、每日备份、异机同步、WAL 安全恢复脚本与 dead-man 心跳均已完成并通过真实 Docker/Linux 验证。
+- **UI-R1 已合并**：后台危险操作确认、移动端表格边界、兑换状态、readiness 无业务副作用和首次 DB replacement fail-closed 已收口。
+- **P7-R1 已合并**：usage payload 严格校验与累计结算 reconciliation 已落地；partial → full 只补正差额，同值幂等、低值不倒扣，未修改 CPAMP、未新增 migration。
 - **MOCK 全链路可验证**：交号 → 首检 → 入池 → 每日用量 → 积分 → 兑换。
-- **仍未完成生产验收**：真实 Linux.do + 真号 E2E、CPA 写操作实测、真实服务器部署，以及 P6-R2 的 readiness、异机备份、恢复脚本和监控告警。
+- **当前为 release candidate，不等于已上线**：`main` 已通过合并态 CI；仍未完成真实 Linux.do + 真号 E2E、CPA 写操作实测和真实服务器部署。这些外部验收须单独授权，不能从本地/CI 结果自动外推。
 
-> 请勿把“本地 MOCK 可运行”、“Docker 产物已完成”与“生产已验收”视为同一状态。
+> 截至 2026-07-31，远端 `main` 为 `ae41555`（合并 PR #36），合并态 CI run `30639486006` 成功。请勿把“本地 MOCK 可运行”、“Docker/CI 已验证”与“生产已验收”视为同一状态。
 
 ## 本地 MOCK 运行
 
