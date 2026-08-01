@@ -16,6 +16,23 @@ export function originOf(req: NextRequest): string {
   return env.appBaseUrl.replace(/\/+$/, '')
 }
 
+// Cookie 的 SameSite 边界是 site，不是 origin。同站 sibling 仍可携带会话 cookie 发起
+// text/plain blind POST，因此高副作用 JSON 路由必须同时锁定精确 origin 与媒体类型。
+export function isSameOriginJsonMutation(req: NextRequest): boolean {
+  const contentType = req.headers.get('content-type')
+  const mediaType = contentType?.split(';', 1)[0].trim().toLowerCase()
+  if (mediaType !== 'application/json') return false
+
+  const origin = req.headers.get('origin')
+  if (!origin || origin === 'null') return false
+
+  try {
+    return origin === new URL(originOf(req)).origin
+  } catch {
+    return false
+  }
+}
+
 // cookie 是否走 secure：跟随推断出的 origin 协议
 export function isSecureRequest(req: NextRequest): boolean {
   return originOf(req).startsWith('https://')

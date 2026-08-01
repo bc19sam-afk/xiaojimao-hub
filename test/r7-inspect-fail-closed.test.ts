@@ -184,7 +184,7 @@ test('R7-P2③ 反向：巡检跑完且有结果 → 正常返回映射结果', 
     runBody: { run: { id: 9 } },
     runDetail: () => ({
       run: { status: 'completed' },
-      results: [{ accountId: 'a1', action: 'keep', status: 'ok', provider: 'codex', planType: 'plus' }],
+      results: [{ accountId: 'a1', action: 'keep', status: 'ok', statusCode: null, provider: 'codex', planType: 'plus' }],
     }),
   })
   const r = await cpa.inspect()

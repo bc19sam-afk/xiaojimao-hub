@@ -98,7 +98,6 @@ test('③ findNew 按 provider 过滤候选：findNew(codex) 只取 codex 文件
     // claude 排在最前且也是「新号」——旧逻辑（无 provider 过滤）会先命中它 → 拿错号
     authFile({ name: 'claude-accB.json', accountId: 'accB', provider: 'claude' }),
     authFile({ name: 'codex-accA.json', accountId: 'accA', provider: 'codex' }),
-    authFile({ name: 'mystery-accC.json', accountId: 'accC', provider: undefined }), // 识别不出 → 应保守跳过
   ]
   const client = stubClient(files)
 

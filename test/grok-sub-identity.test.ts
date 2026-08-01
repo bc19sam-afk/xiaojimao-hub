@@ -43,18 +43,14 @@ test('grok：auth-file 仅有 sub（OIDC subject）时采纳为 accountId', asyn
 })
 
 // 任务1（对称 P1b-1 account 仅限 claude 的教训）：sub 兜底严格仅限 grok。
-// claude 带 sub 但无 account/account_id → 不认 sub（claude 只认 account）；
-// codex 带 sub 无 account_id → 不认 sub（codex 只认 account_id）。都落空。
-test('sub 仅限 grok：claude/codex 带 sub 不被采纳，accountId 落空', async () => {
+// claude 带 sub 但无 account/account_id、codex 带 sub 无 account_id，都缺 canonical identity。
+// 严格边界不再把残缺行降成 accountId='' 后继续消费，而是整批 fail-closed。
+test('sub 仅限 grok：claude/codex 只有 sub 时整批 fail-closed', async () => {
   stubAuthFiles([
     { name: 'anthropic-c.json', provider: 'anthropic', sub: 'should-not-win-claude' },
     { name: 'codex-d.json', provider: 'codex', sub: 'should-not-win-codex' },
   ])
-  const files = await cpa.listAuthFiles()
-  assert.equal(files[0].provider, 'claude')
-  assert.equal(files[0].accountId, '') // claude 不认 sub
-  assert.equal(files[1].provider, 'codex')
-  assert.equal(files[1].accountId, '') // codex 不认 sub
+  await assert.rejects(() => cpa.listAuthFiles(), /账号服务暂时不可用/)
 })
 
 // 任务1：grok 号同时有 account_id 与 sub → account_id 优先（兜底链不改既有优先级）

@@ -211,8 +211,12 @@ test('OAuth routes share the protocol helper and expose recovery plus idempotent
     ['cancel', 'cancelOAuth'],
   ] as const) {
     const source = fs.readFileSync(path.join(root, `app/api/collect/oauth/${route}/route.ts`), 'utf8')
+    const guardAt = source.indexOf('isSameOriginJsonMutation(req)')
+    const authAt = source.indexOf('await getCurrentUser()')
     const parseAt = source.indexOf('await parseOAuthRequestBody(req)')
     const operationAt = source.indexOf(`await ${operation}(`)
+    assert.ok(guardAt >= 0, `${route} must use the shared same-origin JSON mutation guard`)
+    assert.ok(authAt > guardAt, `${route} must reject untrusted requests before authentication`)
     assert.ok(parseAt >= 0, `${route} must use the shared OAuth request body parser`)
     assert.ok(operationAt > parseAt, `${route} must reject invalid bodies before ${operation}`)
     assert.match(source, /if \(!parsed\.ok\) return parsed\.response/)
@@ -227,7 +231,8 @@ test('OAuth routes share the protocol helper and expose recovery plus idempotent
 test('CollectPanel binds provider to the recovered session, settles polling, and cancels server-side', () => {
   const panel = fs.readFileSync(path.join(root, 'components/CollectPanel.tsx'), 'utf8')
   assert.match(panel, /provider:\s*Provider/)
-  assert.match(panel, /session\.provider/)
+  assert.match(panel, /activeSession\s*=\s*session\?\.provider\s*===\s*provider/)
+  assert.match(panel, /currentSession\.provider/)
   assert.match(panel, /\/api\/collect\/oauth\/session/)
   assert.match(panel, /\/api\/collect\/oauth\/cancel/)
   assert.match(panel, /shouldClearOAuthSession\(code\)/)

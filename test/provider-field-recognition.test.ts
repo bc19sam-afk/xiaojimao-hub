@@ -12,13 +12,14 @@ import assert from 'node:assert/strict'
 
 let cpa: typeof import('../lib/cpa.ts').cpa
 let findNew: typeof import('../lib/cpa.ts').findNew
+let CPA_UNAVAILABLE: string
 
 before(async () => {
   process.env.MOCK = 'false'
   process.env.SESSION_SECRET = '12345678901234567890123456789012'
   process.env.CPA_BASE_URL = 'http://cpa.test'
   process.env.CPA_MANAGEMENT_KEY = 'k'
-  ;({ cpa, findNew } = await import('../lib/cpa.ts'))
+  ;({ cpa, findNew, CPA_UNAVAILABLE } = await import('../lib/cpa.ts'))
 })
 
 test('真实客户端：auth-files 显式 provider 字段（文件名无前缀）也能识别，findNew 不误报重复', async () => {
@@ -30,7 +31,6 @@ test('真实客户端：auth-files 显式 provider 字段（文件名无前缀�
           files: [
             { name: 'auth-a.json', provider: 'codex', account_id: 'acct-123' },
             { name: 'auth-b.json', provider: 'anthropic', account_id: 'acct-456' },
-            { name: 'auth-c.json', account_id: 'acct-789' }, // 无任何 provider 线索 → 仍应跳过
           ],
         }),
         { status: 200 },
@@ -42,7 +42,6 @@ test('真实客户端：auth-files 显式 provider 字段（文件名无前缀�
   const files = await cpa.listAuthFiles()
   assert.equal(files[0].provider, 'codex')
   assert.equal(files[1].provider, 'claude') // anthropic 归一化为 claude
-  assert.equal(files[2].provider, undefined)
 
   // codex review 的复现场景：修复前这里 duplicate=true（合法新号被误拒）
   const found = await findNew(cpa, 'codex', new Set<string>())
@@ -53,4 +52,25 @@ test('真实客户端：auth-files 显式 provider 字段（文件名无前缀�
   // 识别不出 provider 的文件对任何 provider 都不可见（保守跳过不变）
   const grok = await findNew(cpa, 'grok', new Set<string>())
   assert.equal(grok.duplicate, true)
+})
+
+test('真实客户端：混入无 provider 线索的 auth-file 行时整批 fail-closed', async () => {
+  globalThis.fetch = (async (url: unknown) => {
+    const u = String(url)
+    if (u.endsWith('/v0/management/auth-files')) {
+      return new Response(
+        JSON.stringify({
+          files: [
+            { name: 'auth-a.json', provider: 'codex', account_id: 'acct-123' },
+            { name: 'auth-c.json', account_id: 'acct-789' },
+          ],
+        }),
+        { status: 200 },
+      )
+    }
+    throw new Error('测试桩：不该请求 ' + u)
+  }) as typeof fetch
+
+  const error = await cpa.listAuthFiles().then(() => null, (caught) => caught as Error)
+  assert.equal(error?.message, CPA_UNAVAILABLE)
 })

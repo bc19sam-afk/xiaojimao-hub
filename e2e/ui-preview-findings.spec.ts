@@ -370,7 +370,11 @@ test('OAuth panel applies structured duplicate, busy, expired, cancelled, and pe
     })
   }
 
+  let restoreHandler: ((route: Route, provider: string) => Promise<boolean>) | null = null
+
   await page.route('**/api/collect/oauth/session*', async (route) => {
+    const provider = new URL(route.request().url()).searchParams.get('provider') ?? ''
+    if (restoreHandler && await restoreHandler(route, provider)) return
     await route.fulfill({
       status: 200,
       contentType: 'application/json',
@@ -379,9 +383,11 @@ test('OAuth panel applies structured duplicate, busy, expired, cancelled, and pe
   })
 
   let startSequence = 0
+  let startHandler: ((route: Route, provider: 'codex' | 'claude' | 'grok') => Promise<boolean>) | null = null
   await page.route('**/api/collect/oauth/start', async (route) => {
     const body = route.request().postDataJSON() as { provider?: 'codex' | 'claude' | 'grok' }
     const provider = body.provider ?? 'codex'
+    if (startHandler && await startHandler(route, provider)) return
     startSequence += 1
     await route.fulfill({
       status: 200,
@@ -410,7 +416,11 @@ test('OAuth panel applies structured duplicate, busy, expired, cancelled, and pe
   })
 
   let cancelSucceeds = false
+  let trackStaleGrokOperations = false
+  let staleGrokCancelCalls = 0
   await page.route('**/api/collect/oauth/cancel', async (route) => {
+    const body = route.request().postDataJSON() as { provider?: string }
+    if (trackStaleGrokOperations && body.provider === 'grok') staleGrokCancelCalls += 1
     if (cancelSucceeds) {
       await route.fulfill({
         status: 200,
@@ -423,7 +433,10 @@ test('OAuth panel applies structured duplicate, busy, expired, cancelled, and pe
   })
 
   let checkCalls = 0
+  let staleGrokCheckCalls = 0
   await page.route('**/api/collect/oauth/check', async (route) => {
+    const body = route.request().postDataJSON() as { provider?: string }
+    if (trackStaleGrokOperations && body.provider === 'grok') staleGrokCheckCalls += 1
     checkCalls += 1
     if (checkCalls === 1) {
       await route.fulfill({
@@ -499,6 +512,153 @@ test('OAuth panel applies structured duplicate, busy, expired, cancelled, and pe
   const settledCalls = checkCalls
   await page.waitForTimeout(1750)
   expect(checkCalls).toBe(settledCalls)
+
+  const authorizeClaude = page.getByRole('button', { name: /授权 Claude 账号/ })
+  const staleDeviceCode = page.getByText('STALE-GROK-CODE', { exact: true })
+  let releaseMismatchedRestore!: () => void
+  let markMismatchedRestoreRequested!: () => void
+  let markMismatchedRestoreDelivered!: () => void
+  const mismatchedRestoreGate = new Promise<void>((resolve) => { releaseMismatchedRestore = resolve })
+  const mismatchedRestoreRequested = new Promise<void>((resolve) => { markMismatchedRestoreRequested = resolve })
+  const mismatchedRestoreDelivered = new Promise<void>((resolve) => { markMismatchedRestoreDelivered = resolve })
+  restoreHandler = async (route, selectedProvider) => {
+    if (selectedProvider !== 'claude') return false
+    markMismatchedRestoreRequested()
+    await mismatchedRestoreGate
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        ok: true,
+        session: {
+          provider: 'grok',
+          state: 'stale-grok-restore',
+          url: 'https://example.test/stale-grok',
+          flow: 'device',
+          userCode: 'STALE-GROK-CODE',
+          expiresAt: Date.now() + 900_000,
+        },
+      }),
+    })
+    markMismatchedRestoreDelivered()
+    return true
+  }
+
+  await authorizeGrok.click()
+  await expect(page.getByText('DEVICE-CODE', { exact: true })).toBeVisible()
+  trackStaleGrokOperations = true
+  staleGrokCheckCalls = 0
+  staleGrokCancelCalls = 0
+  await page.getByRole('button', { name: 'Claude Claude 订阅' }).click()
+  await mismatchedRestoreRequested
+  await expect(page.getByText('DEVICE-CODE', { exact: true })).toBeHidden()
+  await expect(page.getByRole('button', { name: '取消', exact: true })).toBeHidden()
+  await expect(authorizeClaude).toBeVisible()
+  await page.waitForTimeout(3250)
+  expect(staleGrokCheckCalls).toBe(0)
+  expect(staleGrokCancelCalls).toBe(0)
+
+  releaseMismatchedRestore()
+  await mismatchedRestoreDelivered
+  await expect(staleDeviceCode).toBeHidden()
+  await expect(authorizeClaude).toBeVisible()
+  await page.waitForTimeout(3250)
+  expect(staleGrokCheckCalls).toBe(0)
+  expect(staleGrokCancelCalls).toBe(0)
+
+  restoreHandler = null
+  trackStaleGrokOperations = false
+  await page.getByRole('button', { name: 'Grok SuperGrok' }).click()
+  await expect(authorizeGrok).toBeVisible()
+  await authorizeGrok.click()
+  await expect(page.getByText('DEVICE-CODE', { exact: true })).toBeVisible()
+
+  let releaseFailedRestore!: () => void
+  let markFailedRestoreRequested!: () => void
+  let markFailedRestoreDelivered!: () => void
+  const failedRestoreGate = new Promise<void>((resolve) => { releaseFailedRestore = resolve })
+  const failedRestoreRequested = new Promise<void>((resolve) => { markFailedRestoreRequested = resolve })
+  const failedRestoreDelivered = new Promise<void>((resolve) => { markFailedRestoreDelivered = resolve })
+  restoreHandler = async (route, selectedProvider) => {
+    if (selectedProvider !== 'codex') return false
+    markFailedRestoreRequested()
+    await failedRestoreGate
+    await route.fulfill({
+      status: 503,
+      contentType: 'application/json',
+      body: JSON.stringify({ ok: false }),
+    })
+    markFailedRestoreDelivered()
+    return true
+  }
+
+  trackStaleGrokOperations = true
+  staleGrokCheckCalls = 0
+  staleGrokCancelCalls = 0
+  await page.getByRole('button', { name: 'ChatGPT Plus / Pro / Team / K12' }).click()
+  await failedRestoreRequested
+  await expect(page.getByText('DEVICE-CODE', { exact: true })).toBeHidden()
+  await expect(page.getByRole('button', { name: '取消', exact: true })).toBeHidden()
+  await expect(authorizeChatGpt).toBeVisible()
+
+  releaseFailedRestore()
+  await failedRestoreDelivered
+  await expect(authorizeChatGpt).toBeVisible()
+  await page.waitForTimeout(3250)
+  expect(staleGrokCheckCalls).toBe(0)
+  expect(staleGrokCancelCalls).toBe(0)
+
+  let releaseNullRestore!: () => void
+  let markNullRestoreRequested!: () => void
+  let markNullRestoreDelivered!: () => void
+  let markStartedSessionDelivered!: () => void
+  const nullRestoreGate = new Promise<void>((resolve) => { releaseNullRestore = resolve })
+  const nullRestoreRequested = new Promise<void>((resolve) => { markNullRestoreRequested = resolve })
+  const nullRestoreDelivered = new Promise<void>((resolve) => { markNullRestoreDelivered = resolve })
+  const startedSessionDelivered = new Promise<void>((resolve) => { markStartedSessionDelivered = resolve })
+  restoreHandler = async (route, selectedProvider) => {
+    if (selectedProvider !== 'claude') return false
+    markNullRestoreRequested()
+    await nullRestoreGate
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ ok: true, session: null }),
+    })
+    markNullRestoreDelivered()
+    return true
+  }
+  startHandler = async (route, selectedProvider) => {
+    if (selectedProvider !== 'claude') return false
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        ok: true,
+        session: {
+          provider: 'claude',
+          state: 'claude-start-wins',
+          url: 'https://example.test/claude/start-wins',
+          flow: 'redirect',
+          expiresAt: Date.now() + 900_000,
+        },
+      }),
+    })
+    markStartedSessionDelivered()
+    releaseNullRestore()
+    return true
+  }
+
+  await page.getByRole('button', { name: 'Claude Claude 订阅' }).click()
+  await nullRestoreRequested
+  await authorizeClaude.click()
+  await startedSessionDelivered
+  await nullRestoreDelivered
+  await expect(callback).toBeVisible()
+  await expect(authorizeClaude).toBeHidden()
+
+  startHandler = null
+  restoreHandler = null
 })
 
 test('Playwright web server listens only on loopback', async ({ request }) => {

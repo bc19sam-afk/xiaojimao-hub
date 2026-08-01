@@ -43,7 +43,7 @@ export interface AuthFile {
   email: string
   plan: string
   disabled: boolean
-  provider?: ProviderId // 识别不出时 undefined（findNew 会保守跳过）
+  provider?: ProviderId // realClient 严格要求合法 provider；可选仅保留给内部测试桩/兼容类型
   priority?: number // 仅 mockClient 填（供测试读回验证入池设优先级）；realClient 读侧不填——R1 实测 cpamp GET auth-files 无此字段
 }
 
@@ -415,48 +415,101 @@ async function reqOk(method: string, path: string, body?: unknown): Promise<void
   }
 }
 
-interface RawFile {
-  name?: string; filename?: string; type?: string; provider?: string
-  account_id?: string; accountId?: string; account?: string; sub?: string
-  email?: string; plan?: string; planType?: string; disabled?: boolean
+function optionalString(value: unknown, operation: string): string | undefined {
+  if (value === undefined) return undefined
+  if (typeof value !== 'string') failCpaShape(operation)
+  return value
 }
-function normFile(f: RawFile): AuthFile {
-  const name = f.name ?? f.filename ?? ''
-  // provider：依次认显式 provider 字段、type 字段、文件名前缀（首个 '-' 前）——
-  // 真实 cpamp 的字段/命名未完全确定，三条路都认，识别不出才落 undefined
-  const provider =
-    providerFromToken(f.provider) ?? providerFromToken(f.type) ?? providerFromToken(name.split('-')[0])
+
+function optionalCanonicalString(value: unknown, operation: string): string | undefined {
+  const parsed = optionalString(value, operation)
+  if (parsed !== undefined && parsed.trim() !== parsed) failCpaShape(operation)
+  return parsed
+}
+
+function parseCanonicalIdentity(
+  operation: string,
+  accountCandidates: unknown[],
+  rawEmail: unknown,
+): { accountId: string; email: string } {
+  const candidates = accountCandidates.map((value) => optionalCanonicalString(value, operation))
+  const accountId = candidates.find((value) => value !== undefined && value.trim().length > 0)
+  const email = optionalCanonicalString(rawEmail, operation) ?? ''
+  if (!accountId) failCpaShape(operation)
+  return { accountId, email }
+}
+
+function parseAuthFileRow(value: unknown): AuthFile {
+  if (!isOAuthRecord(value)) failCpaShape('auth_file_row')
+
+  const rawName = optionalCanonicalString(value.name, 'auth_file_row')
+  const rawFilename = optionalCanonicalString(value.filename, 'auth_file_row')
+  const name = [rawName, rawFilename].find((candidate) => candidate !== undefined && candidate.trim().length > 0)
+  if (!name) failCpaShape('auth_file_row')
+
+  const explicitProviderTokens = [
+    optionalString(value.provider, 'auth_file_row'),
+    optionalString(value.type, 'auth_file_row'),
+  ].filter((token): token is string => token !== undefined)
+  const explicitProviders = explicitProviderTokens.map((token) => providerFromToken(token))
+  if (explicitProviders.some((provider) => provider === undefined)) failCpaShape('auth_file_row')
+
+  const nameProvider = providerFromToken(name.split('-')[0])
+  const provider = explicitProviders[0] ?? nameProvider
+  if (!provider) failCpaShape('auth_file_row')
+  if (
+    explicitProviders.some((candidate) => candidate !== provider) ||
+    (nameProvider !== undefined && nameProvider !== provider)
+  ) {
+    failCpaShape('auth_file_row')
+  }
+
+  const accountIdField = optionalString(value.account_id, 'auth_file_row')
+  const accountIdAlias = optionalString(value.accountId, 'auth_file_row')
+  const claudeAccount = optionalString(value.account, 'auth_file_row')
+  const grokSubject = optionalString(value.sub, 'auth_file_row')
+  const identity = parseCanonicalIdentity(
+    'auth_file_row',
+    [
+      accountIdField,
+      accountIdAlias,
+      provider === 'claude' ? claudeAccount : undefined,
+      provider === 'grok' ? grokSubject : undefined,
+    ],
+    value.email,
+  )
+
+  const plan = optionalString(value.plan, 'auth_file_row')
+  const planType = optionalString(value.planType, 'auth_file_row')
+  if (value.disabled !== undefined && typeof value.disabled !== 'boolean') failCpaShape('auth_file_row')
+
   return {
     name,
-    // 稳定业务 ID 的字段名跨 provider 不同，每条兜底都按 provider 划界、绝不跨 provider 泛认
-    // （泛认未验证字段会把错的当 canonical ID 放行发分）：
-    //   codex  —— account_id；
-    //   claude —— account（P0-A 实测，无 account_id；R1：该 account 值本身=邮箱、含 PII，下游须按 §8 敏感值对待）；
-    //   grok   —— sub（OIDC subject；P0-A 扒 CLIProxyAPI xai 源码确认为稳定唯一标识，跨重授权稳定）。
-    // account_id/accountId 最优先；也绝不用 claude 的 id 字段（那非稳定业务 ID，会把唯一键锚错）。
-    accountId:
-      f.account_id ??
-      f.accountId ??
-      (provider === 'claude' ? f.account : undefined) ??
-      (provider === 'grok' ? f.sub : undefined) ??
-      '',
-    email: f.email ?? '',
-    // R1 核对（§二①）：claude auth-file 无 plan/planType 字段 → 归一 'unknown'（维持现状；要显示套餐需另找来源）
-    plan: f.plan ?? f.planType ?? 'unknown',
-    disabled: Boolean(f.disabled),
+    accountId: identity.accountId,
+    email: identity.email,
+    plan: plan ?? planType ?? 'unknown',
+    disabled: value.disabled ?? false,
     provider,
   }
 }
+
 function parseIdToken(idToken: string): { accountId: string; email: string } {
   try {
-    const payload = JSON.parse(Buffer.from(idToken.split('.')[1], 'base64').toString('utf8'))
-    const auth = payload['https://api.openai.com/auth'] ?? {}
-    return {
-      accountId: auth.chatgpt_account_id ?? payload.chatgpt_account_id ?? payload.account_id ?? '',
-      email: payload.email ?? '',
-    }
-  } catch {
-    return { accountId: '', email: '' }
+    const encodedPayload = idToken.split('.')[1]
+    if (!encodedPayload) failCpaShape('id_token_claims')
+    const payload: unknown = JSON.parse(Buffer.from(encodedPayload, 'base64url').toString('utf8'))
+    if (!isOAuthRecord(payload)) failCpaShape('id_token_claims')
+    const rawAuth = payload['https://api.openai.com/auth']
+    if (rawAuth !== undefined && !isOAuthRecord(rawAuth)) failCpaShape('id_token_claims')
+    const auth = rawAuth ?? {}
+    return parseCanonicalIdentity(
+      'id_token_claims',
+      [auth.chatgpt_account_id, payload.chatgpt_account_id, payload.account_id],
+      payload.email,
+    )
+  } catch (error) {
+    if (error instanceof Error && error.message === CPA_UNAVAILABLE) throw error
+    failCpaShape('id_token_claims')
   }
 }
 
@@ -464,7 +517,7 @@ async function getAuthStatus(state: string): Promise<OAuthStatusPayload> {
   return parseOAuthStatus(await req('GET', `/v0/management/get-auth-status?state=${encodeURIComponent(state)}`))
 }
 // 授权完成后，找出**当前 provider** 新落的号。三重过滤：
-//   ① provider——绝不跨 provider 拿错号；识别不出 provider 的文件保守跳过；
+  //   ① provider——绝不跨 provider 拿错号；realClient 在边界已要求 provider 合法；
 //   ② known（该 provider 已知 accountId）——只含该 provider，故跨 provider 同 id 不误判重复；
 //   ③ before——授权动作**之前**的 auth-files 文件名快照，只认快照外的**新文件**。
 // ③ 是防「抢注号池既有号」的关键：cpamp 号池官方号/贡献号共用，池里本就有一堆不属于 hub
@@ -477,7 +530,7 @@ export async function findNew(
   known: Set<string>,
   before: Set<string> = new Set(),
 ): Promise<IngestResult> {
-  const files = await client.listAuthFiles()
+  const files = (await client.listAuthFiles()).map(parseAuthFileRow)
   const fresh = files.filter((f) => f.provider === provider && f.accountId && !before.has(f.name))
   const created = fresh.find((f) => !known.has(f.accountId))
   if (created) {
@@ -586,7 +639,6 @@ const realClient: CpaClient = {
       throw new Error(CPA_UNAVAILABLE)
     }
     const { accountId, email } = parseIdToken(tok.id_token)
-    if (!accountId) throw new Error('无法从令牌解析账号信息')
     if (known.has(accountId)) return { accountId, email, plan: 'unknown', authFileName: '', duplicate: true }
     const authFile = {
       type: 'codex', id_token: tok.id_token, access_token: tok.access_token,
@@ -617,7 +669,7 @@ const realClient: CpaClient = {
         throw new Error(CPA_UNAVAILABLE)
       }
     }
-    return ((data as { files: RawFile[] }).files).map(normFile)
+    return ((data as { files: unknown[] }).files).map(parseAuthFileRow)
   },
   async setDisabled(name, disabled) {
     await reqOk('PATCH', '/v0/management/auth-files/status', { name, disabled })
@@ -661,27 +713,23 @@ const realClient: CpaClient = {
   //    ⚠️ 抛的是 CPA_UNAVAILABLE：与 req() 失败同一对外文案（§8：绝不透传 cpamp 内部细节），
   //       调用方只 catch 不看 message，语义一致。
   async inspect() {
-    const run = (await req('POST', '/v0/management/codex-inspection/run', {})) as { run?: { id?: number } }
-    const id = run.run?.id
-    if (!id) {
-      console.error('[cpa] codex-inspection/run 未返回 run.id，本轮巡检未能发起') // 原文只进服务端日志
-      throw new Error(CPA_UNAVAILABLE)
-    }
-    let detail: { run?: { status?: string }; results?: RawInspectionResult[] } = {}
-    let done = false
+    const id = parseInspectionRunId(await req('POST', '/v0/management/codex-inspection/run', {}))
+    let completedResults: RawInspectionResult[] | null = null
     for (let i = 0; i < 30; i++) {
-      detail = (await req('GET', `/v0/management/codex-inspection/runs/${id}`)) as typeof detail
-      if (detail.run?.status === 'completed') {
-        done = true
+      const detail = parseInspectionDetail(
+        await req('GET', `/v0/management/codex-inspection/runs/${id}`),
+      )
+      if (detail.status === 'completed') {
+        completedResults = detail.results ?? []
         break
       }
       await sleep(1000)
     }
-    if (!done) {
+    if (completedResults === null) {
       console.error(`[cpa] codex-inspection run ${id} 轮询 30 次仍未就绪，本轮巡检结果不可观测`)
       throw new Error(CPA_UNAVAILABLE)
     }
-    return (detail.results ?? []).map(mapInspection)
+    return completedResults.map(mapInspection)
   },
   async getDailyUsage() {
     // R1 已核对（docs/probe-cpamp-real-R1.md §二②）：真实 usage 事件的三层结构与 account_snapshot /
@@ -705,6 +753,65 @@ interface RawInspectionResult {
   accountId?: string; disabled?: boolean; status?: string; action?: string
   actionReason?: string; statusCode?: number | null; isQuota?: boolean; planType?: string; errorKind?: string
   provider?: string
+}
+const INSPECTION_ACTIONS = new Set(['keep', 'enable', 'reauth', 'relogin', 'disable', 'delete'])
+const INSPECTION_RUN_STATUSES = new Set(['pending', 'running', 'completed', 'failed', 'cancelled'])
+
+function parseInspectionRunId(value: unknown): number {
+  if (!isOAuthRecord(value) || !isOAuthRecord(value.run)) failCpaShape('inspection_run')
+  const id = value.run.id
+  if (typeof id !== 'number' || !Number.isSafeInteger(id) || id <= 0) failCpaShape('inspection_run')
+  return id
+}
+
+function parseInspectionResult(value: unknown): RawInspectionResult {
+  if (!isOAuthRecord(value)) failCpaShape('inspection_result')
+
+  const accountId = optionalCanonicalString(value.accountId, 'inspection_result')
+  const providerToken = value.provider
+  const statusCode = value.statusCode
+  const action = value.action
+  if (!accountId) failCpaShape('inspection_result')
+  if (!isNonEmptyString(providerToken)) failCpaShape('inspection_result')
+  const provider = providerFromToken(providerToken)
+  if (!provider) failCpaShape('inspection_result')
+  if (
+    statusCode !== null &&
+    (typeof statusCode !== 'number' || !Number.isSafeInteger(statusCode))
+  ) {
+    failCpaShape('inspection_result')
+  }
+  if (typeof action !== 'string' || !INSPECTION_ACTIONS.has(action)) failCpaShape('inspection_result')
+
+  const disabled = value.disabled
+  const isQuota = value.isQuota
+  if (disabled !== undefined && typeof disabled !== 'boolean') failCpaShape('inspection_result')
+  if (isQuota !== undefined && typeof isQuota !== 'boolean') failCpaShape('inspection_result')
+
+  return {
+    accountId,
+    provider,
+    statusCode,
+    action,
+    disabled,
+    isQuota,
+    status: optionalString(value.status, 'inspection_result'),
+    actionReason: optionalString(value.actionReason, 'inspection_result'),
+    planType: optionalString(value.planType, 'inspection_result'),
+    errorKind: optionalString(value.errorKind, 'inspection_result'),
+  }
+}
+
+function parseInspectionDetail(value: unknown): { status: string; results?: RawInspectionResult[] } {
+  if (!isOAuthRecord(value) || !isOAuthRecord(value.run)) failCpaShape('inspection_detail')
+  const status = value.run.status
+  if (typeof status !== 'string' || !INSPECTION_RUN_STATUSES.has(status)) failCpaShape('inspection_detail')
+  if (value.results !== undefined && !Array.isArray(value.results)) failCpaShape('inspection_detail')
+  if (status === 'completed' && !Array.isArray(value.results)) failCpaShape('inspection_detail')
+  return {
+    status,
+    results: Array.isArray(value.results) ? value.results.map(parseInspectionResult) : undefined,
+  }
 }
 // action=keep 但 errorKind 是**健康分类**而非错误的白名单：xai 深度探测复用 errorKind 字段装健康
 // 结论（CPA-Manager-Plus apps/manager-server/internal/service/codexinspection/xai_probe.go:130/:172/

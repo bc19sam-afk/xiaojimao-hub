@@ -35,9 +35,12 @@ test('worker interval：不超过 Node 定时器的 32 位有符号上界', () =
 test('verify-now：路由先做管理员守卫，普通 Dashboard 不再暴露全局验证入口', () => {
   const route = fs.readFileSync(path.join(root, 'app/api/verify-now/route.ts'), 'utf8')
   const contributions = fs.readFileSync(path.join(root, 'components/Contributions.tsx'), 'utf8')
+  const mutationGuardAt = route.indexOf('isSameOriginJsonMutation(req)')
+  const adminGuardAt = route.indexOf('await getAdminActor()')
+  assert.ok(mutationGuardAt >= 0 && adminGuardAt > mutationGuardAt, '须先校验 same-origin JSON，再做管理员鉴权')
   assert.match(route, /getAdminActor/)
   assert.doesNotMatch(route, /getCurrentUser/)
-  assert.ok(route.indexOf('getAdminActor') < route.indexOf("import('@/lib/collect')"), '须先鉴权再加载全局巡检')
+  assert.ok(adminGuardAt < route.indexOf("import('@/lib/collect')"), '须先鉴权再加载全局巡检')
   assert.doesNotMatch(contributions, /\/api\/verify-now/)
   assert.doesNotMatch(contributions, /立即验证/)
 })

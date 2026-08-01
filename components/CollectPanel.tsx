@@ -40,7 +40,9 @@ export default function CollectPanel({ onDone }: { onDone: () => void }) {
   const [rt, setRt] = useState('')
   const [toast, setToast] = useState<Toast>(null)
   const pollRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const restoreGenerationRef = useRef(0)
   const onDoneRef = useRef(onDone)
+  const activeSession = session?.provider === provider ? session : null
 
   useEffect(() => {
     onDoneRef.current = onDone
@@ -53,6 +55,12 @@ export default function CollectPanel({ onDone }: { onDone: () => void }) {
     pollRef.current = null
   }
 
+  const selectProvider = (nextProvider: Provider) => {
+    if (nextProvider === provider) return
+    clearLocalSession()
+    setProvider(nextProvider)
+  }
+
   function apiError(payload: unknown): OAuthApiError | null {
     if (!payload || typeof payload !== 'object' || !('error' in payload)) return null
     const error = (payload as { error?: unknown }).error
@@ -63,7 +71,8 @@ export default function CollectPanel({ onDone }: { onDone: () => void }) {
   }
 
   useEffect(() => {
-    if (session?.provider === provider) return
+    if (activeSession) return
+    const restoreGeneration = ++restoreGenerationRef.current
     let active = true
     void (async () => {
       try {
@@ -71,8 +80,9 @@ export default function CollectPanel({ onDone }: { onDone: () => void }) {
           cache: 'no-store',
         })
         const payload = await res.json().catch(() => ({}))
-        if (!active || !res.ok) return
-        setSession(payload.session ?? null)
+        if (!active || restoreGeneration !== restoreGenerationRef.current || !res.ok) return
+        const recovered = payload.session as OAuthSession | null | undefined
+        setSession(recovered?.provider === provider ? recovered : null)
         setCallback('')
       } catch {
         // 恢复失败不伪造本地会话；用户仍可稍后重试或重新选择 provider。
@@ -85,7 +95,8 @@ export default function CollectPanel({ onDone }: { onDone: () => void }) {
 
   // device 流程：自动轮询
   useEffect(() => {
-    if (!session || session.flow !== 'device') return
+    if (!activeSession || activeSession.flow !== 'device') return
+    const currentSession = activeSession
     let stopped = false
     const schedule = (delayMs: number) => {
       if (stopped) return
@@ -96,7 +107,7 @@ export default function CollectPanel({ onDone }: { onDone: () => void }) {
         const res = await fetch('/api/collect/oauth/check', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ provider: session.provider, state: session.state }),
+          body: JSON.stringify({ provider: currentSession.provider, state: currentSession.state }),
         })
         const payload = await res.json().catch(() => ({}))
         if (stopped) return
@@ -135,7 +146,7 @@ export default function CollectPanel({ onDone }: { onDone: () => void }) {
       if (pollRef.current) clearTimeout(pollRef.current)
       pollRef.current = null
     }
-  }, [session])
+  }, [activeSession])
 
   async function start() {
     setBusy(true)
@@ -148,7 +159,10 @@ export default function CollectPanel({ onDone }: { onDone: () => void }) {
       })
       const payload = await res.json().catch(() => ({}))
       if (!res.ok) throw new Error(apiError(payload)?.message || '发起授权失败')
-      setSession(payload.session)
+      const started = payload.session as OAuthSession | undefined
+      if (!started || started.provider !== provider) throw new Error('发起授权失败')
+      restoreGenerationRef.current += 1
+      setSession(started)
     } catch (e) {
       setToast({ title: '发起授权失败', desc: (e as Error).message, ok: false })
     } finally {
@@ -157,13 +171,14 @@ export default function CollectPanel({ onDone }: { onDone: () => void }) {
   }
 
   async function submitCallback() {
-    if (!callback.trim() || !session) return
+    if (!callback.trim() || !activeSession) return
+    const currentSession = activeSession
     setBusy(true)
     try {
       const res = await fetch('/api/collect/oauth/finish', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ provider: session.provider, redirect_url: callback.trim() }),
+        body: JSON.stringify({ provider: currentSession.provider, redirect_url: callback.trim() }),
       })
       const payload = await res.json().catch(() => ({}))
       if (!res.ok) {
@@ -190,13 +205,14 @@ export default function CollectPanel({ onDone }: { onDone: () => void }) {
   }
 
   async function cancelSession() {
-    if (!session) return
+    if (!activeSession) return
+    const currentSession = activeSession
     setBusy(true)
     try {
       const res = await fetch('/api/collect/oauth/cancel', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ provider: session.provider, state: session.state }),
+        body: JSON.stringify({ provider: currentSession.provider, state: currentSession.state }),
       })
       const payload = await res.json().catch(() => ({}))
       if (!res.ok) {
@@ -259,7 +275,7 @@ export default function CollectPanel({ onDone }: { onDone: () => void }) {
             data-provider-option={p.id}
             aria-label={`${p.name} ${p.sub}`}
             aria-pressed={provider === p.id}
-            onClick={() => setProvider(p.id)}
+            onClick={() => selectProvider(p.id)}
             className={`min-w-0 rounded-xl border px-3 py-2.5 text-center transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400 ${
               provider === p.id
                 ? 'border-[var(--brand)]/50 bg-[var(--brand)]/10'
@@ -274,12 +290,12 @@ export default function CollectPanel({ onDone }: { onDone: () => void }) {
         ))}
       </div>
 
-      {session ? (
-        session.flow === 'device' ? (
+      {activeSession ? (
+        activeSession.flow === 'device' ? (
           // 设备码流程（Grok）
           <div className="mt-4 space-y-3 rounded-xl border border-white/10 bg-black/20 p-4">
             <a
-              href={session.url}
+              href={activeSession.url}
               target="_blank"
               rel="noopener noreferrer"
               className="flex w-full items-center justify-center gap-2 rounded-xl bg-[var(--brand)] px-4 py-3 text-sm font-bold text-white transition hover:bg-[var(--brand-bright)]"
@@ -290,7 +306,7 @@ export default function CollectPanel({ onDone }: { onDone: () => void }) {
             <div className="rounded-xl border border-white/10 bg-white/5 py-3 text-center">
               <div className="text-[11px] text-neutral-500">验证码</div>
               <div className="mono mt-1 text-2xl font-black tracking-widest text-[var(--brand-bright)]">
-                {session.userCode}
+                {activeSession.userCode}
               </div>
             </div>
             <div className="flex items-center justify-center gap-2 text-xs text-neutral-400">
@@ -309,7 +325,7 @@ export default function CollectPanel({ onDone }: { onDone: () => void }) {
           // 跳转+粘贴流程（ChatGPT / Claude）
           <div className="mt-4 space-y-3 rounded-xl border border-white/10 bg-black/20 p-4">
             <a
-              href={session.url}
+              href={activeSession.url}
               target="_blank"
               rel="noopener noreferrer"
               className="flex w-full items-center justify-center gap-2 rounded-xl bg-[var(--brand)] px-4 py-3 text-sm font-bold text-white transition hover:bg-[var(--brand-bright)]"
@@ -365,7 +381,7 @@ export default function CollectPanel({ onDone }: { onDone: () => void }) {
       )}
 
       {/* RT 入口仅 ChatGPT */}
-      {provider === 'codex' && !session && (
+      {provider === 'codex' && !activeSession && (
         <>
           <div className="my-3 flex items-center gap-3 text-[11px] text-neutral-600">
             <div className="h-px flex-1 bg-white/10" />

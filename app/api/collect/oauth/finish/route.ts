@@ -2,6 +2,7 @@ import { NextRequest } from 'next/server'
 import { getCurrentUser } from '@/lib/session'
 import { finishOAuth } from '@/lib/collect'
 import type { ProviderId } from '@/lib/cpa'
+import { isSameOriginJsonMutation } from '@/lib/request'
 import {
   oauthCompletedResponse,
   oauthExceptionResponse,
@@ -13,6 +14,7 @@ const VALID: ProviderId[] = ['codex', 'claude', 'grok']
 
 // redirect 流程：提交授权后地址栏的回调链接
 export async function POST(req: NextRequest) {
+  if (!isSameOriginJsonMutation(req)) return oauthFailureResponse('INVALID_REQUEST')
   const user = await getCurrentUser()
   if (!user) return oauthFailureResponse('AUTH_REQUIRED')
   const parsed = await parseOAuthRequestBody(req)

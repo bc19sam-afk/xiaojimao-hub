@@ -1,6 +1,7 @@
 import { NextRequest } from 'next/server'
 import { cancelOAuth } from '@/lib/collect'
 import type { ProviderId } from '@/lib/cpa'
+import { isSameOriginJsonMutation } from '@/lib/request'
 import {
   oauthCancelledResponse,
   oauthExceptionResponse,
@@ -12,6 +13,7 @@ import { getCurrentUser } from '@/lib/session'
 const VALID: ProviderId[] = ['codex', 'claude', 'grok']
 
 export async function POST(req: NextRequest) {
+  if (!isSameOriginJsonMutation(req)) return oauthFailureResponse('INVALID_REQUEST')
   const user = await getCurrentUser()
   if (!user) return oauthFailureResponse('AUTH_REQUIRED')
   const parsed = await parseOAuthRequestBody(req)

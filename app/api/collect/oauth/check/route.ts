@@ -2,6 +2,7 @@ import { NextRequest } from 'next/server'
 import { getCurrentUser } from '@/lib/session'
 import { checkOAuth } from '@/lib/collect'
 import type { ProviderId } from '@/lib/cpa'
+import { isSameOriginJsonMutation } from '@/lib/request'
 import {
   oauthCompletedResponse,
   oauthExceptionResponse,
@@ -14,6 +15,7 @@ const VALID: ProviderId[] = ['codex', 'claude', 'grok']
 
 // device 流程（Grok）：前端轮询此接口，直到 done。ok 则落号
 export async function POST(req: NextRequest) {
+  if (!isSameOriginJsonMutation(req)) return oauthFailureResponse('INVALID_REQUEST')
   const user = await getCurrentUser()
   if (!user) return oauthFailureResponse('AUTH_REQUIRED')
   const parsed = await parseOAuthRequestBody(req)
