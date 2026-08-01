@@ -6,6 +6,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { migrate, migrations } from '../lib/migrate.ts'
 import type { CpaClient, ProviderId, StartResult } from '../lib/cpa.ts'
+import type { Contribution } from '../lib/db.ts'
 import type { SessionUser } from '../lib/session.ts'
 
 let db: typeof import('../lib/db.ts').db
@@ -16,11 +17,37 @@ let tmpDir: string
 let dbPath: string
 let originalCpa: Pick<
   CpaClient,
-  'startOAuth' | 'finishOAuth' | 'checkOAuth' | 'cancelOAuth' | 'listAuthFiles' | 'setDisabled'
+  'startOAuth' | 'finishOAuth' | 'checkOAuth' | 'cancelOAuth' | 'ingestRefreshToken' | 'listAuthFiles' | 'setDisabled'
 >
 
 function user(id: number): SessionUser {
   return { id, username: `u${id}`, trustLevel: 3 }
+}
+
+function oauthContribution(
+  linuxdoId: number,
+  provider: ProviderId,
+  accountId: string,
+): Contribution {
+  const now = Date.now()
+  return {
+    id: `contribution-${accountId}`,
+    linuxdoId,
+    username: `u${linuxdoId}`,
+    accountId,
+    email: '',
+    provider,
+    plan: 'pro',
+    method: 'oauth',
+    authFileName: `${provider}-${accountId}.json`,
+    verifyStatus: 'submitted',
+    points: 0,
+    rewardStatus: 'none',
+    rewardText: '',
+    rewardNote: '',
+    createdAt: now,
+    updatedAt: now,
+  }
 }
 
 function rawDb(): DatabaseSync {
@@ -116,6 +143,7 @@ before(async () => {
     finishOAuth: cpa.finishOAuth,
     checkOAuth: cpa.checkOAuth,
     cancelOAuth: cpa.cancelOAuth,
+    ingestRefreshToken: cpa.ingestRefreshToken,
     listAuthFiles: cpa.listAuthFiles,
     setDisabled: cpa.setDisabled,
   }
@@ -130,6 +158,7 @@ afterEach(() => {
   cpa.finishOAuth = originalCpa.finishOAuth
   cpa.checkOAuth = originalCpa.checkOAuth
   cpa.cancelOAuth = originalCpa.cancelOAuth
+  cpa.ingestRefreshToken = originalCpa.ingestRefreshToken
   cpa.listAuthFiles = originalCpa.listAuthFiles
   cpa.setDisabled = originalCpa.setDisabled
 })
@@ -753,6 +782,281 @@ test('device cancellation racing a completed poll returns OAUTH_CANCELLED withou
     }),
     true,
   )
+})
+
+test('redirect cleanup during isolate cannot commit a contribution or report success', async () => {
+  const now = Date.now()
+  const expiresAt = now + 900_000
+  const hardExpiresAt = expiresAt + collect.OAUTH_OPERATION_TTL_MS
+  seedSession(122, 'claude', 'cleanup-during-redirect-isolate', [], now, expiresAt, hardExpiresAt)
+  markModernSession('cleanup-during-redirect-isolate', 'redirect', hardExpiresAt)
+
+  let isolateCalls = 0
+  let releaseIsolate!: () => void
+  const isolateBarrier = new Promise<void>((resolve) => {
+    releaseIsolate = resolve
+  })
+  cpa.finishOAuth = async () => ({
+    accountId: 'expired-redirect-account',
+    email: '',
+    plan: 'pro',
+    authFileName: 'anthropic-expired-redirect.json',
+    duplicate: false,
+  })
+  cpa.setDisabled = async () => {
+    isolateCalls++
+    await isolateBarrier
+  }
+
+  const pending = collect.finishOAuth(
+    user(122),
+    'claude',
+    'https://app.test/callback?state=cleanup-during-redirect-isolate',
+  )
+  await waitUntil(() => isolateCalls === 1)
+
+  const beforeCleanup = rawDb()
+  const operation = beforeCleanup.prepare(
+    `SELECT status, operation_expires_at AS operationExpiresAt
+     FROM oauth_snapshots WHERE state='cleanup-during-redirect-isolate'`,
+  ).get() as { status: string; operationExpiresAt: number }
+  beforeCleanup.close()
+  assert.equal(operation.status, 'FINALIZING')
+
+  db.cleanupOAuthSessions(operation.operationExpiresAt + 1)
+  releaseIsolate()
+  const result = await pending
+
+  assert.equal(result.ok, false)
+  if (!result.ok) assert.equal(result.code, 'OAUTH_CANCELLED')
+  const raw = rawDb()
+  const session = raw.prepare(
+    `SELECT status, operation_token AS operationToken
+     FROM oauth_snapshots WHERE state='cleanup-during-redirect-isolate'`,
+  ).get() as { status: string; operationToken: string | null }
+  const contribution = raw.prepare(
+    "SELECT COUNT(*) AS n FROM contributions WHERE account_id='expired-redirect-account'",
+  ).get() as { n: number }
+  raw.close()
+  assert.equal(session.status, 'CANCELLED')
+  assert.equal(session.operationToken, null)
+  assert.equal(contribution.n, 0)
+})
+
+test('device cleanup during isolate cannot commit a contribution or report success', async () => {
+  const now = Date.now()
+  const expiresAt = now + 900_000
+  const hardExpiresAt = expiresAt + collect.OAUTH_OPERATION_TTL_MS
+  seedSession(123, 'grok', 'cleanup-during-device-isolate', [], now, expiresAt, hardExpiresAt)
+  markModernSession(
+    'cleanup-during-device-isolate',
+    'device',
+    hardExpiresAt,
+    'https://example.test/device-cleanup',
+    'CLEANUP-CODE',
+  )
+
+  let isolateCalls = 0
+  let releaseIsolate!: () => void
+  const isolateBarrier = new Promise<void>((resolve) => {
+    releaseIsolate = resolve
+  })
+  cpa.checkOAuth = async () => ({
+    status: 'ok',
+    ingest: {
+      accountId: 'expired-device-account',
+      email: '',
+      plan: 'super',
+      authFileName: 'xai-expired-device.json',
+      duplicate: false,
+    },
+  })
+  cpa.setDisabled = async () => {
+    isolateCalls++
+    await isolateBarrier
+  }
+
+  const pending = collect.checkOAuth(user(123), 'grok', 'cleanup-during-device-isolate')
+  await waitUntil(() => isolateCalls === 1)
+
+  const beforeCleanup = rawDb()
+  const operation = beforeCleanup.prepare(
+    `SELECT status, operation_expires_at AS operationExpiresAt
+     FROM oauth_snapshots WHERE state='cleanup-during-device-isolate'`,
+  ).get() as { status: string; operationExpiresAt: number }
+  beforeCleanup.close()
+  assert.equal(operation.status, 'FINALIZING')
+
+  db.cleanupOAuthSessions(operation.operationExpiresAt + 1)
+  releaseIsolate()
+  const result = await pending
+
+  assert.equal(result.done, false)
+  if (!result.done) assert.equal(result.code, 'OAUTH_CANCELLED')
+  const raw = rawDb()
+  const session = raw.prepare(
+    `SELECT status, operation_token AS operationToken
+     FROM oauth_snapshots WHERE state='cleanup-during-device-isolate'`,
+  ).get() as { status: string; operationToken: string | null }
+  const contribution = raw.prepare(
+    "SELECT COUNT(*) AS n FROM contributions WHERE account_id='expired-device-account'",
+  ).get() as { n: number }
+  raw.close()
+  assert.equal(session.status, 'CANCELLED')
+  assert.equal(session.operationToken, null)
+  assert.equal(contribution.n, 0)
+})
+
+test('single-writer contract blocks RT upload while a codex OAuth lease owns the provider', async () => {
+  const now = Date.now()
+  const expiresAt = now + 900_000
+  const hardExpiresAt = expiresAt + collect.OAUTH_OPERATION_TTL_MS
+  seedSession(124, 'codex', 'oauth-blocks-rt-writer', ['codex-old.json'], now, expiresAt, hardExpiresAt)
+  markModernSession('oauth-blocks-rt-writer', 'redirect', hardExpiresAt)
+
+  let rtUploads = 0
+  let isolateCalls = 0
+  cpa.ingestRefreshToken = async () => {
+    rtUploads++
+    return {
+      accountId: 'rt-race-account',
+      email: '',
+      plan: 'plus',
+      authFileName: 'codex-rt-race.json',
+      duplicate: false,
+    }
+  }
+  cpa.setDisabled = async () => {
+    isolateCalls++
+  }
+
+  const result = await collect.ingestRT(user(125), 'refresh-token-race')
+
+  assert.equal(result.ok, false)
+  if (!result.ok) assert.equal(result.code, 'PROVIDER_BUSY')
+  assert.equal(rtUploads, 0, 'RT must stop before token exchange or auth-file upload')
+  assert.equal(isolateCalls, 0, 'a blocked RT must not isolate any auth file')
+  const raw = rawDb()
+  const contribution = raw.prepare(
+    "SELECT COUNT(*) AS n FROM contributions WHERE account_id='rt-race-account'",
+  ).get() as { n: number }
+  raw.close()
+  assert.equal(contribution.n, 0)
+  assert.deepEqual(db.getOAuthSnapshot('oauth-blocks-rt-writer'), ['codex-old.json'])
+})
+
+test('single-writer contract holds the RT lease through upload and blocks OAuth start', async () => {
+  let rtUploads = 0
+  let oauthStarts = 0
+  let releaseUpload!: () => void
+  const uploadBarrier = new Promise<void>((resolve) => {
+    releaseUpload = resolve
+  })
+  cpa.ingestRefreshToken = async () => {
+    rtUploads++
+    await uploadBarrier
+    return {
+      accountId: 'rt-owned-account',
+      email: '',
+      plan: 'plus',
+      authFileName: 'codex-rt-owned.json',
+      duplicate: false,
+    }
+  }
+  cpa.listAuthFiles = async () => []
+  cpa.startOAuth = async () => {
+    oauthStarts++
+    return { state: 'after-rt-state', url: 'https://example.test/after-rt', flow: 'redirect' }
+  }
+  cpa.setDisabled = async () => {}
+
+  const pendingRt = collect.ingestRT(user(126), 'refresh-token-owned')
+  await waitUntil(() => rtUploads === 1)
+  await assert.rejects(
+    () => collect.startOAuth(user(127), 'codex'),
+    (error: unknown) =>
+      typeof error === 'object' &&
+      error !== null &&
+      'code' in error &&
+      (error as { code?: unknown }).code === 'PROVIDER_BUSY',
+  )
+  assert.equal(oauthStarts, 0, 'OAuth must stop before CPA while RT owns the provider lease')
+
+  releaseUpload()
+  const rtResult = await pendingRt
+  assert.equal(rtResult.ok, true)
+
+  const oauth = await collect.startOAuth(user(127), 'codex')
+  assert.equal(oauth.state, 'after-rt-state')
+  assert.equal(oauthStarts, 1)
+})
+
+test('atomic OAuth ingest revalidates operation token, provider lease, and hard expiry with zero writes', () => {
+  const cases = [
+    { state: 'atomic-wrong-operation', accountId: 'atomic-wrong-operation-account', mutation: 'operation' },
+    { state: 'atomic-missing-lease', accountId: 'atomic-missing-lease-account', mutation: 'lease' },
+    { state: 'atomic-hard-expired', accountId: 'atomic-hard-expired-account', mutation: 'hard-expiry' },
+  ] as const
+  const providers: ProviderId[] = ['codex', 'claude', 'grok']
+
+  for (const [index, item] of cases.entries()) {
+    const linuxdoId = 130 + index
+    const provider = providers[index]
+    const now = 100
+    const hardExpiresAt = 1_000
+    const leaseToken = seedSession(linuxdoId, provider, item.state, [], now, 900, hardExpiresAt)
+    const operationToken = `operation-${item.state}`
+    assert.equal(
+      db.claimOAuthSession({
+        state: item.state,
+        provider,
+        linuxdoId,
+        operationToken,
+        now: 110,
+        operationExpiresAt: 500,
+      }).status,
+      'claimed',
+    )
+    assert.deepEqual(
+      db.beginOAuthFinalization({ state: item.state, leaseToken, operationToken, now: 120 }),
+      { status: 'finalizing' },
+    )
+
+    let commitNow = 130
+    let commitOperation = operationToken
+    const raw = rawDb()
+    if (item.mutation === 'operation') commitOperation = 'wrong-operation-token'
+    if (item.mutation === 'lease') {
+      raw.prepare('DELETE FROM oauth_provider_leases WHERE provider=?').run(provider)
+    }
+    if (item.mutation === 'hard-expiry') {
+      raw.prepare('UPDATE oauth_provider_leases SET expires_at=2000 WHERE provider=?').run(provider)
+      raw.prepare('UPDATE oauth_snapshots SET operation_expires_at=2000 WHERE state=?').run(item.state)
+      commitNow = hardExpiresAt + 1
+    }
+    raw.close()
+
+    assert.notEqual(
+      db.finalizeOAuthIngest({
+        state: item.state,
+        provider,
+        linuxdoId,
+        leaseToken,
+        operationToken: commitOperation,
+        now: commitNow,
+        contribution: oauthContribution(linuxdoId, provider, item.accountId),
+      }).status,
+      'committed',
+      item.mutation,
+    )
+
+    const verify = rawDb()
+    const contribution = verify.prepare(
+      'SELECT COUNT(*) AS n FROM contributions WHERE account_id=?',
+    ).get(item.accountId) as { n: number }
+    verify.close()
+    assert.equal(contribution.n, 0, item.mutation)
+  }
 })
 
 test('cancel plus transient redirect failure keeps the provider fence until hard expiry', async () => {

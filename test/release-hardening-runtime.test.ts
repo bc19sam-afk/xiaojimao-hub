@@ -84,4 +84,9 @@ test('发布文档：worker 默认、nginx 最小安全项和 release checklist 
   ]) {
     assert.ok(checklist.includes(required), `release checklist 缺少 ${required}`)
   }
+  assert.match(
+    checklist,
+    /CPA `auth-files` 写入口只由本服务使用；运行期间不允许其它 UI、脚本或客户端并发发起 OAuth、RT 上传或 auth-file 创建/,
+    'release checklist 必须明确 auth-files 无外部 writer 的单写者合同',
+  )
 })

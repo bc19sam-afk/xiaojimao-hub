@@ -51,32 +51,63 @@ test('① 核心回归：before 快照挡住号池既有号，findNew 只返回�
   assert.notEqual(r.accountId, 'acct-poolA') // 绝不抢注池中既有号
 })
 
-// ② 反证：同一文件池、同一顺序，若 before 为空（旧行为）→ findNew 命中池中既有号 poolA。
-//    证明「快照」正是关键防线：唯一变量就是有没有快照。
-test('② 反证：无快照（before 空）会抢注号池既有号 poolA', async () => {
+// ② fail-closed：同一文件池、同一顺序，若 before 为空会出现两个无法因果区分的 fresh 文件。
+//    单写者合同被破坏时绝不能按列表顺序猜第一个，否则会抢注池中既有号或并发 RT 文件。
+test('② fail-closed：多个 fresh 文件不按列表顺序猜归属', async () => {
   const client = stubClient([poolA, newB])
   const r = await findNew(client, 'claude', new Set<string>(), new Set<string>())
-  assert.equal(r.accountId, 'acct-poolA') // 没有快照就中招（正是本单要修的）
+  assert.equal(r.accountId, '')
+  assert.equal(r.authFileName, '')
+  assert.equal(r.duplicate, true)
 })
 
-// ③ 向后兼容：before 空时，provider 过滤 + known 判重仍与原 findNew 一致。
-test('③ 向后兼容：空 before 下 provider 过滤与 known 判重仍生效', async () => {
+// ③ 向后兼容：before 过滤旧文件后，provider 过滤 + known 判重仍与原 findNew 一致。
+test('③ 向后兼容：before 与 provider 过滤后，唯一 fresh 文件仍可判重', async () => {
   const known = authFile({ name: 'anthropic-known.json', accountId: 'acct-known' })
   const codex = authFile({ name: 'codex-x.json', accountId: 'acct-codex', provider: 'codex' })
   const fresh = authFile({ name: 'anthropic-fresh.json', accountId: 'acct-fresh' })
   const client = stubClient([known, codex, fresh])
+  const before = new Set<string>([known.name])
 
   // known 含 acct-known → 跳过；codex 非目标 provider → 跳过；只剩 claude 的 fresh
-  const r = await findNew(client, 'claude', new Set<string>(['acct-known']), new Set<string>())
+  const r = await findNew(client, 'claude', new Set<string>(['acct-known']), before)
   assert.equal(r.duplicate, false)
   assert.equal(r.accountId, 'acct-fresh')
 
-  // 全部已知/被过滤 → duplicate；accountId 带回已知号身份（重交语义：collect 层报
+  // 唯一 fresh 已知 → duplicate；accountId 带回已知号身份（重交语义：collect 层报
   // 「这个号交过了」而非「未能确认」），authFileName 留空保证 isolate() 零副作用
-  const none = await findNew(client, 'claude', new Set<string>(['acct-known', 'acct-fresh']), new Set<string>())
+  const none = await findNew(client, 'claude', new Set<string>(['acct-known', 'acct-fresh']), before)
   assert.equal(none.duplicate, true)
-  assert.equal(none.accountId, 'acct-known')
+  assert.equal(none.accountId, 'acct-fresh')
   assert.equal(none.authFileName, '')
+})
+
+test('并发 RT 与目标 OAuth 文件同时 fresh 时整体拒绝，零错误归属', async () => {
+  const rtRace = authFile({
+    name: 'codex-rt-race.json',
+    accountId: 'rt-account',
+    provider: 'codex',
+  })
+  const intendedOAuth = authFile({
+    name: 'codex-oauth-intended.json',
+    accountId: 'oauth-account',
+    provider: 'codex',
+  })
+
+  const result = await findNew(
+    stubClient([rtRace, intendedOAuth]),
+    'codex',
+    new Set<string>(),
+    new Set<string>(),
+  )
+
+  assert.deepEqual(result, {
+    accountId: '',
+    email: '',
+    plan: 'unknown',
+    authFileName: '',
+    duplicate: true,
+  })
 })
 
 // ④ 端到端（真实 redirect 链）：P1b-4 后 cpa.finishOAuth 不再自拍快照，改用调用方传入的授权前快照
@@ -131,13 +162,14 @@ test('重交已交号：快照外新文件但 accountId 在 known → duplicate 
   assert.equal(r.authFileName, '') // 留空 → isolate() 空转，不碰池中文件
 })
 
-// 优先级：快照外同时有「真新号」和「重交号」→ 必须先认真新号（不能把真新号误报成重复）
-test('重交与真新号并存：优先返回真新号', async () => {
+// 快照外同时有「真新号」和「重交号」仍无法证明哪个属于本次 state，必须整体拒绝。
+test('重交与真新号并存：多 fresh 候选 fail-closed', async () => {
   const client = stubClient([
     authFile({ name: 'anthropic-rejoin3.json', accountId: 'acct-known-2' }), // 重交（排前面）
     authFile({ name: 'anthropic-brand-new.json', accountId: 'acct-brand-new' }), // 真新号
   ])
   const r = await findNew(client, 'claude', new Set(['acct-known-2']), new Set<string>())
-  assert.equal(r.duplicate, false)
-  assert.equal(r.accountId, 'acct-brand-new')
+  assert.equal(r.duplicate, true)
+  assert.equal(r.accountId, '')
+  assert.equal(r.authFileName, '')
 })

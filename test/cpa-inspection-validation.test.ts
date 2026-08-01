@@ -106,6 +106,49 @@ test('inspection envelope fails closed on non-canonical run id and missing/misty
   }
 })
 
+test('real cpa.inspect keeps legacy rows without provider while strictly validating provider when present', async () => {
+  stubInspection(
+    { run: { id: 10 } },
+    {
+      run: { status: 'completed' },
+      results: [
+        {
+          accountId: 'legacy-no-provider',
+          statusCode: 200,
+          action: 'keep',
+          planType: 'plus',
+        },
+      ],
+    },
+  )
+
+  assert.deepEqual(await cpa.inspect(), [
+    {
+      accountId: 'legacy-no-provider',
+      decision: 'ok',
+      plan: 'plus',
+      reason: '',
+      provider: undefined,
+    },
+  ])
+
+  for (const [label, provider] of [
+    ['provider number', 123],
+    ['provider padded', ' codex '],
+    ['provider unknown', 'unknown'],
+  ] as const) {
+    stubInspection(
+      { run: { id: 10 } },
+      {
+        run: { status: 'completed' },
+        results: [{ accountId: 'strict-provider', provider, statusCode: 200, action: 'keep' }],
+      },
+    )
+    const error = await cpa.inspect().then(() => null, (caught) => caught as Error)
+    assert.equal(error?.message, CPA_UNAVAILABLE, label)
+  }
+})
+
 test('inspection rejects every malformed result row instead of mapping it to healthy', async () => {
   const malformedRows: Array<[string, unknown]> = [
     [
@@ -127,6 +170,10 @@ test('inspection rejects every malformed result row instead of mapping it to hea
     [
       'unknown provider',
       { accountId: 'inspect-provider', provider: 'unknown', statusCode: 200, action: 'keep' },
+    ],
+    [
+      'padded provider',
+      { accountId: 'inspect-provider', provider: ' codex ', statusCode: 200, action: 'keep' },
     ],
     [
       'unknown action enum',

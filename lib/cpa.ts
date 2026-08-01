@@ -524,6 +524,8 @@ async function getAuthStatus(state: string): Promise<OAuthStatusPayload> {
 //   （不在 known）的号；没有快照时 findNew 会把池中某个既有号误当成用户刚授权的新号，进而记到
 //   提交者名下、被 isolate() 禁用（那是生产号！）、错发分。before 用文件名（f.name）做身份——
 //   比 accountId 稳、且唯一。before 为空集 → 该条件恒真＝退化为原行为（无快照的调用方仍可用）。
+// 单写者合同：本应用的 OAuth 与 RT producer 共享 provider lease，部署时 auth-files 不允许外部写者。
+// 即使合同被破坏，只要出现多个 fresh 候选也必须整体 fail closed，绝不按列表顺序猜 state 归属。
 export async function findNew(
   client: CpaClient,
   provider: ProviderId,
@@ -532,21 +534,30 @@ export async function findNew(
 ): Promise<IngestResult> {
   const files = (await client.listAuthFiles()).map(parseAuthFileRow)
   const fresh = files.filter((f) => f.provider === provider && f.accountId && !before.has(f.name))
-  const created = fresh.find((f) => !known.has(f.accountId))
-  if (created) {
-    return { accountId: created.accountId, email: created.email, plan: created.plan, authFileName: created.name, duplicate: false }
+  if (fresh.length !== 1) {
+    return { accountId: '', email: '', plan: 'unknown', authFileName: '', duplicate: true }
+  }
+  const [candidate] = fresh
+  if (!known.has(candidate.accountId)) {
+    return {
+      accountId: candidate.accountId,
+      email: candidate.email,
+      plan: candidate.plan,
+      authFileName: candidate.name,
+      duplicate: false,
+    }
   }
   // 快照外有新文件、但 accountId 已在 known ＝「已交过的号重新授权又落了一份文件」
   // （典型：号被拒后文件已删，用户重交——§2.4 要拦的场景）。带回 accountId 让 collect 层
   // 报「这个号交过了」而非「未能确认」；authFileName 留空——绝不能让 isolate() 去禁用
   // 池中那个可能正在服务的文件（重交不该有任何外部副作用）。
-  const rejoined = fresh.find((f) => known.has(f.accountId))
-  if (rejoined) {
-    return { accountId: rejoined.accountId, email: rejoined.email, plan: rejoined.plan, authFileName: '', duplicate: true }
+  return {
+    accountId: candidate.accountId,
+    email: candidate.email,
+    plan: candidate.plan,
+    authFileName: '',
+    duplicate: true,
   }
-  // 快照外无本 provider 新文件：授权未完成 / 文件被 cpamp 原地覆盖（重交在池号，原理上与
-  // 未完成不可区分，彻底区分留 P1b-5 响应关联）→ 认不出，collect 层报「未能确认」。
-  return { accountId: '', email: '', plan: 'unknown', authFileName: '', duplicate: true }
 }
 
 const realClient: CpaClient = {
@@ -772,9 +783,13 @@ function parseInspectionResult(value: unknown): RawInspectionResult {
   const statusCode = value.statusCode
   const action = value.action
   if (!accountId) failCpaShape('inspection_result')
-  if (!isNonEmptyString(providerToken)) failCpaShape('inspection_result')
-  const provider = providerFromToken(providerToken)
-  if (!provider) failCpaShape('inspection_result')
+  let provider: ProviderId | undefined
+  if (providerToken !== undefined) {
+    const canonicalProvider = optionalCanonicalString(providerToken, 'inspection_result')
+    if (!canonicalProvider) failCpaShape('inspection_result')
+    provider = providerFromToken(canonicalProvider)
+    if (!provider) failCpaShape('inspection_result')
+  }
   if (
     statusCode !== null &&
     (typeof statusCode !== 'number' || !Number.isSafeInteger(statusCode))

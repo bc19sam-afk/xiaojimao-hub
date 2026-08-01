@@ -24,29 +24,26 @@ type CollectResult =
   | { ok: false; code: OAuthErrorCode; error: string }
 type OAuthFailureResult = Extract<CollectResult, { ok: false }>
 
-// 把一个已落号的结果记为贡献：pending，等巡检。
-function recordIngest(
+function missingIngestIdentity(): OAuthFailureResult {
+  return {
+    ok: false,
+    code: 'CPA_UNAVAILABLE',
+    error: '未能确认到新授权的账号，请确认已完成授权后重试',
+  }
+}
+
+function duplicateIngest(): OAuthFailureResult {
+  return { ok: false, code: 'DUPLICATE_ACCOUNT', error: '这个号交过了，不能再交' }
+}
+
+function buildContribution(
   user: SessionUser,
   provider: ProviderId,
   result: IngestResult,
   method: 'oauth' | 'rt',
-): CollectResult {
-  // 认不出身份：findNew 没找到本 provider 的新号（accountId 空），或三家稳定字段全读不到的
-  // 残缺号——这不是「重复」，用重复文案会误导用户。诚实提示重试即可（认不出身份的号进
-  // needs_review + 人工录入 canonical ID 留待 P2；三家都有稳定字段后此处只剩残缺/异常号）。
-  if (!result.accountId) {
-    return {
-      ok: false,
-      code: 'CPA_UNAVAILABLE',
-      error: '未能确认到新授权的账号，请确认已完成授权后重试',
-    }
-  }
-  // 真重复：拿到了 accountId，但该 (provider, accountId) 已被贡献过 / 池中已有。
-  if (result.duplicate) {
-    return { ok: false, code: 'DUPLICATE_ACCOUNT', error: '这个号交过了，不能再交' }
-  }
+): Contribution {
   const now = Date.now()
-  const contribution: Contribution = {
+  return {
     id: randomBytes(8).toString('hex'),
     linuxdoId: user.id,
     username: user.username,
@@ -64,10 +61,52 @@ function recordIngest(
     createdAt: now,
     updatedAt: now,
   }
+}
+
+// 把一个已落号的结果记为贡献：pending，等巡检。
+function recordIngest(
+  user: SessionUser,
+  provider: ProviderId,
+  result: IngestResult,
+  method: 'oauth' | 'rt',
+): CollectResult {
+  // 认不出身份：findNew 没找到本 provider 的新号（accountId 空），或三家稳定字段全读不到的
+  // 残缺号——这不是「重复」，用重复文案会误导用户。诚实提示重试即可（认不出身份的号进
+  // needs_review + 人工录入 canonical ID 留待 P2；三家都有稳定字段后此处只剩残缺/异常号）。
+  if (!result.accountId) return missingIngestIdentity()
+  // 真重复：拿到了 accountId，但该 (provider, accountId) 已被贡献过 / 池中已有。
+  if (result.duplicate) return duplicateIngest()
+
+  const contribution = buildContribution(user, provider, result, method)
   const { duplicate } = db.insertUnique(contribution)
-  if (duplicate) return { ok: false, code: 'DUPLICATE_ACCOUNT', error: '这个号交过了，不能再交' }
+  if (duplicate) return duplicateIngest()
   // 修好重交成功入库 → 清掉**本人**该号旧退回记录，dashboard 的「未收下」提示随之消失（codex xhigh 于 PR #18）
   db.clearRejections(contribution.linuxdoId, provider, contribution.accountId)
+  return { ok: true, contribution }
+}
+
+function finalizeOAuthIngest(
+  user: SessionUser,
+  provider: ProviderId,
+  state: string,
+  claim: Extract<ReturnType<typeof claimOAuthOperation>, { status: 'claimed' }>,
+  result: IngestResult,
+): CollectResult {
+  if (!result.accountId) return missingIngestIdentity()
+  const contribution = result.duplicate ? undefined : buildContribution(user, provider, result, 'oauth')
+  const finalized = db.finalizeOAuthIngest({
+    state,
+    provider,
+    linuxdoId: user.id,
+    leaseToken: claim.leaseToken,
+    operationToken: claim.operationToken,
+    now: Date.now(),
+    contribution,
+  })
+  if (finalized.status === 'cancelled') return cancelledOAuthSession()
+  if (finalized.status === 'stale') return invalidOAuthSession()
+  if (finalized.status === 'duplicate') return duplicateIngest()
+  if (!contribution) return invalidOAuthSession()
   return { ok: true, contribution }
 }
 
@@ -99,6 +138,7 @@ const SNAPSHOT_MISSING_ERROR = '授权会话已过期或已完成，请重新点
 const OAUTH_OPERATION_BUSY_ERROR = '授权会话正在处理中，请稍后重试'
 const OAUTH_SESSION_CREATE_ERROR = '授权会话创建失败，请重新发起授权'
 const OAUTH_START_LEASE_TTL_MS = 60_000
+const RT_PROVIDER_LEASE_TTL_MS = DEFAULT_OUTBOUND_TIMEOUT_MS * 3 + 60_000
 const OAUTH_REDIRECT_TTL_MS = 15 * 60_000
 const OAUTH_DEVICE_MAX_TTL_SECONDS = 30 * 60
 // 覆盖 redirect finish 的最坏外呼上界、随后 isolate 的一次外呼，以及 60s 调度/本地处理余量。
@@ -308,12 +348,10 @@ export async function finishOAuth(
   if (gate.status === 'cancelled') return cancelledOAuthSession()
   if (gate.status !== 'finalizing') return invalidOAuthSession()
   await isolate(result.authFileName)
-  const recorded = recordIngest(user, provider, result, 'oauth')
+  const recorded = finalizeOAuthIngest(user, provider, state, claim, result)
   // accountId 为空仍可能只是 auth-file 尚未可见；只释放短 claim，保留会话供同 state 重试。
   // 有 canonical accountId 的成功或重复才是可证明终态。
-  if (result.accountId) {
-    db.completeOAuthSession(state, claim.leaseToken, claim.operationToken)
-  } else {
+  if (!result.accountId) {
     db.releaseOAuthOperation(state, claim.leaseToken, claim.operationToken)
   }
   return recorded
@@ -371,7 +409,7 @@ export async function checkOAuth(
     return { done: false }
   }
   await isolate(r.ingest.authFileName)
-  const recorded = recordIngest(user, provider, r.ingest, 'oauth')
+  const recorded = finalizeOAuthIngest(user, provider, state, claim, r.ingest)
   if (!r.ingest.accountId) {
     db.releaseOAuthOperation(state, claim.leaseToken, claim.operationToken)
     return {
@@ -380,16 +418,44 @@ export async function checkOAuth(
       error: recorded.ok ? undefined : recorded.error,
     }
   }
-  db.completeOAuthSession(state, claim.leaseToken, claim.operationToken)
+  if (!recorded.ok && (recorded.code === 'OAUTH_CANCELLED' || recorded.code === 'OAUTH_SESSION_INVALID')) {
+    return { done: false, code: recorded.code, error: recorded.error }
+  }
   return { done: true, result: recorded }
 }
 
 // —— 直贴 RT（仅 codex）——
 export async function ingestRT(user: SessionUser, rt: string): Promise<CollectResult> {
-  const known = db.accountIdsFor('codex') // RT 仅 codex
-  const result = await cpa.ingestRefreshToken(rt, known)
-  await isolate(result.authFileName)
-  return recordIngest(user, 'codex', result, 'rt')
+  // 单写者合同：本应用内所有会创建 auth-file 的 producer 必须共享 provider lease。OAuth 会话已
+  // 持有长租约；RT 也先抢同一 codex 租约，避免它在 OAuth 快照后并发落文件并被错认归属。
+  const leaseToken = randomBytes(24).toString('hex')
+  let acquired = false
+  for (const delayMs of OAUTH_LEASE_RETRY_DELAYS_MS) {
+    if (delayMs > 0) await sleep(delayMs)
+    const now = Date.now()
+    db.cleanupOAuthSessions(now)
+    acquired = db.acquireOAuthProviderLease({
+      provider: 'codex',
+      linuxdoId: user.id,
+      leaseToken,
+      now,
+      expiresAt: now + RT_PROVIDER_LEASE_TTL_MS,
+    })
+    if (acquired) break
+  }
+  if (!acquired) {
+    const error = oauthProtocolError('PROVIDER_BUSY')
+    return { ok: false, code: error.code, error: error.message }
+  }
+
+  try {
+    const known = db.accountIdsFor('codex') // RT 仅 codex
+    const result = await cpa.ingestRefreshToken(rt, known)
+    await isolate(result.authFileName)
+    return recordIngest(user, 'codex', result, 'rt')
+  } finally {
+    db.releaseOAuthProviderLease('codex', leaseToken)
+  }
 }
 
 // @deprecated v4（R1 拆考察期）：observationKind / pauseIncrement 及其原消费方（考察闭环 settle /

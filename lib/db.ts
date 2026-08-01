@@ -96,6 +96,22 @@ export type OAuthSessionFinalization =
   | { status: 'cancelled' }
   | { status: 'stale' }
 
+export interface OAuthIngestFinalization {
+  state: string
+  provider: string
+  linuxdoId: number
+  leaseToken: string
+  operationToken: string
+  now: number
+  contribution?: Contribution
+}
+
+export type OAuthIngestFinalizationResult =
+  | { status: 'committed' }
+  | { status: 'duplicate' }
+  | { status: 'cancelled' }
+  | { status: 'stale' }
+
 const DB_PATH = process.env.DB_PATH || path.join(process.cwd(), 'data', 'app.db')
 
 interface DbFileIdentity {
@@ -217,6 +233,22 @@ function toContribution(r: Row): Contribution {
     snapshotPriority: r.snapshot_priority ?? undefined,
     pooledAt: r.pooled_at ?? undefined,
   }
+}
+
+function insertContribution(c: Contribution): boolean {
+  return conn
+    .prepare(
+      `INSERT INTO contributions
+       (id, linuxdo_id, username, account_id, email, provider, plan, method, auth_file_name,
+        verify_status, points, reward_status, reward_text, reward_note, reward_code, created_at, updated_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+       ON CONFLICT(provider, account_id) DO NOTHING`,
+    )
+    .run(
+      c.id, c.linuxdoId, c.username, c.accountId, c.email, c.provider, c.plan, c.method, c.authFileName,
+      c.verifyStatus, c.points, c.rewardStatus, c.rewardText, c.rewardNote, c.rewardCode ?? null,
+      c.createdAt, c.updatedAt,
+    ).changes === 1
 }
 
 // 考察期观测事件的合法类型（封死取值，防拼错——如 'hard-fail' 会被 hasHardFailure 漏判、
@@ -350,20 +382,7 @@ export const db = {
 
   // 插入；(provider, account_id) 冲突则不插入并返回 duplicate=true（依赖复合 UNIQUE 约束，原子防重）
   insertUnique(c: Contribution): { duplicate: boolean } {
-    const r = conn
-      .prepare(
-        `INSERT INTO contributions
-         (id, linuxdo_id, username, account_id, email, provider, plan, method, auth_file_name,
-          verify_status, points, reward_status, reward_text, reward_note, reward_code, created_at, updated_at)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-         ON CONFLICT(provider, account_id) DO NOTHING`,
-      )
-      .run(
-        c.id, c.linuxdoId, c.username, c.accountId, c.email, c.provider, c.plan, c.method, c.authFileName,
-        c.verifyStatus, c.points, c.rewardStatus, c.rewardText, c.rewardNote, c.rewardCode ?? null,
-        c.createdAt, c.updatedAt,
-      )
-    return { duplicate: r.changes === 0 }
+    return { duplicate: !insertContribution(c) }
   },
 
   // 通用部分更新（供状态/字段调整）
@@ -1648,6 +1667,118 @@ export const db = {
       }
       conn.exec('COMMIT')
       return true
+    } catch (error) {
+      conn.exec('ROLLBACK')
+      throw error
+    }
+  },
+
+  // isolate 完成后的唯一提交点。一个短事务内重新核验 owner/provider、FINALIZING、provider lease、
+  // operation fencing token 与两个 expiry，再原子插入 contribution、清本人退回记录并完成 session/lease。
+  // cleanup/cancel 若在 isolate await 期间先改变状态或 token，本事务不插入任何 contribution。
+  finalizeOAuthIngest(input: OAuthIngestFinalization): OAuthIngestFinalizationResult {
+    if (
+      !input.state ||
+      !input.provider ||
+      !input.leaseToken ||
+      !input.operationToken ||
+      (input.contribution && (
+        input.contribution.method !== 'oauth' ||
+        input.contribution.provider !== input.provider ||
+        input.contribution.linuxdoId !== input.linuxdoId
+      ))
+    ) return { status: 'stale' }
+
+    conn.exec('BEGIN IMMEDIATE')
+    try {
+      const row = conn
+        .prepare(
+          `SELECT s.status, s.operation_token, s.operation_expires_at, s.hard_expires_at,
+                  l.lease_token AS active_lease_token
+           FROM oauth_snapshots s
+           LEFT JOIN oauth_provider_leases l
+             ON l.provider=s.provider
+            AND l.lease_token=s.lease_token
+            AND l.linuxdo_id=s.linuxdo_id
+            AND l.expires_at>?
+           WHERE s.state=? AND s.provider=? AND s.linuxdo_id=? AND s.lease_token=?`,
+        )
+        .get(
+          input.now,
+          input.state,
+          input.provider,
+          input.linuxdoId,
+          input.leaseToken,
+        ) as unknown as
+        | {
+            status: string
+            operation_token: string | null
+            operation_expires_at: number | null
+            hard_expires_at: number | null
+            active_lease_token: string | null
+          }
+        | undefined
+
+      if (!row) {
+        conn.exec('COMMIT')
+        return { status: 'stale' }
+      }
+      if (
+        row.status === 'CANCEL_PENDING' ||
+        row.status === 'CANCEL_CONFIRMED' ||
+        row.status === 'CANCELLED'
+      ) {
+        conn.exec('COMMIT')
+        return { status: 'cancelled' }
+      }
+      if (
+        row.status !== 'FINALIZING' ||
+        row.operation_token !== input.operationToken ||
+        row.operation_expires_at == null ||
+        row.operation_expires_at <= input.now ||
+        row.hard_expires_at == null ||
+        row.hard_expires_at <= input.now ||
+        row.active_lease_token !== input.leaseToken
+      ) {
+        conn.exec('COMMIT')
+        return { status: 'stale' }
+      }
+
+      const inserted = input.contribution ? insertContribution(input.contribution) : false
+      if (inserted && input.contribution) {
+        conn
+          .prepare('DELETE FROM rejections WHERE linuxdo_id=? AND provider=? AND account_id=?')
+          .run(input.contribution.linuxdoId, input.provider, input.contribution.accountId)
+      }
+
+      const completed = conn
+        .prepare(
+          `DELETE FROM oauth_snapshots
+           WHERE state=? AND provider=? AND linuxdo_id=? AND lease_token=? AND operation_token=?
+             AND status='FINALIZING' AND operation_expires_at>? AND hard_expires_at>?`,
+        )
+        .run(
+          input.state,
+          input.provider,
+          input.linuxdoId,
+          input.leaseToken,
+          input.operationToken,
+          input.now,
+          input.now,
+        )
+      const released = conn
+        .prepare(
+          `DELETE FROM oauth_provider_leases
+           WHERE provider=? AND lease_token=? AND linuxdo_id=? AND expires_at>?`,
+        )
+        .run(input.provider, input.leaseToken, input.linuxdoId, input.now)
+      if (completed.changes !== 1 || released.changes !== 1) {
+        conn.exec('ROLLBACK')
+        return { status: 'stale' }
+      }
+
+      conn.exec('COMMIT')
+      return { status: inserted ? 'committed' : 'duplicate' }
     } catch (error) {
       conn.exec('ROLLBACK')
       throw error

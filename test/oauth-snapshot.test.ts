@@ -240,14 +240,61 @@ test('device 覆盖：checkOAuth 读持久化快照 {poolC}，挡住池中 poolC
   assert.equal(db.getOAuthSnapshot(state), null) // 成功入库后快照删
 })
 
-// 反证：device 传空 before（旧行为）会抢注池中 poolC（证明持久化快照正是关键防线）。
-test('device 反证：空 before（旧行为）会抢注池中既有 poolC', async () => {
+test('OAuth 多 fresh 候选整体拒绝：旧文件与并发 RT 均零隔离、零错误归属', async () => {
+  const uid = 4006
+  const state = 'st-multi-fresh-zero-write'
+  seedOAuthSession(uid, 'codex', state, ['codex-old.json'])
+
+  let isolateCalls = 0
+  globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
+    const target = String(url)
+    const method = (init?.method || 'GET').toUpperCase()
+    if (target.endsWith('/v0/management/auth-files') && method === 'GET') {
+      return new Response(JSON.stringify({
+        files: [
+          { name: 'codex-old.json', provider: 'codex', account_id: 'old-account' },
+          { name: 'codex-rt-race.json', provider: 'codex', account_id: 'rt-account' },
+          { name: 'codex-oauth-intended.json', provider: 'codex', account_id: 'oauth-account' },
+        ],
+      }), { status: 200 })
+    }
+    if (target.endsWith('/v0/management/oauth-callback') && method === 'POST') {
+      return new Response('{}', { status: 200 })
+    }
+    if (target.includes('/v0/management/get-auth-status')) {
+      return new Response(JSON.stringify({ status: 'ok' }), { status: 200 })
+    }
+    if (target.includes('/v0/management/auth-files/status') && method === 'PATCH') {
+      isolateCalls++
+      return new Response('{}', { status: 200 })
+    }
+    throw new Error(`测试桩：不该请求 ${method} ${target}`)
+  }) as typeof fetch
+
+  const result = await collect.finishOAuth(
+    user(uid),
+    'codex',
+    `https://app/callback?state=${state}`,
+  )
+
+  assert.equal(result.ok, false)
+  if (!result.ok) assert.equal(result.code, 'CPA_UNAVAILABLE')
+  assert.equal(isolateCalls, 0)
+  assert.equal(db.byUser(uid).length, 0)
+  assert.deepEqual(db.getOAuthSnapshot(state), ['codex-old.json'])
+})
+
+// 即使调用方错误地传空 before，只要出现多个无法因果区分的 fresh 候选也必须整体拒绝，
+// 不能再按列表顺序抢注池中 poolC。
+test('device 防线：空 before 且多 fresh 候选时 fail-closed，不抢注池中既有号', async () => {
   const client = stubClient([
     authFile({ name: 'xai-poolC.json', accountId: 'acct-poolC', provider: 'grok' }),
     authFile({ name: 'xai-newD.json', accountId: 'acct-newD', provider: 'grok' }),
   ])
-  const grabbed = await findNew(client, 'grok', new Set<string>(), new Set<string>())
-  assert.equal(grabbed.accountId, 'acct-poolC') // 没有快照就抢注池中既有号（正是本单要修的）
+  const result = await findNew(client, 'grok', new Set<string>(), new Set<string>())
+  assert.equal(result.accountId, '')
+  assert.equal(result.authFileName, '')
+  assert.equal(result.duplicate, true)
 })
 
 // ── fail-closed：快照缺失即拒绝（codex xhigh 于 PR #10 指出）─────────────────
