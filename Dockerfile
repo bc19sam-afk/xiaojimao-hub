@@ -48,6 +48,9 @@ ENV NODE_ENV=production \
 
 # standalone 三件套：server.js + 最小 node_modules（拷到 ./）、静态资源、public。
 COPY --from=builder /app/.next/standalone ./
+# Next's standalone tracer keeps sharp itself but may omit its optional platform packages.
+# Copy them explicitly so Alpine runners retain the matching linuxmusl libvips binary.
+COPY --from=builder /app/node_modules/@img ./node_modules/@img
 COPY --from=builder /app/.next/static ./.next/static
 COPY --from=builder /app/public ./public
 
