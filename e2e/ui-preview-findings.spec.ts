@@ -434,10 +434,19 @@ test('OAuth panel applies structured duplicate, busy, expired, cancelled, and pe
 
   let checkCalls = 0
   let staleGrokCheckCalls = 0
+  let keepGrokPendingForProviderSwitch = false
   await page.route('**/api/collect/oauth/check', async (route) => {
     const body = route.request().postDataJSON() as { provider?: string }
     if (trackStaleGrokOperations && body.provider === 'grok') staleGrokCheckCalls += 1
     checkCalls += 1
+    if (keepGrokPendingForProviderSwitch && body.provider === 'grok') {
+      await route.fulfill({
+        status: 202,
+        contentType: 'application/json',
+        body: JSON.stringify({ ok: true, status: 'pending', retryAfterMs: 250 }),
+      })
+      return
+    }
     if (checkCalls === 1) {
       await route.fulfill({
         status: 202,
@@ -546,25 +555,32 @@ test('OAuth panel applies structured duplicate, busy, expired, cancelled, and pe
 
   await authorizeGrok.click()
   await expect(page.getByText('DEVICE-CODE', { exact: true })).toBeVisible()
+  keepGrokPendingForProviderSwitch = true
   trackStaleGrokOperations = true
   staleGrokCheckCalls = 0
   staleGrokCancelCalls = 0
+  // Force one legitimate pre-switch poll so the assertion cannot confuse it with a stale post-switch poll.
+  await expect.poll(() => staleGrokCheckCalls).toBeGreaterThanOrEqual(1)
   await page.getByRole('button', { name: 'Claude Claude 订阅' }).click()
+  // A slow runner may let the already-scheduled Grok poll start before the click is dispatched.
+  // The provider-switch contract is that no additional Grok operation starts after the click completes.
+  const grokChecksAtClaudeSwitch = staleGrokCheckCalls
+  const grokCancelsAtClaudeSwitch = staleGrokCancelCalls
   await mismatchedRestoreRequested
   await expect(page.getByText('DEVICE-CODE', { exact: true })).toBeHidden()
   await expect(page.getByRole('button', { name: '取消', exact: true })).toBeHidden()
   await expect(authorizeClaude).toBeVisible()
   await page.waitForTimeout(3250)
-  expect(staleGrokCheckCalls).toBe(0)
-  expect(staleGrokCancelCalls).toBe(0)
+  expect(staleGrokCheckCalls).toBe(grokChecksAtClaudeSwitch)
+  expect(staleGrokCancelCalls).toBe(grokCancelsAtClaudeSwitch)
 
   releaseMismatchedRestore()
   await mismatchedRestoreDelivered
   await expect(staleDeviceCode).toBeHidden()
   await expect(authorizeClaude).toBeVisible()
   await page.waitForTimeout(3250)
-  expect(staleGrokCheckCalls).toBe(0)
-  expect(staleGrokCancelCalls).toBe(0)
+  expect(staleGrokCheckCalls).toBe(grokChecksAtClaudeSwitch)
+  expect(staleGrokCancelCalls).toBe(grokCancelsAtClaudeSwitch)
 
   restoreHandler = null
   trackStaleGrokOperations = false
@@ -595,7 +611,10 @@ test('OAuth panel applies structured duplicate, busy, expired, cancelled, and pe
   trackStaleGrokOperations = true
   staleGrokCheckCalls = 0
   staleGrokCancelCalls = 0
+  await expect.poll(() => staleGrokCheckCalls).toBeGreaterThanOrEqual(1)
   await page.getByRole('button', { name: 'ChatGPT Plus / Pro / Team / K12' }).click()
+  const grokChecksAtCodexSwitch = staleGrokCheckCalls
+  const grokCancelsAtCodexSwitch = staleGrokCancelCalls
   await failedRestoreRequested
   await expect(page.getByText('DEVICE-CODE', { exact: true })).toBeHidden()
   await expect(page.getByRole('button', { name: '取消', exact: true })).toBeHidden()
@@ -605,8 +624,9 @@ test('OAuth panel applies structured duplicate, busy, expired, cancelled, and pe
   await failedRestoreDelivered
   await expect(authorizeChatGpt).toBeVisible()
   await page.waitForTimeout(3250)
-  expect(staleGrokCheckCalls).toBe(0)
-  expect(staleGrokCancelCalls).toBe(0)
+  expect(staleGrokCheckCalls).toBe(grokChecksAtCodexSwitch)
+  expect(staleGrokCancelCalls).toBe(grokCancelsAtCodexSwitch)
+  keepGrokPendingForProviderSwitch = false
 
   let releaseNullRestore!: () => void
   let markNullRestoreRequested!: () => void
