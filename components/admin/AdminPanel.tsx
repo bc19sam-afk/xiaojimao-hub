@@ -8,8 +8,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import ConfirmDialog, { type ConfirmDialogRequest } from './ConfirmDialog'
 import { OpenAIMark } from '@/components/OpenAIMark'
-import StarField from '@/components/StarField'
-import NebulaBackground from '@/components/NebulaBackground'
 import {
   loadingServiceProbe,
   probeSystemStatus,
@@ -692,10 +690,9 @@ export default function AdminPanel() {
   return (
     <main id="admin-top" className="bg-ink relative min-h-[100dvh] min-w-0 overflow-x-clip text-neutral-200">
       <div className="pointer-events-none fixed inset-0 overflow-hidden" aria-hidden="true">
-        <NebulaBackground />
-        <StarField />
-        <div className="bg-grid absolute inset-0" />
-        <div className="absolute inset-0 bg-neutral-950/55" />
+        <div className="absolute inset-0 bg-[radial-gradient(circle_at_18%_10%,rgba(25,201,154,0.13),transparent_34%),radial-gradient(circle_at_82%_22%,rgba(16,163,127,0.08),transparent_28%)]" />
+        <div className="bg-grid absolute inset-0 opacity-60" />
+        <div className="absolute inset-0 bg-gradient-to-b from-neutral-950/35 via-neutral-950/65 to-neutral-950/95" />
       </div>
 
       <div className="relative mx-auto min-w-0 max-w-[90rem] px-4 py-5 sm:px-6 lg:px-8 lg:py-8">

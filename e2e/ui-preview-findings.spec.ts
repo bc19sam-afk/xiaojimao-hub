@@ -1912,6 +1912,7 @@ test('admin keeps page width bounded and primary controls visible at mobile and 
   try {
     await page.setViewportSize({ width: 390, height: 900 })
     await openAdmin(page)
+    await expect(page.locator('main#admin-top canvas')).toHaveCount(0)
     await expect(page.getByTestId('review-table-scroll').getByText(longUsername, { exact: true })).toHaveCount(1)
     await expect(page.getByTestId('contributions-table-scroll').getByText(longAccount, { exact: true })).toHaveCount(1)
     await expect(page.getByTestId('settlements-table-scroll').getByText(longAccount, { exact: true })).toHaveCount(1)
