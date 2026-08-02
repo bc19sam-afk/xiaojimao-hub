@@ -1,7 +1,15 @@
+/* Hallmark · macrostructure: Workbench · genre: atmospheric · theme: homepage-inherited
+ * tone: technical · anchor hue: OpenAI green · enrichment: none · nav: N3 side rail · footer: none
+ * contrast: pass (40–41) · mobile: pass (34, 49–56) · honest: pass (46) · chrome: pass (47)
+ */
+/* Hallmark · pre-emit critique: P4 H5 E4 S5 R5 V4 */
 'use client'
 
 import { useCallback, useEffect, useRef, useState } from 'react'
 import ConfirmDialog, { type ConfirmDialogRequest } from './ConfirmDialog'
+import { OpenAIMark } from '@/components/OpenAIMark'
+import StarField from '@/components/StarField'
+import NebulaBackground from '@/components/NebulaBackground'
 import {
   loadingServiceProbe,
   probeSystemStatus,
@@ -146,8 +154,18 @@ const FULFILLMENTS = [
   { v: 'cdk', t: 'CDK 发码' },
 ]
 
+const ADMIN_NAV = [
+  { href: '#overview', label: '运营概览' },
+  { href: '#rules', label: '积分规则' },
+  { href: '#store', label: '商店与库存' },
+  { href: '#runtime', label: '运行参数' },
+  { href: '#audit', label: '审计日志' },
+  { href: '#review', label: '人工复核' },
+  { href: '#data', label: '数据记录' },
+] as const
+
 const field =
-  'rounded-lg border border-white/10 bg-white/5 px-2 py-1.5 text-sm text-neutral-100 outline-none focus:border-emerald-400/50'
+  'min-h-11 rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-sm text-neutral-100 outline-none transition-colors placeholder:text-neutral-600 hover:bg-white/[0.07] focus-visible:border-emerald-400/50 focus-visible:ring-2 focus-visible:ring-emerald-400/30 disabled:cursor-not-allowed disabled:opacity-50'
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
@@ -672,18 +690,42 @@ export default function AdminPanel() {
   )
 
   return (
-    <main className="min-h-[100dvh] min-w-0 bg-neutral-950 px-4 py-8 text-neutral-200">
-      <div className="mx-auto min-w-0 max-w-4xl">
-        <header className="mb-6 flex flex-wrap items-center justify-between gap-3">
-          <h1 className="text-xl font-bold text-white">管理后台</h1>
-          <div className="flex min-w-0 flex-wrap items-center justify-end gap-3">
-            {msg && <span role="status" aria-live="polite" className="min-w-0 break-words text-xs text-emerald-400">{msg}</span>}
-            <a href="/dashboard" className="text-sm text-neutral-400 hover:text-white">
-              前台
+    <main id="admin-top" className="bg-ink relative min-h-[100dvh] min-w-0 overflow-x-clip text-neutral-200">
+      <div className="pointer-events-none fixed inset-0 overflow-hidden" aria-hidden="true">
+        <NebulaBackground />
+        <StarField />
+        <div className="bg-grid absolute inset-0" />
+        <div className="absolute inset-0 bg-neutral-950/55" />
+      </div>
+
+      <div className="relative mx-auto min-w-0 max-w-[90rem] px-4 py-5 sm:px-6 lg:px-8 lg:py-8">
+        <header className="mb-6 flex min-w-0 flex-col gap-4 border-b border-white/10 pb-5 sm:flex-row sm:items-center sm:justify-between">
+          <div className="flex min-w-0 items-center gap-3">
+            <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-white/10 bg-[var(--ink-soft)]">
+              <OpenAIMark className="h-5 w-5 text-white" />
+            </div>
+            <div className="min-w-0 leading-tight">
+              <h1 className="text-xl font-bold tracking-tight text-white">管理后台</h1>
+              <p className="mono mt-1 truncate text-[10px] uppercase tracking-[0.16em] text-[var(--brand-bright)]">
+                OpenAI Plus 收集系统 · 小鸡毛の公益宇宙
+              </p>
+            </div>
+          </div>
+          <div className="flex min-w-0 flex-wrap items-center gap-2 sm:justify-end">
+            {msg && (
+              <span role="status" aria-live="polite" className="min-w-0 break-words px-1 text-xs text-emerald-300">
+                {msg}
+              </span>
+            )}
+            <a
+              href="/dashboard"
+              className="inline-flex min-h-11 items-center whitespace-nowrap rounded-lg px-3 text-sm text-neutral-300 transition-colors hover:bg-white/5 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400"
+            >
+              返回前台
             </a>
             <a
               href="/api/admin/logout"
-              className="rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 text-sm hover:bg-white/10"
+              className="inline-flex min-h-11 items-center whitespace-nowrap rounded-lg border border-white/10 bg-white/5 px-3 text-sm text-neutral-200 transition-colors hover:bg-white/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400"
             >
               退出
             </a>
@@ -696,24 +738,51 @@ export default function AdminPanel() {
           </p>
         )}
 
-        <section aria-labelledby="admin-overview-title" className="mb-8 min-w-0 rounded-2xl border border-white/10 bg-white/[0.03] p-5">
-          <div className="flex flex-wrap items-start justify-between gap-3">
-            <div>
-              <h2 id="admin-overview-title" className="font-bold text-white">运营概览</h2>
-              <p className="mt-1 text-xs text-neutral-500">真实数据库总数与当前服务探针；Liveness 和 Readiness 分别检查。</p>
+        <div className="grid min-w-0 gap-6 lg:grid-cols-[13rem_minmax(0,1fr)] xl:grid-cols-[15rem_minmax(0,1fr)]">
+          <aside className="min-w-0 lg:row-span-full">
+            <nav
+              aria-label="后台分区"
+              className="sticky top-2 z-20 -mx-1 overflow-x-auto rounded-xl border border-white/10 bg-neutral-950/90 p-1.5 shadow-sm shadow-black/20 backdrop-blur-xl lg:top-6 lg:mx-0 lg:overflow-visible lg:rounded-2xl lg:p-2"
+            >
+              <div className="flex min-w-max gap-1 lg:min-w-0 lg:flex-col">
+                {ADMIN_NAV.map((item) => (
+                  <a
+                    key={item.href}
+                    href={item.href}
+                    className="group inline-flex min-h-10 items-center justify-between gap-3 whitespace-nowrap rounded-lg px-3 text-sm text-neutral-400 transition-colors hover:bg-white/[0.06] hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400 lg:w-full"
+                  >
+                    <span>{item.label}</span>
+                    {item.href === '#review' && (overview?.needsReview ?? 0) > 0 && (
+                      <span className="mono rounded-full border border-amber-300/20 bg-amber-300/10 px-1.5 py-0.5 text-[10px] text-amber-200">
+                        {overview?.needsReview}
+                      </span>
+                    )}
+                  </a>
+                ))}
+              </div>
+            </nav>
+          </aside>
+
+          <div className="min-w-0 space-y-8 lg:space-y-10">
+
+        <section id="overview" aria-labelledby="admin-overview-title" className="scroll-mt-24 min-w-0 rounded-3xl border border-white/10 bg-white/[0.04] p-5 sm:p-6">
+          <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+            <div className="max-w-2xl">
+              <h2 id="admin-overview-title" className="text-lg font-bold tracking-tight text-white">运营概览</h2>
+              <p className="mt-1 text-sm leading-6 text-neutral-400">真实数据库总数与当前服务探针；Liveness 和 Readiness 分别检查。</p>
             </div>
             <button
               type="button"
               data-testid="refresh-system-status"
               onClick={refreshSystemStatus}
               disabled={refreshingStatus}
-              className="rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 text-xs font-medium text-neutral-200 transition hover:bg-white/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400 disabled:cursor-not-allowed disabled:opacity-50"
+              className="inline-flex min-h-11 items-center justify-center self-start whitespace-nowrap rounded-lg border border-white/10 bg-white/5 px-3 text-xs font-medium text-neutral-200 transition-colors hover:bg-white/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400 disabled:cursor-not-allowed disabled:opacity-50"
             >
               {refreshingStatus ? '检查中…' : '刷新系统状态'}
             </button>
           </div>
 
-          <dl className="mt-4 grid grid-cols-2 overflow-hidden rounded-xl border border-white/10 bg-black/15 sm:grid-cols-4">
+          <dl className="mt-5 grid grid-cols-2 overflow-hidden rounded-2xl border border-white/10 bg-black/15 sm:grid-cols-4">
             {[
               ['在池账号', overview?.pooledAccounts],
               ['待人工复核', overview?.needsReview],
@@ -722,15 +791,15 @@ export default function AdminPanel() {
             ].map(([label, value], index) => (
               <div
                 key={String(label)}
-                className={`px-3 py-3 ${index % 2 === 1 ? 'border-l border-white/10' : ''} ${index >= 2 ? 'border-t border-white/10 sm:border-t-0' : ''} ${index > 0 ? 'sm:border-l sm:border-white/10' : ''}`}
+                className={`px-4 py-4 ${index % 2 === 1 ? 'border-l border-white/10' : ''} ${index >= 2 ? 'border-t border-white/10 sm:border-t-0' : ''} ${index > 0 ? 'sm:border-l sm:border-white/10' : ''}`}
               >
-                <dt className="text-[11px] text-neutral-500">{label}</dt>
-                <dd className="mono mt-1 text-xl font-bold text-white">{value ?? '—'}</dd>
+                <dt className="text-xs text-neutral-400">{label}</dt>
+                <dd className="mono mt-1 text-2xl font-bold tabular-nums text-white">{value ?? '—'}</dd>
               </div>
             ))}
           </dl>
 
-          <div className="mt-4 grid gap-3 sm:grid-cols-2">
+          <div className="mt-4 grid min-w-0 gap-3 sm:grid-cols-2">
             <ServiceStatusCard
               testId="liveness-status"
               title="Liveness"
@@ -744,21 +813,22 @@ export default function AdminPanel() {
               result={systemStatus.readiness}
             />
           </div>
-          <p className="mt-3 text-right text-[11px] text-neutral-600">
+          <p className="mt-3 text-right text-[11px] text-neutral-500">
             {lastCheckedAt > 0
               ? `最近检查：${new Date(lastCheckedAt).toLocaleTimeString('zh-CN', { hour12: false })}`
               : '最近检查：尚未完成'}
           </p>
         </section>
 
+        <div id="rules" className="scroll-mt-24 min-w-0 overflow-hidden rounded-2xl border border-white/10 bg-white/[0.025]">
         {/* 发分规则 */}
-        <section className="mb-8 min-w-0 rounded-2xl border border-white/10 bg-white/[0.02] p-5">
-          <h2 ref={ruleHeadingRef} tabIndex={-1} className="mb-1 font-bold text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400">发分规则</h2>
-          <p className="mb-4 text-xs text-neutral-500">
+        <section className="min-w-0 p-5 sm:p-6">
+          <h2 ref={ruleHeadingRef} tabIndex={-1} className="mb-1 text-lg font-bold tracking-tight text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400">发分规则</h2>
+          <p className="mb-5 max-w-4xl text-sm leading-6 text-neutral-400">
             账号验证通过后，按 (provider, 套餐) 发放积分。plan 填 <code>*</code> 作为该 provider 的兜底。改完点保存即时生效。
           </p>
-          <div className="space-y-2">
-            <div className="hidden grid-cols-[1fr_1fr_80px_1.4fr_auto_auto] gap-2 text-[11px] text-neutral-500 sm:grid">
+          <div className="space-y-3">
+            <div className="hidden grid-cols-[minmax(7rem,1fr)_minmax(7rem,1fr)_6rem_minmax(10rem,1.4fr)_3rem_auto] gap-2 px-1 text-[11px] text-neutral-400 xl:grid">
               <span>provider</span><span>plan</span><span>积分</span><span>标签</span><span>启用</span><span></span>
             </div>
             {rules.map((r) => (
@@ -769,14 +839,14 @@ export default function AdminPanel() {
         </section>
 
         {/* 折算规则（按次单价，P4-R2 §3.4）：按 (provider, 套餐) 每次调用积分单价，可小数。plan 填 * 作兜底 */}
-        <section className="mb-8 min-w-0 rounded-2xl border border-white/10 bg-white/[0.02] p-5">
-          <h2 ref={rateHeadingRef} tabIndex={-1} className="mb-1 font-bold text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400">折算规则（按次单价）</h2>
-          <p className="mb-4 text-xs text-neutral-500">
+        <section className="min-w-0 border-t border-white/10 p-5 sm:p-6">
+          <h2 ref={rateHeadingRef} tabIndex={-1} className="mb-1 text-lg font-bold tracking-tight text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400">折算规则（按次单价）</h2>
+          <p className="mb-5 max-w-4xl text-sm leading-6 text-neutral-400">
             号在池后，按 cpamp 每日调用量折算积分：结算 = round(次数 × 单价)。单价可小数（如 <code>0.5</code>）。plan 填{' '}
             <code>*</code> 作该 provider 的兜底。改完点保存即时生效。改 <code>provider</code>/<code>plan</code> 需先删旧行再新增。
           </p>
-          <div className="space-y-2">
-            <div className="hidden grid-cols-[1fr_1fr_80px_1.4fr_auto_auto] gap-2 text-[11px] text-neutral-500 sm:grid">
+          <div className="space-y-3">
+            <div className="hidden grid-cols-[minmax(7rem,1fr)_minmax(7rem,1fr)_6rem_minmax(10rem,1.4fr)_3rem_auto] gap-2 px-1 text-[11px] text-neutral-400 xl:grid">
               <span>provider</span><span>plan</span><span>单价</span><span>标签</span><span>启用</span><span></span>
             </div>
             {rates.map((r) => (
@@ -785,11 +855,13 @@ export default function AdminPanel() {
             <RateRow onSave={saveRate} isNew />
           </div>
         </section>
+        </div>
 
+        <div id="store" className="scroll-mt-24 min-w-0 overflow-hidden rounded-2xl border border-white/10 bg-white/[0.025]">
         {/* 兑换项 */}
-        <section className="min-w-0 rounded-2xl border border-white/10 bg-white/[0.02] p-5">
-          <h2 ref={itemHeadingRef} tabIndex={-1} className="mb-1 font-bold text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400">兑换项（商店）</h2>
-          <p className="mb-4 text-xs text-neutral-500">用户用积分兑换。履约接口后续接小鸡毛，现为占位。</p>
+        <section className="min-w-0 p-5 sm:p-6">
+          <h2 ref={itemHeadingRef} tabIndex={-1} className="mb-1 text-lg font-bold tracking-tight text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400">兑换项（商店）</h2>
+          <p className="mb-5 text-sm leading-6 text-neutral-400">用户用积分兑换。履约接口后续接小鸡毛，现为占位。</p>
           {itemError && (
             <p
               data-testid="redeem-item-error"
@@ -800,9 +872,9 @@ export default function AdminPanel() {
               {itemError}
             </p>
           )}
-          <div className="space-y-2">
-            <div className="hidden grid-cols-[1.3fr_100px_1fr_1.4fr_auto_auto] gap-2 text-[11px] text-neutral-500 sm:grid">
-              <span>名称</span><span>积分价</span><span>类型</span><span>说明</span><span>启用</span><span></span>
+          <div className="space-y-3">
+            <div className="hidden grid-cols-[minmax(8rem,1.2fr)_5rem_minmax(8rem,1fr)_minmax(7rem,1fr)_4.5rem_minmax(9rem,1.2fr)_3rem_auto] gap-2 px-1 text-[11px] text-neutral-400 xl:grid">
+              <span>名称</span><span>积分价</span><span>类型</span><span>履约</span><span>限购</span><span>说明</span><span>启用</span><span></span>
             </div>
             {items.map((it) => (
               <ItemRow
@@ -818,20 +890,22 @@ export default function AdminPanel() {
         </section>
 
         {/* CDK 库存导入（P4-R1）：选项 + 贴码 + 面额 → 导入；只回计数/库存，绝不回显已导入的码 */}
-        <section className="mt-8 min-w-0 rounded-2xl border border-white/10 bg-white/[0.02] p-5">
-          <h2 className="mb-1 font-bold text-white">CDK 库存导入</h2>
-          <p className="mb-4 text-xs text-neutral-500">
+        <section className="min-w-0 border-t border-white/10 p-5 sm:p-6">
+          <h2 className="mb-1 text-lg font-bold tracking-tight text-white">CDK 库存导入</h2>
+          <p className="mb-5 max-w-4xl text-sm leading-6 text-neutral-400">
             给「CDK 发码」履约的兑换项预导入码（一行一码 / 逗号 / 空白分隔，跨批自动去重）。
             <span className="text-amber-300/80">LDC 商品必填正整数面额（一批同面额）。</span>
             安全起见，导入后只显示计数与库存，<b>不回显任何码</b>。
           </p>
           <CdkImport items={items} onDone={loadAudit} flash={flash} />
         </section>
+        </div>
 
+        <div id="runtime" className="scroll-mt-24 grid min-w-0 gap-4 xl:grid-cols-2">
         {/* LDC 每日额度（P4-R1）：读改 app_config['ldc_daily_quota']，缺省 2000 */}
-        <section className="mt-8 rounded-2xl border border-white/10 bg-white/[0.02] p-5">
-          <h2 className="mb-1 font-bold text-white">LDC 每日额度</h2>
-          <p className="mb-4 text-xs text-neutral-500">
+        <section className="flex min-w-0 flex-col rounded-2xl border border-white/10 bg-white/[0.025] p-5 sm:p-6">
+          <h2 className="mb-1 text-base font-bold tracking-tight text-white">LDC 每日额度</h2>
+          <p className="mb-5 flex-1 text-sm leading-6 text-neutral-400">
             当日已发 LDC 面额之和的上限（按服务器本地自然日重置）。0＝当日停发。非负整数。
           </p>
           <div className="flex min-w-0 flex-wrap items-center gap-2">
@@ -842,10 +916,11 @@ export default function AdminPanel() {
               value={quota}
               onChange={(e) => setQuota(e.target.value)}
               placeholder="2000"
+              aria-label="LDC 每日额度"
             />
             <button
               onClick={saveQuota}
-              className="rounded-lg bg-[var(--brand)]/20 px-3 py-1.5 text-xs font-medium text-[var(--brand-bright)] hover:bg-[var(--brand)]/30"
+              className="inline-flex min-h-11 items-center justify-center whitespace-nowrap rounded-lg bg-[var(--brand)]/20 px-4 text-xs font-medium text-[var(--brand-bright)] transition-colors hover:bg-[var(--brand)]/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400"
             >
               保存
             </button>
@@ -853,14 +928,14 @@ export default function AdminPanel() {
         </section>
 
         {/* 信任等级门槛 & 限身份开关（P4-R2 §1）：关＝登录即可、不限等级；开则等级不足拒登录（不使已登录会话失效） */}
-        <section className="mt-8 min-w-0 rounded-2xl border border-white/10 bg-white/[0.02] p-5">
-          <h2 className="mb-1 font-bold text-white">信任等级门槛</h2>
-          <p className="mb-4 text-xs text-neutral-500">
+        <section className="flex min-w-0 flex-col rounded-2xl border border-white/10 bg-white/[0.025] p-5 sm:p-6">
+          <h2 className="mb-1 text-base font-bold tracking-tight text-white">信任等级门槛</h2>
+          <p className="mb-5 flex-1 text-sm leading-6 text-neutral-400">
             控制谁能登录贡献账号。关闭门槛＝登录即可、不限信任等级；开启则 linux.do 信任等级低于门槛者被拒。
             调整只影响此后登录，不使已登录会话失效。
           </p>
           <div className="flex flex-wrap items-center gap-3">
-            <label className="flex items-center gap-2 text-sm">
+            <label className="flex min-h-11 items-center gap-2 text-sm">
               <input
                 type="checkbox"
                 checked={gateEnabled}
@@ -877,10 +952,11 @@ export default function AdminPanel() {
               onChange={(e) => setMinTrust(e.target.value)}
               disabled={!gateEnabled}
               placeholder="门槛等级，如 1"
+              aria-label="最低信任等级"
             />
             <button
               onClick={saveGate}
-              className="rounded-lg bg-[var(--brand)]/20 px-3 py-1.5 text-xs font-medium text-[var(--brand-bright)] hover:bg-[var(--brand)]/30"
+              className="inline-flex min-h-11 items-center justify-center whitespace-nowrap rounded-lg bg-[var(--brand)]/20 px-4 text-xs font-medium text-[var(--brand-bright)] transition-colors hover:bg-[var(--brand)]/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400"
             >
               保存
             </button>
@@ -888,9 +964,9 @@ export default function AdminPanel() {
         </section>
 
         {/* 结算参数（P4-R2 §3.3）：结算时刻＝午夜后延迟分钟数，缺省 10（00:10）。时区随服务器不可配 */}
-        <section className="mt-8 min-w-0 rounded-2xl border border-white/10 bg-white/[0.02] p-5">
-          <h2 className="mb-1 font-bold text-white">结算参数</h2>
-          <p className="mb-4 text-xs text-neutral-500">
+        <section className="flex min-w-0 flex-col rounded-2xl border border-white/10 bg-white/[0.025] p-5 sm:p-6">
+          <h2 className="mb-1 text-base font-bold tracking-tight text-white">结算参数</h2>
+          <p className="mb-5 flex-1 text-sm leading-6 text-neutral-400">
             每日结算前一自然日的用量。结算时刻＝午夜后延迟多少分钟再结（吸收迟到落账），缺省 <code>10</code>（即 00:10）。
             范围 0–1439 分钟。<span className="text-amber-300/80">时区随服务器，不可配。</span>
           </p>
@@ -903,11 +979,12 @@ export default function AdminPanel() {
               value={graceMinutes}
               onChange={(e) => setGraceMinutes(e.target.value)}
               placeholder="10"
+              aria-label="结算延迟分钟数"
             />
             <span className="text-xs text-neutral-500">分钟（午夜后）</span>
             <button
               onClick={saveSettle}
-              className="rounded-lg bg-[var(--brand)]/20 px-3 py-1.5 text-xs font-medium text-[var(--brand-bright)] hover:bg-[var(--brand)]/30"
+              className="inline-flex min-h-11 items-center justify-center whitespace-nowrap rounded-lg bg-[var(--brand)]/20 px-4 text-xs font-medium text-[var(--brand-bright)] transition-colors hover:bg-[var(--brand)]/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400"
             >
               保存
             </button>
@@ -915,9 +992,9 @@ export default function AdminPanel() {
         </section>
 
         {/* 入池优先级（对接-R2b §2.5/§7.1）：贡献号入池即设的全局优先级，cpamp 数字越大越优先 */}
-        <section className="mt-8 min-w-0 rounded-2xl border border-white/10 bg-white/[0.02] p-5">
-          <h2 className="mb-1 font-bold text-white">入池优先级</h2>
-          <p className="mb-4 text-xs text-neutral-500">
+        <section className="flex min-w-0 flex-col rounded-2xl border border-white/10 bg-white/[0.025] p-5 sm:p-6">
+          <h2 className="mb-1 text-base font-bold tracking-tight text-white">入池优先级</h2>
+          <p className="mb-5 flex-1 text-sm leading-6 text-neutral-400">
             贡献账号入池时统一设置的优先级，缺省 <code>10</code>，数值越大越优先被调用（号主越先赚分）。非负整数。
           </p>
           <div className="flex min-w-0 flex-wrap items-center gap-2">
@@ -928,30 +1005,32 @@ export default function AdminPanel() {
               value={poolPriority}
               onChange={(e) => setPoolPriority(e.target.value)}
               placeholder="10"
+              aria-label="入池优先级"
             />
             <button
               onClick={savePool}
-              className="rounded-lg bg-[var(--brand)]/20 px-3 py-1.5 text-xs font-medium text-[var(--brand-bright)] hover:bg-[var(--brand)]/30"
+              className="inline-flex min-h-11 items-center justify-center whitespace-nowrap rounded-lg bg-[var(--brand)]/20 px-4 text-xs font-medium text-[var(--brand-bright)] transition-colors hover:bg-[var(--brand)]/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400"
             >
               保存
             </button>
           </div>
         </section>
+        </div>
 
         {/* 审计日志（P4-R1，§7.3）：只读倒序。old/new 为脱敏摘要，查看不泄敏感值 */}
-        <section className="mt-8 min-w-0 rounded-2xl border border-white/10 bg-white/[0.02] p-5">
-          <div className="mb-1 flex items-center justify-between">
-            <h2 className="font-bold text-white">审计日志</h2>
+        <section id="audit" className="scroll-mt-24 min-w-0 rounded-2xl border border-white/10 bg-white/[0.025] p-5 sm:p-6">
+          <div className="mb-1 flex flex-wrap items-center justify-between gap-3">
+            <h2 className="text-lg font-bold tracking-tight text-white">审计日志</h2>
             <button
               type="button"
               data-testid="refresh-audit"
               onClick={loadAudit}
-              className="rounded-lg border border-white/10 bg-white/5 px-2.5 py-1 text-xs hover:bg-white/10"
+              className="inline-flex min-h-11 items-center justify-center whitespace-nowrap rounded-lg border border-white/10 bg-white/5 px-3 text-xs transition-colors hover:bg-white/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400"
             >
               刷新
             </button>
           </div>
-          <p className="mb-4 text-xs text-neutral-500">
+          <p className="mb-5 text-sm leading-6 text-neutral-400">
             配置写操作留痕（操作人 / 时间 / 动作 / 目标 / 旧→新）。最新 50 条，倒序。
           </p>
           {auditError && (
@@ -963,8 +1042,8 @@ export default function AdminPanel() {
               {auditError}
             </p>
           )}
-          <div data-testid="audit-table-scroll" className="max-w-full overflow-x-auto">
-            <div className="min-w-[760px] space-y-1.5">
+          <div data-testid="audit-table-scroll" className="max-w-full overflow-x-auto rounded-xl border border-white/[0.07] bg-black/15 p-3">
+            <div className="min-w-[760px] space-y-1.5 tabular-nums">
               <div className="grid grid-cols-[130px_130px_1.2fr_1.4fr_2fr] gap-2 text-[11px] text-neutral-500">
                 <span>时间</span><span>操作人</span><span>动作</span><span>目标</span><span>旧 → 新</span>
               </div>
@@ -993,23 +1072,23 @@ export default function AdminPanel() {
         </section>
 
         {/* 待人工复核（P4-R3，§7.4）：needs_review 号的人工出口。重试→转回首检队列；终止→停用（不删行、不碰结算表） */}
-        <section className="mt-8 min-w-0 rounded-2xl border border-white/10 bg-white/[0.02] p-5">
-          <div className="mb-1 flex items-center justify-between">
-            <h2 ref={reviewHeadingRef} tabIndex={-1} className="font-bold text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400">待人工复核</h2>
+        <section id="review" className="scroll-mt-24 min-w-0 rounded-2xl border border-amber-300/15 bg-amber-300/[0.025] p-5 sm:p-6">
+          <div className="mb-1 flex flex-wrap items-center justify-between gap-3">
+            <h2 ref={reviewHeadingRef} tabIndex={-1} className="text-lg font-bold tracking-tight text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400">待人工复核</h2>
             <button
               onClick={loadReview}
-              className="rounded-lg border border-white/10 bg-white/5 px-2.5 py-1 text-xs hover:bg-white/10"
+              className="inline-flex min-h-11 items-center justify-center whitespace-nowrap rounded-lg border border-white/10 bg-white/5 px-3 text-xs transition-colors hover:bg-white/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400"
             >
               刷新
             </button>
           </div>
-          <p className="mb-4 text-xs text-neutral-500">
+          <p className="mb-5 max-w-5xl text-sm leading-6 text-neutral-400">
             卡在 <code>needs_review</code> 的号（残缺号 / 首检或巡检需重授权）。<b>重试</b>按是否入过池分叉：
             未入过池→转回首检队列重查；已入过池→直接回池、交由巡检复核（不重走首检，保住历史结算与唯一键）。
             <b>终止</b>放弃并停用（保留记录、不影响已有结算）。
           </p>
-          <div data-testid="review-table-scroll" className="max-w-full overflow-x-auto">
-            <div className="min-w-[620px] space-y-1.5">
+          <div data-testid="review-table-scroll" className="max-w-full overflow-x-auto rounded-xl border border-white/[0.07] bg-black/15 p-3">
+            <div className="min-w-[620px] space-y-1.5 tabular-nums">
             <div className="grid grid-cols-[130px_110px_80px_1fr_auto] gap-2 text-[11px] text-neutral-500">
               <span>提交时间</span><span>用户</span><span>provider</span><span>account</span><span>操作</span>
             </div>
@@ -1030,7 +1109,7 @@ export default function AdminPanel() {
                     type="button"
                     onClick={() => confirmReviewAction(r, 'retry')}
                     aria-label={`重试人工复核 ${r.provider} ${r.accountId}`}
-                    className="rounded-lg bg-[var(--brand)]/20 px-2.5 py-1 text-xs font-medium text-[var(--brand-bright)] hover:bg-[var(--brand)]/30"
+                    className="inline-flex min-h-10 items-center justify-center whitespace-nowrap rounded-lg bg-[var(--brand)]/20 px-3 text-xs font-medium text-[var(--brand-bright)] transition-colors hover:bg-[var(--brand)]/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400"
                   >
                     重试
                   </button>
@@ -1038,7 +1117,7 @@ export default function AdminPanel() {
                     type="button"
                     onClick={() => confirmReviewAction(r, 'terminate')}
                     aria-label={`终止人工复核 ${r.provider} ${r.accountId}`}
-                    className="rounded-lg bg-rose-500/10 px-2.5 py-1 text-xs text-rose-300 hover:bg-rose-500/20"
+                    className="inline-flex min-h-10 items-center justify-center whitespace-nowrap rounded-lg bg-rose-500/10 px-3 text-xs text-rose-300 transition-colors hover:bg-rose-500/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-300"
                   >
                     终止
                   </button>
@@ -1049,20 +1128,21 @@ export default function AdminPanel() {
           </div>
         </section>
 
+        <div id="data" className="scroll-mt-24 min-w-0 overflow-hidden rounded-2xl border border-white/10 bg-white/[0.025]">
         {/* 贡献记录（P4-R3，§6.146）：全局倒序只读。脱敏——不含 email/reward_code。积分＝该号累计发分 */}
-        <section className="mt-8 min-w-0 rounded-2xl border border-white/10 bg-white/[0.02] p-5">
-          <div className="mb-1 flex items-center justify-between">
-            <h2 className="font-bold text-white">贡献记录</h2>
+        <section className="min-w-0 p-5 sm:p-6">
+          <div className="mb-1 flex flex-wrap items-center justify-between gap-3">
+            <h2 className="text-lg font-bold tracking-tight text-white">贡献记录</h2>
             <button
               onClick={loadContributions}
-              className="rounded-lg border border-white/10 bg-white/5 px-2.5 py-1 text-xs hover:bg-white/10"
+              className="inline-flex min-h-11 items-center justify-center whitespace-nowrap rounded-lg border border-white/10 bg-white/5 px-3 text-xs transition-colors hover:bg-white/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400"
             >
               刷新
             </button>
           </div>
-          <p className="mb-4 text-xs text-neutral-500">用户贡献的账号（最新 50 条，倒序）。积分＝该号累计发分。</p>
-          <div data-testid="contributions-table-scroll" className="max-w-full overflow-x-auto">
-            <div className="min-w-[760px] space-y-1.5">
+          <p className="mb-5 text-sm leading-6 text-neutral-400">用户贡献的账号（最新 50 条，倒序）。积分＝该号累计发分。</p>
+          <div data-testid="contributions-table-scroll" className="max-w-full overflow-x-auto rounded-xl border border-white/[0.07] bg-black/15 p-3">
+            <div className="min-w-[760px] space-y-1.5 tabular-nums">
             <div className="grid grid-cols-[120px_100px_70px_60px_80px_1fr_56px] gap-2 text-[11px] text-neutral-500">
               <span>时间</span><span>用户</span><span>provider</span><span>套餐</span><span>状态</span><span>account</span><span>积分</span>
             </div>
@@ -1088,19 +1168,19 @@ export default function AdminPanel() {
         </section>
 
         {/* 每日结算记录（P4-R3，§6.146）：全局倒序只读。用户/归属由 LEFT JOIN 取 */}
-        <section className="mt-8 min-w-0 rounded-2xl border border-white/10 bg-white/[0.02] p-5">
-          <div className="mb-1 flex items-center justify-between">
-            <h2 className="font-bold text-white">每日结算记录</h2>
+        <section className="min-w-0 border-t border-white/10 p-5 sm:p-6">
+          <div className="mb-1 flex flex-wrap items-center justify-between gap-3">
+            <h2 className="text-lg font-bold tracking-tight text-white">每日结算记录</h2>
             <button
               onClick={loadSettlements}
-              className="rounded-lg border border-white/10 bg-white/5 px-2.5 py-1 text-xs hover:bg-white/10"
+              className="inline-flex min-h-11 items-center justify-center whitespace-nowrap rounded-lg border border-white/10 bg-white/5 px-3 text-xs transition-colors hover:bg-white/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400"
             >
               刷新
             </button>
           </div>
-          <p className="mb-4 text-xs text-neutral-500">按日折算的结算流水（最新 50 条，倒序）。积分＝round(次数 × 单价)。</p>
-          <div data-testid="settlements-table-scroll" className="max-w-full overflow-x-auto">
-            <div className="min-w-[780px] space-y-1.5">
+          <p className="mb-5 text-sm leading-6 text-neutral-400">按日折算的结算流水（最新 50 条，倒序）。积分＝round(次数 × 单价)。</p>
+          <div data-testid="settlements-table-scroll" className="max-w-full overflow-x-auto rounded-xl border border-white/[0.07] bg-black/15 p-3">
+            <div className="min-w-[780px] space-y-1.5 tabular-nums">
             <div className="grid grid-cols-[100px_100px_70px_1fr_56px_56px_130px] gap-2 text-[11px] text-neutral-500">
               <span>日期</span><span>用户</span><span>provider</span><span>account</span><span>次数</span><span>积分</span><span>结算时刻</span>
             </div>
@@ -1126,21 +1206,21 @@ export default function AdminPanel() {
         </section>
 
         {/* 兑换记录（P4-R3，§6.146）：全局倒序只读。🔴 §8——后端已脱敏，绝不含 result（CDK 码），故无「码」列 */}
-        <section className="mt-8 min-w-0 rounded-2xl border border-white/10 bg-white/[0.02] p-5">
-          <div className="mb-1 flex items-center justify-between">
-            <h2 className="font-bold text-white">兑换记录</h2>
+        <section className="min-w-0 border-t border-white/10 p-5 sm:p-6">
+          <div className="mb-1 flex flex-wrap items-center justify-between gap-3">
+            <h2 className="text-lg font-bold tracking-tight text-white">兑换记录</h2>
             <button
               onClick={loadRedemptions}
-              className="rounded-lg border border-white/10 bg-white/5 px-2.5 py-1 text-xs hover:bg-white/10"
+              className="inline-flex min-h-11 items-center justify-center whitespace-nowrap rounded-lg border border-white/10 bg-white/5 px-3 text-xs transition-colors hover:bg-white/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400"
             >
               刷新
             </button>
           </div>
-          <p className="mb-4 text-xs text-neutral-500">
+          <p className="mb-5 text-sm leading-6 text-neutral-400">
             用户兑换流水（最新 50 条，倒序）。安全起见<b>不显示兑换码</b>（码仅号主本人可在前台找回）。
           </p>
-          <div data-testid="redemptions-table-scroll" className="max-w-full overflow-x-auto">
-            <div className="min-w-[560px] space-y-1.5">
+          <div data-testid="redemptions-table-scroll" className="max-w-full overflow-x-auto rounded-xl border border-white/[0.07] bg-black/15 p-3">
+            <div className="min-w-[560px] space-y-1.5 tabular-nums">
             <div className="grid grid-cols-[130px_110px_1fr_64px_90px] gap-2 text-[11px] text-neutral-500">
               <span>时间</span><span>用户</span><span>商品</span><span>花费</span><span>状态</span>
             </div>
@@ -1162,6 +1242,9 @@ export default function AdminPanel() {
             </div>
           </div>
         </section>
+        </div>
+          </div>
+        </div>
       </div>
       {confirmation && (
         <ConfirmDialog
@@ -1200,7 +1283,7 @@ function ServiceStatusCard({
       <div className="flex items-start justify-between gap-3">
         <div>
           <h3 className="mono text-xs font-bold uppercase tracking-wide text-white">{title}</h3>
-          <p className="mt-0.5 text-[11px] text-neutral-500">{subtitle}</p>
+          <p className="mt-0.5 text-[11px] text-neutral-400">{subtitle}</p>
         </div>
         <span className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-xs font-semibold ${presentation.cls}`}>
           <span aria-hidden="true" className="font-black">{presentation.symbol}</span>
@@ -1270,6 +1353,7 @@ function CdkImport({
     <div className="min-w-0 space-y-3">
       <div className="flex flex-wrap items-center gap-2">
         <select
+          aria-label="选择兑换项"
           className={field + ' min-w-0 w-full max-w-full sm:w-auto'}
           value={itemId}
           onChange={(e) => setItemId(Number(e.target.value))}
@@ -1284,6 +1368,7 @@ function CdkImport({
           ))}
         </select>
         <input
+          aria-label="CDK 面额"
           className={field + ' min-w-0 w-full sm:w-32'}
           type="number"
           min={1}
@@ -1293,7 +1378,7 @@ function CdkImport({
         />
         <button
           onClick={doImport}
-          className="rounded-lg bg-[var(--brand)]/20 px-3 py-1.5 text-xs font-medium text-[var(--brand-bright)] hover:bg-[var(--brand)]/30"
+          className="inline-flex min-h-11 items-center justify-center whitespace-nowrap rounded-lg bg-[var(--brand)]/20 px-4 text-xs font-medium text-[var(--brand-bright)] transition-colors hover:bg-[var(--brand)]/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400"
         >
           导入
         </button>
@@ -1305,6 +1390,7 @@ function CdkImport({
         )}
       </div>
       <textarea
+        aria-label="要导入的 CDK 码"
         className={field + ' h-28 min-w-0 w-full max-w-full font-mono'}
         value={codes}
         onChange={(e) => setCodes(e.target.value)}
@@ -1332,17 +1418,20 @@ function RuleRow({
   const [enabled, setEnabled] = useState((rule?.enabled ?? 1) !== 0)
 
   return (
-    <div className="grid min-w-0 grid-cols-1 items-center gap-2 sm:grid-cols-[1fr_1fr_80px_1.4fr_auto_auto]">
-      <input className={field + ' min-w-0 w-full'} value={provider} onChange={(e) => setProvider(e.target.value)} placeholder="codex" />
-      <input className={field + ' min-w-0 w-full'} value={plan} onChange={(e) => setPlan(e.target.value)} placeholder="plus / *" />
-      <input className={field + ' min-w-0 w-full'} type="number" value={points} onChange={(e) => setPoints(Number(e.target.value))} />
-      <input className={field + ' min-w-0 w-full'} value={label} onChange={(e) => setLabel(e.target.value)} placeholder="标签" />
-      <input type="checkbox" checked={enabled} onChange={(e) => setEnabled(e.target.checked)} className="h-4 w-4 accent-emerald-500" />
-      <div className="flex flex-wrap gap-1">
+    <div className="grid min-w-0 grid-cols-1 items-center gap-2 rounded-xl bg-black/10 p-3 sm:grid-cols-2 xl:grid-cols-[minmax(7rem,1fr)_minmax(7rem,1fr)_6rem_minmax(10rem,1.4fr)_3rem_auto]">
+      <input aria-label="provider" className={field + ' min-w-0 w-full'} value={provider} onChange={(e) => setProvider(e.target.value)} placeholder="codex" />
+      <input aria-label="套餐" className={field + ' min-w-0 w-full'} value={plan} onChange={(e) => setPlan(e.target.value)} placeholder="plus / *" />
+      <input aria-label="积分" className={field + ' min-w-0 w-full'} type="number" value={points} onChange={(e) => setPoints(Number(e.target.value))} />
+      <input aria-label="标签" className={field + ' min-w-0 w-full'} value={label} onChange={(e) => setLabel(e.target.value)} placeholder="标签" />
+      <label className="flex min-h-11 items-center gap-2 text-xs text-neutral-400 xl:justify-center">
+        <input type="checkbox" checked={enabled} onChange={(e) => setEnabled(e.target.checked)} className="h-4 w-4 accent-emerald-500" />
+        <span className="xl:sr-only">启用</span>
+      </label>
+      <div className="flex flex-wrap gap-2 sm:justify-end xl:justify-start">
         <button
           type="button"
           onClick={() => onSave({ provider, plan, points, label, enabled: enabled ? 1 : 0 })}
-          className="rounded-lg bg-[var(--brand)]/20 px-2.5 py-1.5 text-xs font-medium text-[var(--brand-bright)] hover:bg-[var(--brand)]/30"
+          className="inline-flex min-h-11 items-center justify-center whitespace-nowrap rounded-lg bg-[var(--brand)]/20 px-3 text-xs font-medium text-[var(--brand-bright)] transition-colors hover:bg-[var(--brand)]/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400"
         >
           {isNew ? '新增' : '保存'}
         </button>
@@ -1351,7 +1440,7 @@ function RuleRow({
             type="button"
             onClick={onDelete}
             aria-label={`删除发分规则 ${provider} ${plan}`}
-            className="rounded-lg bg-rose-500/10 px-2.5 py-1.5 text-xs text-rose-300 hover:bg-rose-500/20"
+            className="inline-flex min-h-11 items-center justify-center whitespace-nowrap rounded-lg bg-rose-500/10 px-3 text-xs text-rose-300 transition-colors hover:bg-rose-500/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-300"
           >
             删
           </button>
@@ -1380,19 +1469,22 @@ function RateRow({
   const [enabled, setEnabled] = useState((rate?.enabled ?? 1) !== 0)
 
   return (
-    <div className="grid min-w-0 grid-cols-1 items-center gap-2 sm:grid-cols-[1fr_1fr_80px_1.4fr_auto_auto]">
+    <div className="grid min-w-0 grid-cols-1 items-center gap-2 rounded-xl bg-black/10 p-3 sm:grid-cols-2 xl:grid-cols-[minmax(7rem,1fr)_minmax(7rem,1fr)_6rem_minmax(10rem,1.4fr)_3rem_auto]">
       {/* 存量行 provider/plan 禁改（P4-R2 codex 复审 P2）：upsert 按 (provider,plan) 键，改键＝插新行、旧行仍
           enabled 计价。改档口径＝先删旧行再新增（唯 isNew 行可编辑键）。置灰样式与信任门槛 disabled 输入一致。 */}
-      <input className={field + ' min-w-0 w-full' + (isNew ? '' : ' opacity-40')} value={provider} onChange={(e) => setProvider(e.target.value)} placeholder="codex" disabled={!isNew} />
-      <input className={field + ' min-w-0 w-full' + (isNew ? '' : ' opacity-40')} value={plan} onChange={(e) => setPlan(e.target.value)} placeholder="plus / *" disabled={!isNew} />
-      <input className={field + ' min-w-0 w-full'} type="number" step={0.1} min={0} value={pointsPerCall} onChange={(e) => setPointsPerCall(Number(e.target.value))} />
-      <input className={field + ' min-w-0 w-full'} value={label} onChange={(e) => setLabel(e.target.value)} placeholder="标签" />
-      <input type="checkbox" checked={enabled} onChange={(e) => setEnabled(e.target.checked)} className="h-4 w-4 accent-emerald-500" />
-      <div className="flex flex-wrap gap-1">
+      <input aria-label="provider" className={field + ' min-w-0 w-full' + (isNew ? '' : ' opacity-40')} value={provider} onChange={(e) => setProvider(e.target.value)} placeholder="codex" disabled={!isNew} />
+      <input aria-label="套餐" className={field + ' min-w-0 w-full' + (isNew ? '' : ' opacity-40')} value={plan} onChange={(e) => setPlan(e.target.value)} placeholder="plus / *" disabled={!isNew} />
+      <input aria-label="单价" className={field + ' min-w-0 w-full'} type="number" step={0.1} min={0} value={pointsPerCall} onChange={(e) => setPointsPerCall(Number(e.target.value))} />
+      <input aria-label="标签" className={field + ' min-w-0 w-full'} value={label} onChange={(e) => setLabel(e.target.value)} placeholder="标签" />
+      <label className="flex min-h-11 items-center gap-2 text-xs text-neutral-400 xl:justify-center">
+        <input type="checkbox" checked={enabled} onChange={(e) => setEnabled(e.target.checked)} className="h-4 w-4 accent-emerald-500" />
+        <span className="xl:sr-only">启用</span>
+      </label>
+      <div className="flex flex-wrap gap-2 sm:justify-end xl:justify-start">
         <button
           type="button"
           onClick={() => onSave({ provider, plan, pointsPerCall, label, enabled: enabled ? 1 : 0 })}
-          className="rounded-lg bg-[var(--brand)]/20 px-2.5 py-1.5 text-xs font-medium text-[var(--brand-bright)] hover:bg-[var(--brand)]/30"
+          className="inline-flex min-h-11 items-center justify-center whitespace-nowrap rounded-lg bg-[var(--brand)]/20 px-3 text-xs font-medium text-[var(--brand-bright)] transition-colors hover:bg-[var(--brand)]/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400"
         >
           {isNew ? '新增' : '保存'}
         </button>
@@ -1401,7 +1493,7 @@ function RateRow({
             type="button"
             onClick={onDelete}
             aria-label={`删除折算规则 ${provider} ${plan}`}
-            className="rounded-lg bg-rose-500/10 px-2.5 py-1.5 text-xs text-rose-300 hover:bg-rose-500/20"
+            className="inline-flex min-h-11 items-center justify-center whitespace-nowrap rounded-lg bg-rose-500/10 px-3 text-xs text-rose-300 transition-colors hover:bg-rose-500/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-300"
           >
             删
           </button>
@@ -1460,18 +1552,18 @@ function ItemRow({
   return (
     <div
       data-testid={isNew ? 'redeem-item-new-row' : `redeem-item-row-${item?.id}`}
-      className="grid min-w-0 grid-cols-1 items-center gap-2 sm:grid-cols-[1.2fr_80px_1fr_1fr_72px_1.2fr_auto_auto]"
+      className="grid min-w-0 grid-cols-1 items-center gap-2 rounded-xl bg-black/10 p-3 sm:grid-cols-2 xl:grid-cols-[minmax(8rem,1.2fr)_5rem_minmax(8rem,1fr)_minmax(7rem,1fr)_4.5rem_minmax(9rem,1.2fr)_3rem_auto]"
     >
-      <input className={field + ' min-w-0 w-full'} value={name} disabled={saving} onChange={(e) => { changed(); setName(e.target.value) }} placeholder="名称" />
-      <input className={field + ' min-w-0 w-full'} type="number" value={cost} disabled={saving} onChange={(e) => { changed(); setCost(Number(e.target.value)) }} />
-      <select className={field + ' min-w-0 w-full'} value={kind} disabled={saving} onChange={(e) => { changed(); setKind(e.target.value) }}>
+      <input aria-label="商品名称" className={field + ' min-w-0 w-full'} value={name} disabled={saving} onChange={(e) => { changed(); setName(e.target.value) }} placeholder="名称" />
+      <input aria-label="积分价" className={field + ' min-w-0 w-full'} type="number" value={cost} disabled={saving} onChange={(e) => { changed(); setCost(Number(e.target.value)) }} />
+      <select aria-label="商品类型" className={field + ' min-w-0 w-full'} value={kind} disabled={saving} onChange={(e) => { changed(); setKind(e.target.value) }}>
         {KINDS.map((k) => (
           <option key={k.v} value={k.v}>
             {k.t}
           </option>
         ))}
       </select>
-      <select className={field + ' min-w-0 w-full'} value={fulfillment} disabled={saving} onChange={(e) => { changed(); setFulfillment(e.target.value as 'placeholder' | 'cdk') }} title="履约类型">
+      <select aria-label="履约类型" className={field + ' min-w-0 w-full'} value={fulfillment} disabled={saving} onChange={(e) => { changed(); setFulfillment(e.target.value as 'placeholder' | 'cdk') }} title="履约类型">
         {FULFILLMENTS.map((f) => (
           <option key={f.v} value={f.v}>
             {f.t}
@@ -1487,16 +1579,20 @@ function ItemRow({
         onChange={(e) => { changed(); setPerUserLimit(Number(e.target.value)) }}
         title="每人限购（0=不限）"
         placeholder="限购"
+        aria-label="每人限购"
       />
-      <input className={field + ' min-w-0 w-full'} value={description} disabled={saving} onChange={(e) => { changed(); setDescription(e.target.value) }} placeholder="说明" />
-      <input type="checkbox" checked={enabled} disabled={saving} onChange={(e) => { changed(); setEnabled(e.target.checked) }} className="h-4 w-4 accent-emerald-500" />
-      <div className="flex flex-wrap gap-1">
+      <input aria-label="商品说明" className={field + ' min-w-0 w-full'} value={description} disabled={saving} onChange={(e) => { changed(); setDescription(e.target.value) }} placeholder="说明" />
+      <label className="flex min-h-11 items-center gap-2 text-xs text-neutral-400 xl:justify-center">
+        <input type="checkbox" checked={enabled} disabled={saving} onChange={(e) => { changed(); setEnabled(e.target.checked) }} className="h-4 w-4 accent-emerald-500" />
+        <span className="xl:sr-only">启用</span>
+      </label>
+      <div className="flex flex-wrap gap-2 sm:justify-end xl:justify-start">
         <button
           type="button"
           data-testid="redeem-item-save"
           onClick={() => void submit()}
           disabled={saving}
-          className="rounded-lg bg-[var(--brand)]/20 px-2.5 py-1.5 text-xs font-medium text-[var(--brand-bright)] hover:bg-[var(--brand)]/30 disabled:cursor-not-allowed disabled:opacity-50"
+          className="inline-flex min-h-11 items-center justify-center whitespace-nowrap rounded-lg bg-[var(--brand)]/20 px-3 text-xs font-medium text-[var(--brand-bright)] transition-colors hover:bg-[var(--brand)]/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400 disabled:cursor-not-allowed disabled:opacity-50"
         >
           {saving ? '保存中…' : isNew ? '新增' : '保存'}
         </button>
@@ -1505,7 +1601,7 @@ function ItemRow({
             type="button"
             onClick={onDelete}
             aria-label={`删除兑换项 ${name}`}
-            className="rounded-lg bg-rose-500/10 px-2.5 py-1.5 text-xs text-rose-300 hover:bg-rose-500/20"
+            className="inline-flex min-h-11 items-center justify-center whitespace-nowrap rounded-lg bg-rose-500/10 px-3 text-xs text-rose-300 transition-colors hover:bg-rose-500/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-300"
           >
             删
           </button>
